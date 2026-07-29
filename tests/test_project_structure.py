@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def test_required_project_files_exist() -> None:
+    root = Path(__file__).resolve().parents[1]
+    required_paths = [
+        root / "app.py",
+        root / "config.yaml",
+        root / "requirements.txt",
+        root / "README.md",
+        root / "CHANGELOG.md",
+        root / ".gitignore",
+        root / ".env.example",
+        root / "src" / "__init__.py",
+        root / "src" / "models.py",
+        root / "src" / "camera_reader.py",
+        root / "src" / "ingestion_manager.py",
+        root / "src" / "detector_tracker.py",
+        root / "src" / "track_manager.py",
+        root / "src" / "evidence.py",
+        root / "src" / "enrichment.py",
+        root / "src" / "persistence.py",
+        root / "src" / "global_association.py",
+        root / "src" / "output_writer.py",
+        root / "src" / "pipeline.py",
+        root / "src" / "logging_setup.py",
+        root / "tests" / "__init__.py",
+        root / "tests" / "test_camera_reader.py",
+        root / "tests" / "test_detector_tracker.py",
+        root / "tests" / "test_ingestion_manager.py",
+        root / "tests" / "test_logging_setup.py",
+        root / "tests" / "test_output_writer.py",
+        root / "tests" / "test_pipeline.py",
+        root / "tests" / "test_project_structure.py",
+        root / "data" / "test_videos" / "README.md",
+        root / "model_weights" / "README.md",
+        root / "outputs" / "runs",
+        root / "docs" / "ARCHITECTURE.md",
+        root / "docs" / "PIPELINE_FLOW.md",
+        root / "docs" / "DEBUGGING.md",
+    ]
+    for required_path in required_paths:
+        assert required_path.exists(), f"Missing required path: {required_path}"

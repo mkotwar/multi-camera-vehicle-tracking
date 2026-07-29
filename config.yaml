@@ -1,0 +1,77 @@
+project:
+  name: multicamera_vehicle_tracking
+  environment: development
+  log_level: INFO
+
+input:
+  cameras:
+    - camera_id: CAM_001
+      source_type: video
+      source: F:/vinfo/Final_vedio_Ai_system/tests/td_case2/multicamera_vehicle_tracking_pipeline/data/1test.mp4
+      enabled: true
+    - camera_id: CAM_002
+      source_type: video
+      source: F:/vinfo/Final_vedio_Ai_system/tests/td_case2/multicamera_vehicle_tracking_pipeline/data/2test.mp4
+      enabled: true
+  max_frames_per_camera: 500
+
+ingestion:
+  worker_count: 7
+  target_read_fps: 10.0
+  frame_queue_size: 200
+  queue_put_timeout_seconds: 2.0
+  queue_get_timeout_seconds: 1.0
+  stop_on_camera_error: false
+  round_robin: true
+  raw_frames:
+    enabled: true
+    save_every_n_frames: 10
+    max_saved_frames_per_camera: 100
+    image_format: jpg
+    jpeg_quality: 90
+
+detection:
+  model_path: model_weights/best_old.pt
+  device: auto
+  confidence_threshold: 0.38
+  iou_threshold: 0.45
+  image_size: 640
+  allowed_classes:
+    - car
+    - truck
+    - bus
+    - motorcycle
+    - 3wheeler
+  bbox_quality:
+    enabled: true
+    minimum_width_pixels: 60
+    minimum_height_pixels: 60
+    minimum_area_ratio: 0.005
+    maximum_area_ratio: 0.90
+    minimum_aspect_ratio: 0.30
+    maximum_aspect_ratio: 4.50
+    reject_edge_truncated: true
+    edge_margin_pixels: 8
+
+tracking:
+  backend: supervision_bytetrack
+  track_activation_threshold: 0.15
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.80
+  minimum_consecutive_frames: 1
+
+visualization:
+  show_rejected_boxes: false
+  detected_frames:
+    enabled: true
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 100
+
+  tracked_frames:
+    enabled: true
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 100
+
+output:
+  root_directory: outputs/runs
+  save_run_config: true
