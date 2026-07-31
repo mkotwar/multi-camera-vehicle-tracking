@@ -10,17 +10,21 @@ from typing import Any
 import yaml
 
 from .detector_tracker import VehicleDetectorTracker
+from .evidence import EvidenceCollector
 from .ingestion_manager import MultiCameraIngestionManager
 from .logging_setup import setup_logging
 from .models import (
     ConfigurationError,
+    LocalTrack,
     RUN_STATUS_COMPLETED,
     RUN_STATUS_CREATED,
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
+    TrackObservation,
     RunMetadata,
 )
 from .output_writer import RunOutputManager
+from .track_manager import TrackManager
 
 
 def _normalize_bbox_quality_section(raw_bbox_quality: Any) -> dict[str, Any]:
@@ -114,6 +118,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     ingestion = raw_config.get("ingestion")
     detection = raw_config.get("detection")
     tracking = raw_config.get("tracking")
+    evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
     if not isinstance(project, dict):
@@ -126,6 +131,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Missing or invalid 'detection' section.")
     if not isinstance(tracking, dict):
         raise ConfigurationError("Missing or invalid 'tracking' section.")
+    if evidence is not None and not isinstance(evidence, dict):
+        raise ConfigurationError("Invalid 'evidence' section.")
     if not isinstance(visualization, dict):
         raise ConfigurationError("Missing or invalid 'visualization' section.")
     if not isinstance(output_section, dict):
@@ -221,6 +228,24 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     if not allowed_classes:
         raise ConfigurationError("detection.allowed_classes must not be empty.")
     normalized_bbox_quality = _normalize_bbox_quality_section(detection.get("bbox_quality", {}))
+    lifecycle = dict(raw_config.get("lifecycle", {}) or {})
+    track_class = dict(raw_config.get("track_class", {}) or {})
+    lifecycle_minimum_observations = int(lifecycle.get("minimum_observations", 3))
+    lifecycle_maximum_lost_frames = int(lifecycle.get("maximum_lost_frames", 30))
+    if lifecycle_minimum_observations < 1:
+        raise ConfigurationError("lifecycle.minimum_observations must be at least 1.")
+    if lifecycle_maximum_lost_frames < 0:
+        raise ConfigurationError("lifecycle.maximum_lost_frames must be at least 0.")
+    track_class_minimum_observations = int(track_class.get("minimum_observations", 3))
+    track_class_minimum_winner_ratio = float(track_class.get("minimum_winner_ratio", 0.60))
+    track_class_strategy = str(track_class.get("strategy", "confidence_weighted_majority")).strip() or "confidence_weighted_majority"
+    unknown_class_name = str(track_class.get("unknown_class_name", "UNKNOWN")).strip() or "UNKNOWN"
+    if track_class_minimum_observations < 1:
+        raise ConfigurationError("track_class.minimum_observations must be at least 1.")
+    if not 0.0 <= track_class_minimum_winner_ratio <= 1.0:
+        raise ConfigurationError("track_class.minimum_winner_ratio must be between 0 and 1.")
+    if track_class_strategy != "confidence_weighted_majority":
+        raise ConfigurationError("track_class.strategy must be confidence_weighted_majority.")
 
     detected_frames = dict(visualization.get("detected_frames", {}) or {})
     tracked_frames = dict(visualization.get("tracked_frames", {}) or {})
@@ -235,6 +260,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         output_root = (config_path.parent / output_root).resolve()
     else:
         output_root = output_root.resolve()
+    evidence_section = dict(evidence or {})
+    evidence_weights = dict(evidence_section.get("best_overall_weights", {}) or {})
 
     return {
         "project": {
@@ -268,6 +295,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "confidence_threshold": float(detection.get("confidence_threshold", 0.38)),
             "iou_threshold": float(detection.get("iou_threshold", 0.45)),
             "image_size": int(detection.get("image_size", 640)),
+            "agnostic_nms": bool(detection.get("agnostic_nms", False)),
             "allowed_classes": allowed_classes,
             "bbox_quality": normalized_bbox_quality,
         },
@@ -277,6 +305,55 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "lost_track_buffer": int(tracking.get("lost_track_buffer", 30)),
             "minimum_matching_threshold": float(tracking.get("minimum_matching_threshold", 0.80)),
             "minimum_consecutive_frames": int(tracking.get("minimum_consecutive_frames", 1)),
+            "isolation_mode": str(tracking.get("isolation_mode", "per_camera")).strip() or "per_camera",
+            "supported_isolation_modes": [
+                str(item).strip()
+                for item in tracking.get("supported_isolation_modes", ["per_camera", "per_camera_class"])
+                if str(item).strip()
+            ],
+        },
+        "lifecycle": {
+            "minimum_observations": lifecycle_minimum_observations,
+            "maximum_lost_frames": lifecycle_maximum_lost_frames,
+            "keep_discarded_tracks": bool(lifecycle.get("keep_discarded_tracks", True)),
+        },
+        "track_class": {
+            "minimum_observations": track_class_minimum_observations,
+            "minimum_winner_ratio": track_class_minimum_winner_ratio,
+            "strategy": track_class_strategy,
+            "unknown_class_name": unknown_class_name,
+        },
+        "evidence": {
+            "enabled": bool(evidence_section.get("enabled", True)),
+            "collect_first": bool(evidence_section.get("collect_first", True)),
+            "collect_middle": bool(evidence_section.get("collect_middle", True)),
+            "collect_last": bool(evidence_section.get("collect_last", True)),
+            "collect_highest_confidence": bool(evidence_section.get("collect_highest_confidence", True)),
+            "collect_largest": bool(evidence_section.get("collect_largest", True)),
+            "collect_sharpest": bool(evidence_section.get("collect_sharpest", True)),
+            "collect_best_overall": bool(evidence_section.get("collect_best_overall", True)),
+            "maximum_candidates_per_track": int(evidence_section.get("maximum_candidates_per_track", 7)),
+            "minimum_crop_width_pixels": int(evidence_section.get("minimum_crop_width_pixels", 40)),
+            "minimum_crop_height_pixels": int(evidence_section.get("minimum_crop_height_pixels", 40)),
+            "crop_padding_ratio_x": float(evidence_section.get("crop_padding_ratio_x", 0.08)),
+            "crop_padding_ratio_y": float(evidence_section.get("crop_padding_ratio_y", 0.08)),
+            "minimum_padding_pixels": int(evidence_section.get("minimum_padding_pixels", 8)),
+            "clamp_bbox_to_frame": bool(evidence_section.get("clamp_bbox_to_frame", True)),
+            "reject_invalid_bbox": bool(evidence_section.get("reject_invalid_bbox", True)),
+            "sharpness_enabled": bool(evidence_section.get("sharpness_enabled", True)),
+            "jpeg_quality": int(evidence_section.get("jpeg_quality", 90)),
+            "save_vehicle_crops": bool(evidence_section.get("save_vehicle_crops", True)),
+            "save_annotated_full_frames": bool(evidence_section.get("save_annotated_full_frames", True)),
+            "save_all_candidates": bool(evidence_section.get("save_all_candidates", False)),
+            "include_discarded_tracks": bool(evidence_section.get("include_discarded_tracks", False)),
+            "fail_pipeline_on_error": bool(evidence_section.get("fail_pipeline_on_error", False)),
+            "best_overall_weights": {
+                "confidence": float(evidence_weights.get("confidence", 0.35)),
+                "sharpness": float(evidence_weights.get("sharpness", 0.25)),
+                "bbox_area": float(evidence_weights.get("bbox_area", 0.20)),
+                "centeredness": float(evidence_weights.get("centeredness", 0.10)),
+                "edge_visibility": float(evidence_weights.get("edge_visibility", 0.10)),
+            },
         },
         "visualization": {
             "show_rejected_boxes": bool(visualization.get("show_rejected_boxes", False)),
@@ -354,6 +431,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
     output_manager.save_metadata(metadata)
 
     ingestion_manager: MultiCameraIngestionManager | None = None
+    track_manager: TrackManager | None = None
+    evidence_collector: EvidenceCollector | None = None
     try:
         logger.info("Pipeline started")
         if deferred_setup_error is not None:
@@ -369,6 +448,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
 
         ingestion_manager = MultiCameraIngestionManager(validated_config, logger)
         detector_tracker = VehicleDetectorTracker(validated_config, logger)
+        track_manager = TrackManager(validated_config, logger)
+        evidence_collector = EvidenceCollector(validated_config, logger, output_manager)
         ingestion_manager.start()
 
         raw_frames_config = dict(validated_config["ingestion"]["raw_frames"])
@@ -387,6 +468,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         rejected_by_class: dict[str, int] = {}
         accepted_by_class: dict[str, int] = {}
         unique_native_track_ids_by_camera: dict[str, set[int]] = {camera_id: set() for camera_id in frames_by_camera}
+        lifecycle_completed_tracks: list[LocalTrack] = []
         saved_detected_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         saved_tracked_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
 
@@ -420,6 +502,10 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                     rejected_by_reason[diagnostic.rejection_reason] = rejected_by_reason.get(diagnostic.rejection_reason, 0) + 1
             for tracked_item in result.tracked_detections:
                 unique_native_track_ids_by_camera[packet.camera_id].add(tracked_item.tracker_id)
+            evidence_collector.register_frame(packet, result.tracked_detections)
+            completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
+            lifecycle_completed_tracks.extend(completed_now)
+            evidence_collector.finalize_tracks(completed_now)
             logger.debug(
                 "camera=%s worker=%s frame=%s timestamp=%.3f queue_size=%s detections=%s tracked=%s",
                 packet.camera_id,
@@ -453,30 +539,47 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 saved_tracked_frames_by_camera[packet.camera_id] += 1
             ingestion_manager.mark_task_done()
 
+        for camera_id in frames_by_camera:
+            completed_now = track_manager.flush_camera(camera_id)
+            lifecycle_completed_tracks.extend(completed_now)
+            evidence_collector.finalize_tracks(completed_now)
+            detector_tracker.reset_camera(camera_id)
         ingestion_manager.set_saved_raw_frames_by_camera(saved_raw_frames_by_camera)
         ingestion_manager.stop()
         metrics = ingestion_manager.get_metrics()
+        lifecycle_metrics = track_manager.get_metrics()
+        metadata.completed_tracks = len([track for track in track_manager.get_all_output_tracks() if track.status == "COMPLETED"])
         metadata.error_count = len(metrics["camera_errors"])
         metadata.status = RUN_STATUS_COMPLETED
         metadata.completed_at = datetime.now(timezone.utc).isoformat()
         output_manager.save_metadata(metadata)
         output_manager.save_ingestion_metrics(metrics)
-        inference_times = detector_tracker.metrics["inference_times_ms"]
+        tracker_metrics = detector_tracker.metrics
+        inference_times = tracker_metrics["inference_times_ms"]
         detection_tracking_metrics = {
             "model_path": validated_config["detection"]["model_path"],
             "device": detector_tracker.device,
             "confidence_threshold": validated_config["detection"]["confidence_threshold"],
             "iou_threshold": validated_config["detection"]["iou_threshold"],
             "image_size": validated_config["detection"]["image_size"],
+            "agnostic_nms": validated_config["detection"]["agnostic_nms"],
+            "isolation_mode": validated_config["tracking"]["isolation_mode"],
             "processed_frames_by_camera": frames_by_camera,
             "detections_by_camera": detections_by_camera,
             "tracked_observations_by_camera": tracked_observations_by_camera,
             "detections_by_class": detections_by_class,
             "unique_native_track_ids_by_camera": {camera_id: sorted(values) for camera_id, values in unique_native_track_ids_by_camera.items()},
-            "tracker_instance_count": detector_tracker.metrics["tracker_instance_count"],
+            "tracker_instance_count": tracker_metrics.get("tracker_instance_count", 0),
+            "tracker_instances_created_total": tracker_metrics.get(
+                "tracker_instances_created_total",
+                tracker_metrics.get("tracker_instance_count", 0),
+            ),
+            "tracker_keys": tracker_metrics.get("tracker_keys", []),
+            "trackers_created_by_camera": tracker_metrics.get("trackers_created_by_camera", {}),
+            "trackers_created_by_camera_namespace": tracker_metrics.get("trackers_created_by_camera_namespace", {}),
             "saved_detected_frames_by_camera": saved_detected_frames_by_camera,
             "saved_tracked_frames_by_camera": saved_tracked_frames_by_camera,
-            "inference_errors": detector_tracker.metrics["inference_errors"],
+            "inference_errors": tracker_metrics.get("inference_errors", []),
             "total_inference_time_ms": float(sum(inference_times)) if inference_times else 0.0,
             "average_inference_time_ms": float(sum(inference_times) / len(inference_times)) if inference_times else 0.0,
             "minimum_inference_time_ms": float(min(inference_times)) if inference_times else 0.0,
@@ -484,6 +587,15 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "duration_seconds": float(metrics.get("duration_seconds", 0.0)),
         }
         output_manager.save_detection_tracking_metrics(detection_tracking_metrics)
+        output_tracks = track_manager.get_all_output_tracks()
+        output_observations = track_manager.get_all_observations()
+        evidence_index_records = evidence_collector.evidence_index
+        evidence_summary_by_track = _build_evidence_summary_by_track(evidence_index_records)
+        tracks_path = output_manager.save_tracks([_serialize_track(track, evidence_summary_by_track) for track in output_tracks])
+        observations_path = output_manager.save_observations([_serialize_observation(item) for item in output_observations])
+        lifecycle_metrics_path = output_manager.save_track_lifecycle_metrics(lifecycle_metrics)
+        evidence_index_path = output_manager.save_evidence_index(evidence_index_records)
+        evidence_metrics_path = output_manager.save_evidence_metrics(evidence_collector.metrics)
         output_manager.save_bbox_quality_metrics(
             {
                 "raw_detections": raw_detections,
@@ -513,8 +625,20 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "saved_tracked_frames_by_camera": saved_tracked_frames_by_camera,
                 "camera_errors": metrics["camera_errors"],
                 "queue_full_events": metrics["queue_full_events"],
+                "tracks_completed_by_camera": lifecycle_metrics["tracks_completed_by_camera"],
+                "tracks_discarded_by_camera": lifecycle_metrics["tracks_discarded_by_camera"],
+                "observations_by_camera": lifecycle_metrics["observations_by_camera"],
+                "selected_evidence_records": len(evidence_index_records),
                 "run_directory": str(output_manager.run_directory),
             }
+        )
+        logger.info(
+            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s",
+            tracks_path,
+            observations_path,
+            lifecycle_metrics_path,
+            evidence_index_path,
+            evidence_metrics_path,
         )
         detector_tracker.reset_all()
         logger.info("Pipeline completed")
@@ -525,6 +649,11 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 ingestion_manager.stop()
             except Exception:
                 logger.exception("Ingestion shutdown failed during error handling")
+        if track_manager is not None:
+            try:
+                track_manager.flush_all()
+            except Exception:
+                logger.exception("TrackManager shutdown failed during error handling")
         metadata.status = RUN_STATUS_FAILED
         metadata.error_count += 1
         metadata.completed_at = datetime.now(timezone.utc).isoformat()
@@ -551,3 +680,78 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             }
         )
         return 1, output_manager.run_id, str(output_manager.run_directory)
+
+
+def _serialize_track(track: LocalTrack, evidence_summary_by_track: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    summary = (evidence_summary_by_track or {}).get(track.local_track_id, {})
+    payload = {
+        "local_track_id": track.local_track_id,
+        "camera_id": track.camera_id,
+        "tracker_namespace": track.tracker_namespace,
+        "native_tracker_id": track.native_tracker_id,
+        "status": track.status,
+        "first_frame": track.first_frame,
+        "last_frame": track.last_frame,
+        "first_timestamp_seconds": track.first_timestamp_seconds,
+        "last_timestamp_seconds": track.last_timestamp_seconds,
+        "observation_count": track.observation_count,
+        "lost_frames": track.lost_frames,
+        "final_class": track.final_class,
+        "final_class_reason": track.final_class_reason,
+        "class_counts": dict(track.class_counts),
+        "class_confidence_sums": dict(track.class_confidence_sums),
+        "completion_reason": track.completion_reason,
+    }
+    if summary:
+        payload["evidence_record_count"] = int(summary.get("evidence_record_count", 0))
+        payload["evidence_roles"] = list(summary.get("evidence_roles", []))
+        payload["evidence_directory"] = summary.get("evidence_directory")
+    else:
+        payload["evidence_record_count"] = 0
+        payload["evidence_roles"] = []
+        payload["evidence_directory"] = None
+    return payload
+
+
+def _serialize_observation(observation: TrackObservation) -> dict[str, Any]:
+    x1, y1, x2, y2 = observation.bbox_xyxy
+    return {
+        "local_track_id": observation.local_track_id,
+        "camera_id": observation.camera_id,
+        "tracker_namespace": observation.tracker_namespace,
+        "native_tracker_id": observation.native_tracker_id,
+        "frame_number": observation.frame_number,
+        "timestamp_seconds": observation.timestamp_seconds,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "confidence": observation.confidence,
+        "raw_class_id": observation.raw_class_id,
+        "raw_class_name": observation.raw_class_name,
+    }
+
+
+def _build_evidence_summary_by_track(evidence_index_records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    summary_by_track: dict[str, dict[str, Any]] = {}
+    for record in evidence_index_records:
+        local_track_id = str(record["local_track_id"])
+        summary = summary_by_track.setdefault(
+            local_track_id,
+            {
+                "evidence_record_count": 0,
+                "evidence_roles": [],
+                "evidence_directory": None,
+            },
+        )
+        summary["evidence_record_count"] += 1
+        summary["evidence_roles"].append(str(record["role"]))
+        if summary["evidence_directory"] is None:
+            crop_path = record.get("crop_path")
+            annotated_path = record.get("annotated_frame_path")
+            source_path = crop_path or annotated_path
+            if source_path:
+                summary["evidence_directory"] = str(Path(str(source_path)).parent.parent)
+    for summary in summary_by_track.values():
+        summary["evidence_roles"] = sorted(set(summary["evidence_roles"]))
+    return summary_by_track

@@ -123,7 +123,14 @@ def _per_class_bbox_quality_config(*, default_overrides: dict | None = None, cla
     }
 
 
-def _config(model_path: str, *, bbox_quality: dict | None = None, show_rejected_boxes: bool = False) -> dict:
+def _config(
+    model_path: str,
+    *,
+    bbox_quality: dict | None = None,
+    show_rejected_boxes: bool = False,
+    isolation_mode: str = "per_camera",
+    agnostic_nms: bool = False,
+) -> dict:
     return {
         "detection": {
             "model_path": model_path,
@@ -131,11 +138,14 @@ def _config(model_path: str, *, bbox_quality: dict | None = None, show_rejected_
             "confidence_threshold": 0.38,
             "iou_threshold": 0.45,
             "image_size": 640,
+            "agnostic_nms": agnostic_nms,
             "allowed_classes": ["car", "truck", "bus", "motorcycle", "3wheeler"],
             "bbox_quality": bbox_quality or _bbox_quality_config(),
         },
         "tracking": {
             "backend": "supervision_bytetrack",
+            "isolation_mode": isolation_mode,
+            "supported_isolation_modes": ["per_camera", "per_camera_class"],
             "track_activation_threshold": 0.15,
             "lost_track_buffer": 30,
             "minimum_matching_threshold": 0.80,
@@ -147,7 +157,14 @@ def _config(model_path: str, *, bbox_quality: dict | None = None, show_rejected_
     }
 
 
-def _build_tracker(tmp_path: Path, *, bbox_quality: dict | None = None, show_rejected_boxes: bool = False):
+def _build_tracker(
+    tmp_path: Path,
+    *,
+    bbox_quality: dict | None = None,
+    show_rejected_boxes: bool = False,
+    isolation_mode: str = "per_camera",
+    agnostic_nms: bool = False,
+):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
     model = FakeModel(str(model_path))
@@ -159,7 +176,13 @@ def _build_tracker(tmp_path: Path, *, bbox_quality: dict | None = None, show_rej
         return tracker
 
     detector_tracker = VehicleDetectorTracker(
-        _config(str(model_path), bbox_quality=bbox_quality, show_rejected_boxes=show_rejected_boxes),
+        _config(
+            str(model_path),
+            bbox_quality=bbox_quality,
+            show_rejected_boxes=show_rejected_boxes,
+            isolation_mode=isolation_mode,
+            agnostic_nms=agnostic_nms,
+        ),
         _logger(),
         model_loader=lambda _: model,
         tracker_factory=tracker_factory,
@@ -199,6 +222,7 @@ def test_model_is_loaded_only_once_and_config_is_passed(tmp_path: Path) -> None:
     assert model.predict_calls[0]["conf"] == 0.38
     assert model.predict_calls[0]["iou"] == 0.45
     assert model.predict_calls[0]["imgsz"] == 640
+    assert model.predict_calls[0]["agnostic_nms"] is False
 
 
 def test_allowed_classes_are_filtered_and_empty_results_do_not_crash(tmp_path: Path) -> None:
@@ -255,6 +279,7 @@ def test_native_tracker_ids_and_raw_class_confidence_are_preserved_and_annotatio
     model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.84])
     result = detector_tracker.process_frame(_frame_packet())
     assert result.tracked_detections[0].tracker_id == 1
+    assert result.tracked_detections[0].tracker_namespace == "camera"
     assert result.tracked_detections[0].raw_class_name == "car"
     assert result.tracked_detections[0].confidence == pytest.approx(0.84)
     assert detector_tracker.build_detected_label(result.detections[0]) == "CAR 0.84"
@@ -348,6 +373,11 @@ def test_per_class_profile_lookup_uses_specific_class_and_unknown_uses_default(t
     assert detector_tracker.get_bbox_quality_profile("car").minimum_width_pixels == 25
     assert detector_tracker.get_bbox_quality_profile("bike").minimum_width_pixels == 12
     assert detector_tracker.get_bbox_quality_profile("unknown").minimum_width_pixels == 60
+
+
+def test_default_isolation_mode_remains_per_camera(tmp_path: Path) -> None:
+    detector_tracker, _model, _trackers = _build_tracker(tmp_path)
+    assert detector_tracker.isolation_mode == "per_camera"
 
 
 def test_every_yaml_value_is_configurable_per_class(tmp_path: Path) -> None:
@@ -480,3 +510,92 @@ def test_edge_mode_c_rejects_only_edge_plus_insufficient_dimensions(tmp_path: Pa
     result = detector_tracker.process_frame(_frame_packet())
     assert result.detections == []
     assert result.bbox_quality_diagnostics[0].rejection_reason == "BBOX_TOO_NARROW"
+
+
+def test_per_camera_class_uses_one_tracker_per_camera_and_class_and_yolo_once(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        isolation_mode="per_camera_class",
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, reject_edge_truncated=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120], [30, 30, 100, 160]],
+        cls=[0, 3],
+        conf=[0.9, 0.85],
+    )
+    result = detector_tracker.process_frame(_frame_packet())
+    assert len(model.predict_calls) == 1
+    assert len(created_trackers) == 2
+    assert {item.tracker_namespace for item in result.tracked_detections} == {"car", "motorcycle"}
+    assert all(item.tracker_id == 1 for item in result.tracked_detections)
+
+
+def test_detections_are_grouped_by_normalized_class_and_enter_only_matching_tracker(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        isolation_mode="per_camera_class",
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, reject_edge_truncated=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120], [30, 30, 100, 160], [40, 40, 150, 180]],
+        cls=[0, 3, 4],
+        conf=[0.9, 0.85, 0.8],
+    )
+    detector_tracker.process_frame(_frame_packet())
+    assert len(created_trackers) == 3
+    forwarded_class_ids = sorted(tracker.calls[0].class_id.tolist() for tracker in created_trackers)
+    assert forwarded_class_ids == [[0], [3], [4]]
+
+
+def test_same_native_tracker_id_from_different_class_trackers_produces_different_namespaced_results(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(
+        tmp_path,
+        isolation_mode="per_camera_class",
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, reject_edge_truncated=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120], [30, 30, 100, 160]],
+        cls=[0, 3],
+        conf=[0.9, 0.85],
+    )
+    result = detector_tracker.process_frame(_frame_packet())
+    local_ids = {f"{item.camera_id}:{item.tracker_namespace.upper()}:TRACK_{item.tracker_id}" for item in result.tracked_detections}
+    assert local_ids == {"CAM_001:CAR:TRACK_1", "CAM_001:MOTORCYCLE:TRACK_1"}
+
+
+def test_empty_class_tracker_updates_are_sent_for_existing_class_trackers(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        isolation_mode="per_camera_class",
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, reject_edge_truncated=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120], [30, 30, 100, 160]],
+        cls=[0, 3],
+        conf=[0.9, 0.85],
+    )
+    detector_tracker.process_frame(_frame_packet())
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.92])
+    detector_tracker.process_frame(_frame_packet(frame_number=1))
+    assert len(created_trackers) == 2
+    assert created_trackers[0].calls[1].xyxy.tolist() == [[20.0, 20.0, 120.0, 120.0]]
+    assert created_trackers[1].calls[1].xyxy.tolist() == []
+
+
+def test_reset_camera_resets_every_class_tracker_for_that_camera(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(
+        tmp_path,
+        isolation_mode="per_camera_class",
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, reject_edge_truncated=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120], [30, 30, 100, 160]],
+        cls=[0, 3],
+        conf=[0.9, 0.85],
+    )
+    detector_tracker.process_frame(_frame_packet(camera_id="CAM_001"))
+    detector_tracker.process_frame(_frame_packet(camera_id="CAM_002", frame_number=0))
+    detector_tracker.reset_camera("CAM_001")
+    assert ("CAM_001", "car") not in detector_tracker._trackers
+    assert ("CAM_001", "motorcycle") not in detector_tracker._trackers
+    assert ("CAM_002", "car") in detector_tracker._trackers

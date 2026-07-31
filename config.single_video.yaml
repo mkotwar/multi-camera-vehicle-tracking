@@ -7,14 +7,14 @@ input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: C:\Users\MKProjects\Downloads\cut praveen_test_.mp4
+      source: C:/Users/MKProjects/Downloads/cut praveen_test_.mp4
       enabled: true
-
+    
     - camera_id: CAM_002
       source_type: video
       source: F:/vinfo/Final_vedio_Ai_system/tests/td_case2/multicamera_vehicle_tracking_pipeline/data/2test.mp4
-      enabled: true
-  max_frames_per_camera: 100
+      enabled: false
+  max_frames_per_camera: 500
 
 ingestion:
   worker_count: 7
@@ -27,7 +27,7 @@ ingestion:
   raw_frames:
     enabled: true
     save_every_n_frames: 10
-    max_saved_frames_per_camera: 10
+    max_saved_frames_per_camera: 100
     image_format: jpg
     jpeg_quality: 90
 
@@ -37,7 +37,6 @@ detection:
   confidence_threshold: 0.38
   iou_threshold: 0.45
   image_size: 640
-  agnostic_nms: false
   allowed_classes:
     - car
     - truck
@@ -57,68 +56,22 @@ detection:
 
 tracking:
   backend: supervision_bytetrack
-  isolation_mode: per_camera
-  supported_isolation_modes:
-    - per_camera
-    - per_camera_class
   track_activation_threshold: 0.15
   lost_track_buffer: 30
   minimum_matching_threshold: 0.80
   minimum_consecutive_frames: 1
 
-lifecycle:
-  minimum_observations: 3
-  maximum_lost_frames: 30
-  keep_discarded_tracks: true
-
-track_class:
-  minimum_observations: 3
-  minimum_winner_ratio: 0.60
-  strategy: confidence_weighted_majority
-  unknown_class_name: UNKNOWN
-
-evidence:
-  enabled: true
-  collect_first: true
-  collect_middle: true
-  collect_last: true
-  collect_highest_confidence: true
-  collect_largest: true
-  collect_sharpest: true
-  collect_best_overall: true
-  maximum_candidates_per_track: 7
-  minimum_crop_width_pixels: 40
-  minimum_crop_height_pixels: 40
-  crop_padding_ratio_x: 0.08
-  crop_padding_ratio_y: 0.08
-  minimum_padding_pixels: 8
-  clamp_bbox_to_frame: true
-  reject_invalid_bbox: true
-  sharpness_enabled: true
-  best_overall_weights:
-    confidence: 0.35
-    sharpness: 0.25
-    bbox_area: 0.20
-    centeredness: 0.10
-    edge_visibility: 0.10
-  jpeg_quality: 90
-  save_vehicle_crops: true
-  save_annotated_full_frames: true
-  save_all_candidates: false
-  include_discarded_tracks: false
-  fail_pipeline_on_error: false
-
 visualization:
   show_rejected_boxes: false
   detected_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 100
 
   tracked_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 100
 
 output:
   root_directory: outputs/runs

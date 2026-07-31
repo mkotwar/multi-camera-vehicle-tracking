@@ -34,6 +34,7 @@ class _FakeDetectorTrackerResult:
         self.tracked_detections = [
             TrackedDetection(
                 camera_id=packet.camera_id,
+                tracker_namespace="camera",
                 frame_number=packet.frame_number,
                 timestamp_seconds=packet.timestamp_seconds,
                 tracker_id=1,
@@ -84,6 +85,10 @@ class FakeVehicleDetectorTracker:
             "model_load_count": 1,
             "tracker_instance_count": 2,
             "tracker_camera_ids": ["CAM_001", "CAM_002"],
+            "tracker_instances_created_total": 2,
+            "tracker_keys": ["CAM_001", "CAM_002"],
+            "trackers_created_by_camera": {"CAM_001": 1, "CAM_002": 1},
+            "trackers_created_by_camera_namespace": {"CAM_001:camera": 1, "CAM_002:camera": 1},
             "inference_times_ms": [],
             "inference_errors": [],
         }
@@ -91,6 +96,9 @@ class FakeVehicleDetectorTracker:
     def process_frame(self, packet):
         self.metrics["inference_times_ms"].append(5.0)
         return _FakeDetectorTrackerResult(packet)
+
+    def reset_camera(self, camera_id):
+        return None
 
     def reset_all(self):
         return None
@@ -134,6 +142,7 @@ def _write_config(
             "confidence_threshold": 0.38,
             "iou_threshold": 0.45,
             "image_size": 640,
+            "agnostic_nms": False,
             "allowed_classes": ["car", "truck", "bus", "motorcycle", "3wheeler"],
             "bbox_quality": {
                 "enabled": True,
@@ -149,10 +158,55 @@ def _write_config(
         },
         "tracking": {
             "backend": "supervision_bytetrack",
+            "isolation_mode": "per_camera",
+            "supported_isolation_modes": ["per_camera", "per_camera_class"],
             "track_activation_threshold": 0.15,
             "lost_track_buffer": 30,
             "minimum_matching_threshold": 0.80,
             "minimum_consecutive_frames": 1,
+        },
+        "lifecycle": {
+            "minimum_observations": 3,
+            "maximum_lost_frames": 30,
+            "keep_discarded_tracks": True,
+        },
+        "track_class": {
+            "minimum_observations": 3,
+            "minimum_winner_ratio": 0.60,
+            "strategy": "confidence_weighted_majority",
+            "unknown_class_name": "UNKNOWN",
+        },
+        "evidence": {
+            "enabled": True,
+            "collect_first": True,
+            "collect_middle": True,
+            "collect_last": True,
+            "collect_highest_confidence": True,
+            "collect_largest": True,
+            "collect_sharpest": True,
+            "collect_best_overall": True,
+            "maximum_candidates_per_track": 7,
+            "minimum_crop_width_pixels": 5,
+            "minimum_crop_height_pixels": 5,
+            "crop_padding_ratio_x": 0.08,
+            "crop_padding_ratio_y": 0.08,
+            "minimum_padding_pixels": 2,
+            "clamp_bbox_to_frame": True,
+            "reject_invalid_bbox": True,
+            "sharpness_enabled": True,
+            "best_overall_weights": {
+                "confidence": 0.35,
+                "sharpness": 0.25,
+                "bbox_area": 0.20,
+                "centeredness": 0.10,
+                "edge_visibility": 0.10,
+            },
+            "jpeg_quality": 90,
+            "save_vehicle_crops": True,
+            "save_annotated_full_frames": True,
+            "save_all_candidates": False,
+            "include_discarded_tracks": False,
+            "fail_pipeline_on_error": False,
         },
         "visualization": {
             "show_rejected_boxes": False,
@@ -183,6 +237,11 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     metrics = json.loads((run_dir / "ingestion_metrics.json").read_text(encoding="utf-8"))
     dt_metrics = json.loads((run_dir / "detection_tracking_metrics.json").read_text(encoding="utf-8"))
     bbox_metrics = json.loads((run_dir / "bbox_quality_metrics.json").read_text(encoding="utf-8"))
+    lifecycle_metrics = json.loads((run_dir / "track_lifecycle_metrics.json").read_text(encoding="utf-8"))
+    evidence_index = json.loads((run_dir / "evidence_index.json").read_text(encoding="utf-8"))
+    evidence_metrics = json.loads((run_dir / "evidence_metrics.json").read_text(encoding="utf-8"))
+    tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
+    observations = (run_dir / "observations.csv").read_text(encoding="utf-8")
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert run_id == run_dir.name
@@ -192,6 +251,13 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert dt_metrics["detections_by_camera"]["CAM_001"] == 3
     assert bbox_metrics["accepted_detections"] == 3
     assert bbox_metrics["rejected_detections"] == 0
+    assert lifecycle_metrics["active_tracks_at_shutdown"] == 0
+    assert tracks[0]["local_track_id"] == "CAM_001:TRACK_1"
+    assert tracks[0]["evidence_record_count"] >= 1
+    assert "FIRST" in tracks[0]["evidence_roles"]
+    assert evidence_index[0]["local_track_id"] == "CAM_001:TRACK_1"
+    assert evidence_metrics["tracks_with_evidence"] >= 1
+    assert "CAM_001:TRACK_1" in observations
 
 
 def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path: Path) -> None:
@@ -218,11 +284,15 @@ def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path:
     run_dir = Path(run_directory)
     metrics = json.loads((run_dir / "ingestion_metrics.json").read_text(encoding="utf-8"))
     dt_metrics = json.loads((run_dir / "detection_tracking_metrics.json").read_text(encoding="utf-8"))
+    lifecycle_metrics = json.loads((run_dir / "track_lifecycle_metrics.json").read_text(encoding="utf-8"))
+    evidence_metrics = json.loads((run_dir / "evidence_metrics.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert metrics["frames_by_camera"]["CAM_001"] == 4
     assert metrics["frames_by_camera"]["CAM_002"] == 6
     assert dt_metrics["tracked_observations_by_camera"]["CAM_001"] == 4
     assert dt_metrics["tracked_observations_by_camera"]["CAM_002"] == 6
+    assert lifecycle_metrics["tracks_completed_by_camera"]["CAM_001"] >= 1
+    assert evidence_metrics["tracks_received"] >= 2
     assert (run_dir / "raw_frames" / "CAM_001").exists()
     assert (run_dir / "detected_frames" / "CAM_001").exists()
     assert (run_dir / "tracked_frames" / "CAM_001").exists()

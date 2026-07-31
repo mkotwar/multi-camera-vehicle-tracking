@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from src.evidence import (
+    EVIDENCE_ROLE_BEST_OVERALL,
+    EVIDENCE_ROLE_FIRST,
+    EVIDENCE_ROLE_HIGHEST_CONFIDENCE,
+    EVIDENCE_ROLE_LARGEST,
+    EVIDENCE_ROLE_LAST,
+    EVIDENCE_ROLE_MIDDLE,
+    EVIDENCE_ROLE_SHARPEST,
+    EvidenceCollector,
+)
+from src.logging_setup import setup_logging
+from src.models import (
+    FramePacket,
+    LocalTrack,
+    PipelineRuntimeError,
+    TrackObservation,
+    TrackedDetection,
+)
+from src.output_writer import RunOutputManager
+
+
+def _build_config(**evidence_overrides):
+    evidence = {
+        "enabled": True,
+        "collect_first": True,
+        "collect_middle": True,
+        "collect_last": True,
+        "collect_highest_confidence": True,
+        "collect_largest": True,
+        "collect_sharpest": True,
+        "collect_best_overall": True,
+        "maximum_candidates_per_track": 7,
+        "minimum_crop_width_pixels": 10,
+        "minimum_crop_height_pixels": 10,
+        "crop_padding_ratio_x": 0.0,
+        "crop_padding_ratio_y": 0.0,
+        "minimum_padding_pixels": 0,
+        "clamp_bbox_to_frame": True,
+        "reject_invalid_bbox": True,
+        "sharpness_enabled": True,
+        "best_overall_weights": {
+            "confidence": 0.35,
+            "sharpness": 0.25,
+            "bbox_area": 0.20,
+            "centeredness": 0.10,
+            "edge_visibility": 0.10,
+        },
+        "jpeg_quality": 90,
+        "save_vehicle_crops": True,
+        "save_annotated_full_frames": True,
+        "save_all_candidates": False,
+        "include_discarded_tracks": False,
+        "fail_pipeline_on_error": False,
+    }
+    evidence.update(evidence_overrides)
+    return {"evidence": evidence}
+
+
+def _make_frame(width: int = 120, height: int = 80, *, sharp: bool = False, fill: int = 80) -> np.ndarray:
+    frame = np.full((height, width, 3), fill, dtype=np.uint8)
+    if sharp:
+        for x in range(0, width, 4):
+            frame[:, x : x + 2] = 255
+    return frame
+
+
+def _packet(frame_number: int, frame: np.ndarray, *, camera_id: str = "CAM_001") -> FramePacket:
+    return FramePacket(
+        camera_id=camera_id,
+        frame_number=frame_number,
+        timestamp_seconds=frame_number / 10.0,
+        source_fps=10.0,
+        frame=frame,
+        worker_id=0,
+        captured_at="2026-07-30T00:00:00+00:00",
+        source_type="video",
+    )
+
+
+def _tracked(
+    frame_number: int,
+    *,
+    bbox_xyxy=(20.0, 20.0, 60.0, 60.0),
+    confidence: float = 0.8,
+    raw_class_name: str = "car",
+    tracker_id: int = 1,
+    tracker_namespace: str = "camera",
+    camera_id: str = "CAM_001",
+) -> TrackedDetection:
+    return TrackedDetection(
+        camera_id=camera_id,
+        tracker_namespace=tracker_namespace,
+        frame_number=frame_number,
+        timestamp_seconds=frame_number / 10.0,
+        tracker_id=tracker_id,
+        bbox_xyxy=bbox_xyxy,
+        confidence=confidence,
+        raw_class_id=0,
+        raw_class_name=raw_class_name,
+    )
+
+
+def _observation(
+    frame_number: int,
+    *,
+    bbox_xyxy=(20.0, 20.0, 60.0, 60.0),
+    confidence: float = 0.8,
+    raw_class_name: str = "car",
+    tracker_namespace: str = "camera",
+    camera_id: str = "CAM_001",
+    tracker_id: int = 1,
+    local_track_id: str = "CAM_001:TRACK_1",
+) -> TrackObservation:
+    return TrackObservation(
+        camera_id=camera_id,
+        tracker_namespace=tracker_namespace,
+        native_tracker_id=tracker_id,
+        local_track_id=local_track_id,
+        frame_number=frame_number,
+        timestamp_seconds=frame_number / 10.0,
+        bbox_xyxy=bbox_xyxy,
+        confidence=confidence,
+        raw_class_id=0,
+        raw_class_name=raw_class_name,
+    )
+
+
+def _track(
+    observations: list[TrackObservation],
+    *,
+    status: str = "COMPLETED",
+    local_track_id: str = "CAM_001:TRACK_1",
+    tracker_namespace: str = "camera",
+    camera_id: str = "CAM_001",
+    tracker_id: int = 1,
+    final_class: str = "car",
+) -> LocalTrack:
+    return LocalTrack(
+        local_track_id=local_track_id,
+        camera_id=camera_id,
+        tracker_namespace=tracker_namespace,
+        native_tracker_id=tracker_id,
+        status=status,
+        first_frame=observations[0].frame_number,
+        last_frame=observations[-1].frame_number,
+        first_timestamp_seconds=observations[0].timestamp_seconds,
+        last_timestamp_seconds=observations[-1].timestamp_seconds,
+        observation_count=len(observations),
+        lost_frames=0,
+        final_class=final_class,
+        final_class_reason="WEIGHTED_MAJORITY",
+        class_counts={final_class: len(observations)},
+        class_confidence_sums={final_class: sum(item.confidence for item in observations)},
+        observations=observations,
+        completion_reason="END_OF_STREAM",
+    )
+
+
+def _collector(tmp_path: Path, **evidence_overrides) -> tuple[EvidenceCollector, RunOutputManager]:
+    output_manager = RunOutputManager(tmp_path)
+    logger = setup_logging(output_manager.run_directory, log_level="INFO")
+    collector = EvidenceCollector(_build_config(**evidence_overrides), logger, output_manager)
+    return collector, output_manager
+
+
+def test_register_and_finalize_track_creates_evidence_files_and_reuses_paths(tmp_path: Path) -> None:
+    collector, output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    packet = _packet(0, frame)
+    tracked = _tracked(0, confidence=0.92, raw_class_name="motorcycle")
+    collector.register_frame(packet, [tracked])
+    track = _track([_observation(0, confidence=0.92, raw_class_name="motorcycle")], final_class="motorcycle")
+
+    evidence = collector.finalize_track(track)
+
+    assert {item.role for item in evidence} == {
+        EVIDENCE_ROLE_FIRST,
+        EVIDENCE_ROLE_MIDDLE,
+        EVIDENCE_ROLE_LAST,
+        EVIDENCE_ROLE_HIGHEST_CONFIDENCE,
+        EVIDENCE_ROLE_LARGEST,
+        EVIDENCE_ROLE_SHARPEST,
+        EVIDENCE_ROLE_BEST_OVERALL,
+    }
+    crop_paths = {item.crop_path for item in evidence}
+    annotated_paths = {item.annotated_frame_path for item in evidence}
+    assert len(crop_paths) == 1
+    assert len(annotated_paths) == 1
+    evidence_json = output_manager.evidence_directory / "CAM_001" / "CAM_001_TRACK_1" / "evidence.json"
+    payload = json.loads(evidence_json.read_text(encoding="utf-8"))
+    assert payload[0]["local_track_id"] == "CAM_001:TRACK_1"
+    assert payload[0]["tracker_namespace"] == "camera"
+    assert payload[0]["raw_class_name"] == "motorcycle"
+    assert payload[0]["final_class"] == "motorcycle"
+    assert collector.metrics["cache_frames_released"] == 1
+    assert collector._frame_cache == {}
+
+
+def test_middle_highest_largest_sharpest_and_best_overall_selection_are_correct(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        best_overall_weights={
+            "confidence": 0.0,
+            "sharpness": 2.0,
+            "bbox_area": 0.0,
+            "centeredness": 0.0,
+            "edge_visibility": 0.0,
+        },
+    )
+    frames = {
+        0: _make_frame(fill=30),
+        4: _make_frame(fill=60),
+        9: _make_frame(sharp=True),
+    }
+    detections = {
+        0: _tracked(0, bbox_xyxy=(10.0, 10.0, 40.0, 40.0), confidence=0.55),
+        4: _tracked(4, bbox_xyxy=(20.0, 20.0, 75.0, 75.0), confidence=0.95),
+        9: _tracked(9, bbox_xyxy=(25.0, 25.0, 50.0, 50.0), confidence=0.70),
+    }
+    observations = []
+    for frame_number in (0, 4, 9):
+        collector.register_frame(_packet(frame_number, frames[frame_number]), [detections[frame_number]])
+        observations.append(
+            _observation(
+                frame_number,
+                bbox_xyxy=detections[frame_number].bbox_xyxy,
+                confidence=detections[frame_number].confidence,
+            )
+        )
+    evidence = collector.finalize_track(_track(observations))
+    by_role = {item.role: item for item in evidence}
+
+    assert by_role[EVIDENCE_ROLE_FIRST].frame_number == 0
+    assert by_role[EVIDENCE_ROLE_MIDDLE].frame_number == 4
+    assert by_role[EVIDENCE_ROLE_LAST].frame_number == 9
+    assert by_role[EVIDENCE_ROLE_HIGHEST_CONFIDENCE].frame_number == 4
+    assert by_role[EVIDENCE_ROLE_LARGEST].frame_number == 4
+    assert by_role[EVIDENCE_ROLE_SHARPEST].frame_number == 9
+    assert by_role[EVIDENCE_ROLE_BEST_OVERALL].frame_number == 9
+
+
+def test_invalid_bbox_small_crop_and_empty_crop_are_rejected_without_crashing(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        minimum_crop_width_pixels=20,
+        minimum_crop_height_pixels=20,
+    )
+    frame = _make_frame(width=40, height=40)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(15.0, 15.0, 10.0, 25.0))])
+    collector.register_frame(_packet(1, frame), [_tracked(1, bbox_xyxy=(1.0, 1.0, 8.0, 8.0))])
+    collector.register_frame(
+        _packet(2, frame),
+        [_tracked(2, bbox_xyxy=(0.0, 0.0, 0.0, 0.0), confidence=0.7)],
+    )
+
+    assert collector.metrics["invalid_candidates"] == 3
+    assert collector.finalize_track(_track([_observation(0)], final_class="car")) == []
+
+
+def test_padding_is_clamped_to_frame_and_paths_are_separated_by_camera_and_track(tmp_path: Path) -> None:
+    collector, output_manager = _collector(
+        tmp_path,
+        crop_padding_ratio_x=0.5,
+        crop_padding_ratio_y=0.5,
+        minimum_padding_pixels=10,
+    )
+    frame = _make_frame(width=50, height=50, sharp=True)
+    collector.register_frame(_packet(0, frame, camera_id="CAM_001"), [_tracked(0, bbox_xyxy=(0.0, 0.0, 20.0, 20.0), camera_id="CAM_001")])
+    collector.register_frame(
+        _packet(0, frame, camera_id="CAM_002"),
+        [_tracked(0, bbox_xyxy=(5.0, 5.0, 25.0, 25.0), camera_id="CAM_002", tracker_namespace="car", tracker_id=9)],
+    )
+
+    track_one = _track([_observation(0)], camera_id="CAM_001", local_track_id="CAM_001:TRACK_1")
+    track_two = _track(
+        [_observation(0, camera_id="CAM_002", tracker_namespace="car", tracker_id=9, local_track_id="CAM_002:CAR:TRACK_9")],
+        camera_id="CAM_002",
+        tracker_namespace="car",
+        tracker_id=9,
+        local_track_id="CAM_002:CAR:TRACK_9",
+    )
+
+    evidence_one = collector.finalize_track(track_one)
+    evidence_two = collector.finalize_track(track_two)
+
+    assert Path(evidence_one[0].crop_path).is_file()
+    assert Path(evidence_two[0].crop_path).is_file()
+    assert "CAM_001_TRACK_1" in evidence_one[0].crop_path
+    assert "CAM_002_CAR_TRACK_9" in evidence_two[0].crop_path
+    assert (output_manager.evidence_directory / "CAM_001" / "CAM_001_TRACK_1").exists()
+    assert (output_manager.evidence_directory / "CAM_002" / "CAM_002_CAR_TRACK_9").exists()
+
+
+def test_discarded_tracks_are_excluded_by_default_and_can_be_included(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    frame = _make_frame()
+    collector.register_frame(_packet(0, frame), [_tracked(0)])
+    discarded_track = _track([_observation(0)], status="DISCARDED", final_class="UNKNOWN")
+
+    assert collector.finalize_track(discarded_track) == []
+
+    collector_included, _output_manager_included = _collector(tmp_path / "included", include_discarded_tracks=True)
+    collector_included.register_frame(_packet(0, frame), [_tracked(0)])
+    evidence = collector_included.finalize_track(discarded_track)
+
+    assert evidence
+    assert collector_included.metrics["tracks_with_evidence"] == 1
+
+
+def test_write_errors_are_logged_when_non_strict_and_raised_when_strict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    collector, output_manager = _collector(tmp_path, fail_pipeline_on_error=False)
+    frame = _make_frame()
+    collector.register_frame(_packet(0, frame), [_tracked(0)])
+    track = _track([_observation(0)])
+
+    def _fail_crop(*args, **kwargs):
+        raise OSError("crop write failed")
+
+    monkeypatch.setattr(output_manager, "save_evidence_crop", _fail_crop)
+    evidence = collector.finalize_track(track)
+    assert evidence
+    assert collector.metrics["errors"]
+
+    strict_collector, strict_output_manager = _collector(tmp_path / "strict", fail_pipeline_on_error=True)
+    strict_collector.register_frame(_packet(0, frame), [_tracked(0)])
+    monkeypatch.setattr(strict_output_manager, "save_evidence_crop", _fail_crop)
+    with pytest.raises(PipelineRuntimeError):
+        strict_collector.finalize_track(track)
+
+
+def test_evidence_index_and_metrics_files_can_be_written_from_collector_results(tmp_path: Path) -> None:
+    collector, output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0)])
+    evidence = collector.finalize_track(_track([_observation(0)]))
+
+    evidence_index_path = output_manager.save_evidence_index(collector.evidence_index)
+    evidence_metrics_path = output_manager.save_evidence_metrics(collector.metrics)
+
+    assert evidence
+    assert json.loads(evidence_index_path.read_text(encoding="utf-8"))[0]["local_track_id"] == "CAM_001:TRACK_1"
+    assert json.loads(evidence_metrics_path.read_text(encoding="utf-8"))["tracks_with_evidence"] == 1

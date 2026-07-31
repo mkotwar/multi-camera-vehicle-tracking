@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import asdict
 from datetime import datetime
@@ -83,6 +84,61 @@ class RunOutputManager:
         path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return path
 
+    def save_tracks(self, tracks: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "tracks.json"
+        path.write_text(json.dumps(tracks, indent=2), encoding="utf-8")
+        return path
+
+    def save_observations(self, observations: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "observations.csv"
+        fieldnames = [
+            "local_track_id",
+            "camera_id",
+            "tracker_namespace",
+            "native_tracker_id",
+            "frame_number",
+            "timestamp_seconds",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "confidence",
+            "raw_class_id",
+            "raw_class_name",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in observations:
+                writer.writerow(item)
+        return path
+
+    def save_track_lifecycle_metrics(self, metrics: dict[str, Any]) -> Path:
+        path = self.run_directory / "track_lifecycle_metrics.json"
+        path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return path
+
+    def save_evidence_index(self, records: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "evidence_index.json"
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        return path
+
+    def save_evidence_metrics(self, metrics: dict[str, Any]) -> Path:
+        path = self.run_directory / "evidence_metrics.json"
+        path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return path
+
+    def evidence_track_directory(self, camera_id: str, safe_local_track_id: str) -> Path:
+        path = self.evidence_directory / camera_id / safe_local_track_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_track_evidence(self, camera_id: str, safe_local_track_id: str, records: list[dict[str, Any]]) -> Path:
+        track_directory = self.evidence_track_directory(camera_id, safe_local_track_id)
+        path = track_directory / "evidence.json"
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        return path
+
     def save_error(self, error_name: str, payload: dict[str, Any]) -> Path:
         path = self.errors_directory / f"{error_name}.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -115,8 +171,45 @@ class RunOutputManager:
         camera_directory = self.tracked_frames_directory / camera_id
         camera_directory.mkdir(parents=True, exist_ok=True)
         frame_path = camera_directory / f"frame_{frame_number:06d}.jpg"
-        cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        self._write_image(frame_path, frame, jpeg_quality=90)
         return frame_path
+
+    def save_evidence_crop(
+        self,
+        camera_id: str,
+        safe_local_track_id: str,
+        frame_number: int,
+        crop: np.ndarray,
+        *,
+        jpeg_quality: int,
+    ) -> Path:
+        track_directory = self.evidence_track_directory(camera_id, safe_local_track_id)
+        crop_directory = track_directory / "crops"
+        crop_directory.mkdir(parents=True, exist_ok=True)
+        path = crop_directory / f"frame_{frame_number:06d}.jpg"
+        self._write_image(path, crop, jpeg_quality=jpeg_quality)
+        return path
+
+    def save_evidence_annotated_frame(
+        self,
+        camera_id: str,
+        safe_local_track_id: str,
+        frame_number: int,
+        frame: np.ndarray,
+        *,
+        jpeg_quality: int,
+    ) -> Path:
+        track_directory = self.evidence_track_directory(camera_id, safe_local_track_id)
+        annotated_directory = track_directory / "annotated_frames"
+        annotated_directory.mkdir(parents=True, exist_ok=True)
+        path = annotated_directory / f"frame_{frame_number:06d}.jpg"
+        self._write_image(path, frame, jpeg_quality=jpeg_quality)
+        return path
 
     def future_output_path(self, *parts: str) -> Path:
         return self.run_directory.joinpath(*parts)
+
+    def _write_image(self, path: Path, frame: np.ndarray, *, jpeg_quality: int) -> None:
+        success = cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+        if not success:
+            raise OSError(f"Failed to write image: {path}")

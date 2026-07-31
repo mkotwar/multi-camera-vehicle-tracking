@@ -20,6 +20,9 @@ EDGE_MODE_B = "B"
 EDGE_MODE_C = "C"
 EDGE_MODE_LEGACY = "LEGACY"
 SUPPORTED_EDGE_MODES = {EDGE_MODE_A, EDGE_MODE_B, EDGE_MODE_C, EDGE_MODE_LEGACY}
+TRACKER_ISOLATION_MODE_PER_CAMERA = "per_camera"
+TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS = "per_camera_class"
+SUPPORTED_TRACKER_ISOLATION_MODES = {TRACKER_ISOLATION_MODE_PER_CAMERA, TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS}
 
 ALIAS_TO_CANONICAL_CLASS = {
     "3wheeler": "3wheeler",
@@ -86,6 +89,7 @@ class VehicleDetectorTracker:
         self.confidence_threshold = float(detection_config.get("confidence_threshold", 0.38))
         self.iou_threshold = float(detection_config.get("iou_threshold", 0.45))
         self.image_size = int(detection_config.get("image_size", 640))
+        self.agnostic_nms = bool(detection_config.get("agnostic_nms", False))
         self.allowed_classes = [self._normalize_class_name(name) for name in detection_config.get("allowed_classes", [])]
         if not self.allowed_classes:
             raise ConfigurationError("detection.allowed_classes must not be empty.")
@@ -96,6 +100,12 @@ class VehicleDetectorTracker:
         self.lost_track_buffer = int(tracking_config.get("lost_track_buffer", 30))
         self.minimum_matching_threshold = float(tracking_config.get("minimum_matching_threshold", 0.80))
         self.minimum_consecutive_frames = int(tracking_config.get("minimum_consecutive_frames", 1))
+        self.isolation_mode = str(tracking_config.get("isolation_mode", TRACKER_ISOLATION_MODE_PER_CAMERA)).strip()
+        self.supported_isolation_modes = [str(item).strip() for item in tracking_config.get("supported_isolation_modes", []) if str(item).strip()]
+        if not self.supported_isolation_modes:
+            self.supported_isolation_modes = [TRACKER_ISOLATION_MODE_PER_CAMERA, TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS]
+        if self.isolation_mode not in self.supported_isolation_modes or self.isolation_mode not in SUPPORTED_TRACKER_ISOLATION_MODES:
+            raise ConfigurationError(f"Unsupported tracking.isolation_mode value: {self.isolation_mode}")
         visualization_config = dict(self.config.get("visualization", {}) or {})
         self.show_rejected_boxes = bool(visualization_config.get("show_rejected_boxes", False))
         self._model_loader = model_loader or YOLO
@@ -103,11 +113,15 @@ class VehicleDetectorTracker:
         self._model: Any | None = None
         self._model_class_names: dict[int, str] = {}
         self._allowed_model_class_ids: set[int] = set()
-        self._trackers: dict[str, Any] = {}
+        self._trackers: dict[str | tuple[str, str], Any] = {}
         self._metrics: dict[str, Any] = {
             "model_load_count": 0,
             "tracker_instance_count": 0,
+            "tracker_instances_created_total": 0,
             "tracker_camera_ids": [],
+            "tracker_keys": [],
+            "trackers_created_by_camera": {},
+            "trackers_created_by_camera_namespace": {},
             "inference_times_ms": [],
             "inference_errors": [],
         }
@@ -118,6 +132,9 @@ class VehicleDetectorTracker:
         return {
             **self._metrics,
             "tracker_camera_ids": list(self._metrics["tracker_camera_ids"]),
+            "tracker_keys": list(self._metrics["tracker_keys"]),
+            "trackers_created_by_camera": dict(self._metrics["trackers_created_by_camera"]),
+            "trackers_created_by_camera_namespace": dict(self._metrics["trackers_created_by_camera_namespace"]),
             "inference_times_ms": list(self._metrics["inference_times_ms"]),
             "inference_errors": list(self._metrics["inference_errors"]),
         }
@@ -134,6 +151,7 @@ class VehicleDetectorTracker:
                 iou=self.iou_threshold,
                 imgsz=self.image_size,
                 device=self.device,
+                agnostic_nms=self.agnostic_nms,
                 verbose=False,
             )[0]
         except Exception as exc:
@@ -182,10 +200,22 @@ class VehicleDetectorTracker:
         return accepted_detections, diagnostics
 
     def track_detections(self, packet: FramePacket, detections: list[Detection]) -> list[TrackedDetection]:
-        supervision_detections = self._to_supervision_detections(detections)
-        tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps)
-        tracked = tracker.update_with_detections(supervision_detections)
-        return self._to_tracked_detections(packet, detections, tracked)
+        if self.isolation_mode == TRACKER_ISOLATION_MODE_PER_CAMERA:
+            supervision_detections = self._to_supervision_detections(detections)
+            tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace="camera")
+            tracked = tracker.update_with_detections(supervision_detections)
+            return self._to_tracked_detections(packet, detections, tracked, tracker_namespace="camera")
+
+        grouped_detections = self._group_detections_by_normalized_class(detections)
+        tracked_results: list[TrackedDetection] = []
+        existing_namespaces = self._get_existing_class_tracker_namespaces(packet.camera_id)
+        namespaces_to_update = sorted(existing_namespaces | set(grouped_detections))
+        for tracker_namespace in namespaces_to_update:
+            tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace=tracker_namespace)
+            class_detections = grouped_detections.get(tracker_namespace, [])
+            tracked = tracker.update_with_detections(self._to_supervision_detections(class_detections))
+            tracked_results.extend(self._to_tracked_detections(packet, class_detections, tracked, tracker_namespace=tracker_namespace))
+        return tracked_results
 
     def process_frame(self, packet: FramePacket) -> DetectorTrackerResult:
         started_at = time.perf_counter()
@@ -216,14 +246,17 @@ class VehicleDetectorTracker:
         )
 
     def reset_camera(self, camera_id: str) -> None:
-        self._trackers.pop(camera_id, None)
+        for key in list(self._trackers):
+            if self._tracker_key_camera_id(key) == camera_id:
+                self._trackers.pop(key, None)
         self._metrics["tracker_instance_count"] = len(self._trackers)
-        self._metrics["tracker_camera_ids"] = sorted(self._trackers)
+        self._refresh_tracker_metrics()
 
     def reset_all(self) -> None:
         self._trackers.clear()
         self._metrics["tracker_instance_count"] = 0
         self._metrics["tracker_camera_ids"] = []
+        self._metrics["tracker_keys"] = []
 
     def annotate_detected_frame(
         self,
@@ -267,7 +300,11 @@ class VehicleDetectorTracker:
         return f"{self._normalize_class_name(detection.class_name).upper()} {detection.confidence:.2f}"
 
     def build_tracked_label(self, camera_id: str, tracked: TrackedDetection) -> str:
-        return f"{camera_id} | TRACK_{tracked.tracker_id} | {self._normalize_class_name(tracked.raw_class_name).upper()} | {tracked.confidence:.2f}"
+        if tracked.tracker_namespace == "camera":
+            namespace_text = f"TRACK_{tracked.tracker_id}"
+        else:
+            namespace_text = f"{tracked.tracker_namespace.upper()} | TRACK_{tracked.tracker_id}"
+        return f"{camera_id} | {namespace_text} | {self._normalize_class_name(tracked.raw_class_name).upper()} | {tracked.confidence:.2f}"
 
     def _load_model_once(self) -> None:
         if self._model is not None:
@@ -454,6 +491,13 @@ class VehicleDetectorTracker:
         class_id = np.asarray([detection.class_id for detection in detections], dtype=np.int32)
         return sv.Detections(xyxy=xyxy, confidence=confidence, class_id=class_id)
 
+    def _group_detections_by_normalized_class(self, detections: list[Detection]) -> dict[str, list[Detection]]:
+        grouped: dict[str, list[Detection]] = {}
+        for detection in detections:
+            normalized_class_name = self._normalize_class_name(detection.class_name)
+            grouped.setdefault(normalized_class_name, []).append(detection)
+        return grouped
+
     def _build_bbox_quality_diagnostic(
         self,
         *,
@@ -539,15 +583,56 @@ class VehicleDetectorTracker:
             return True
         raise ConfigurationError(f"Unsupported bbox edge_mode: {profile.edge_mode}")
 
-    def _get_or_create_tracker(self, camera_id: str, source_fps: float) -> Any:
-        tracker = self._trackers.get(camera_id)
+    def _get_or_create_tracker(self, camera_id: str, source_fps: float, *, tracker_namespace: str) -> Any:
+        tracker_key = self._build_tracker_key(camera_id, tracker_namespace)
+        tracker = self._trackers.get(tracker_key)
         if tracker is None:
             tracker = self._tracker_factory(frame_rate=float(source_fps or 30.0))
-            self._trackers[camera_id] = tracker
+            self._trackers[tracker_key] = tracker
             self._metrics["tracker_instance_count"] = len(self._trackers)
-            self._metrics["tracker_camera_ids"] = sorted(self._trackers)
-            self.logger.info("Tracker created for camera camera_id=%s frame_rate=%.3f", camera_id, float(source_fps or 30.0))
+            self._metrics["tracker_instances_created_total"] += 1
+            self._metrics["trackers_created_by_camera"][camera_id] = self._metrics["trackers_created_by_camera"].get(camera_id, 0) + 1
+            formatted_namespace_key = f"{camera_id}:{tracker_namespace}"
+            self._metrics["trackers_created_by_camera_namespace"][formatted_namespace_key] = (
+                self._metrics["trackers_created_by_camera_namespace"].get(formatted_namespace_key, 0) + 1
+            )
+            self._refresh_tracker_metrics()
+            self.logger.info(
+                "Tracker created for camera camera_id=%s tracker_namespace=%s frame_rate=%.3f isolation_mode=%s",
+                camera_id,
+                tracker_namespace,
+                float(source_fps or 30.0),
+                self.isolation_mode,
+            )
         return tracker
+
+    def _build_tracker_key(self, camera_id: str, tracker_namespace: str) -> str | tuple[str, str]:
+        if self.isolation_mode == TRACKER_ISOLATION_MODE_PER_CAMERA:
+            return camera_id
+        return (camera_id, tracker_namespace)
+
+    def _tracker_key_camera_id(self, key: str | tuple[str, str]) -> str:
+        return key[0] if isinstance(key, tuple) else key
+
+    def _tracker_key_namespace(self, key: str | tuple[str, str]) -> str:
+        return key[1] if isinstance(key, tuple) else "camera"
+
+    def _get_existing_class_tracker_namespaces(self, camera_id: str) -> set[str]:
+        return {
+            self._tracker_key_namespace(key)
+            for key in self._trackers
+            if isinstance(key, tuple) and self._tracker_key_camera_id(key) == camera_id
+        }
+
+    def _refresh_tracker_metrics(self) -> None:
+        self._metrics["tracker_instance_count"] = len(self._trackers)
+        self._metrics["tracker_camera_ids"] = sorted({self._tracker_key_camera_id(key) for key in self._trackers})
+        self._metrics["tracker_keys"] = sorted(self._format_tracker_key(key) for key in self._trackers)
+
+    def _format_tracker_key(self, key: str | tuple[str, str]) -> str:
+        if isinstance(key, tuple):
+            return f"{key[0]}:{key[1]}"
+        return key
 
     def _create_tracker(self, *, frame_rate: float) -> Any:
         if self.tracking_backend != "supervision_bytetrack":
@@ -565,6 +650,8 @@ class VehicleDetectorTracker:
         packet: FramePacket,
         detections: list[Detection],
         tracked: sv.Detections,
+        *,
+        tracker_namespace: str,
     ) -> list[TrackedDetection]:
         tracker_ids = list(tracked.tracker_id) if getattr(tracked, "tracker_id", None) is not None else []
         boxes = list(tracked.xyxy) if getattr(tracked, "xyxy", None) is not None else []
@@ -589,6 +676,7 @@ class VehicleDetectorTracker:
             results.append(
                 TrackedDetection(
                     camera_id=packet.camera_id,
+                    tracker_namespace=tracker_namespace,
                     frame_number=packet.frame_number,
                     timestamp_seconds=packet.timestamp_seconds,
                     tracker_id=int(tracker_id),

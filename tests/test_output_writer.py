@@ -39,12 +39,42 @@ def test_effective_config_metadata_summary_and_subdirectories_are_saved(tmp_path
     manager.save_ingestion_metrics({"worker_count": 7})
     manager.save_detection_tracking_metrics({"tracker_instance_count": 2})
     manager.save_bbox_quality_metrics({"raw_detections": 1, "accepted_detections": 1, "rejected_detections": 0})
+    manager.save_tracks([{"local_track_id": "CAM_001:TRACK_1"}])
+    manager.save_observations(
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 1,
+                "frame_number": 0,
+                "timestamp_seconds": 0.0,
+                "x1": 1.0,
+                "y1": 2.0,
+                "x2": 3.0,
+                "y2": 4.0,
+                "confidence": 0.8,
+                "raw_class_id": 0,
+                "raw_class_name": "car",
+            }
+        ]
+    )
+    manager.save_track_lifecycle_metrics({"active_tracks_at_shutdown": 0})
+    manager.save_evidence_index([{"local_track_id": "CAM_001:TRACK_1", "role": "FIRST"}])
+    manager.save_evidence_metrics({"tracks_with_evidence": 1})
+    manager.save_track_evidence("CAM_001", "CAM_001_TRACK_1", [{"local_track_id": "CAM_001:TRACK_1", "role": "FIRST"}])
     assert (manager.run_directory / "run_config.yaml").exists()
     assert (manager.run_directory / "run_metadata.json").exists()
     assert (manager.run_directory / "summary.json").exists()
     assert (manager.run_directory / "ingestion_metrics.json").exists()
     assert (manager.run_directory / "detection_tracking_metrics.json").exists()
     assert (manager.run_directory / "bbox_quality_metrics.json").exists()
+    assert (manager.run_directory / "tracks.json").exists()
+    assert (manager.run_directory / "observations.csv").exists()
+    assert (manager.run_directory / "track_lifecycle_metrics.json").exists()
+    assert (manager.run_directory / "evidence_index.json").exists()
+    assert (manager.run_directory / "evidence_metrics.json").exists()
+    assert (manager.evidence_directory / "CAM_001" / "CAM_001_TRACK_1" / "evidence.json").exists()
     assert manager.evidence_directory.exists()
     assert manager.errors_directory.exists()
     assert manager.raw_frames_directory.exists()
