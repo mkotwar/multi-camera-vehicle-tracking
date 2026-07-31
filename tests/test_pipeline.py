@@ -80,7 +80,21 @@ class FakeVehicleDetectorTracker:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
+        self.configured_device = "cpu"
         self.device = "cpu"
+        self.runtime_device_info = type(
+            "RuntimeDeviceInfoStub",
+            (),
+            {
+                "configured_device": "cpu",
+                "resolved_device": "cpu",
+                "cuda_available": False,
+                "cuda_device_count": 0,
+                "cuda_device_name": None,
+                "torch_version": "test-torch",
+                "torch_cuda_version": None,
+            },
+        )()
         self.metrics = {
             "model_load_count": 1,
             "tracker_instance_count": 2,
@@ -214,6 +228,49 @@ def _write_config(
             "tracked_frames": {"enabled": True, "save_every_n_frames": 1, "max_saved_frames_per_camera": 5},
         },
         "output": {"root_directory": output_root, "save_run_config": True},
+        "vehicle_enrichment": {
+            "enabled": True,
+            "trigger": "track_completed",
+            "fail_open": True,
+            "best_crops_per_track": 3,
+            "write_separate_output": True,
+            "extend_tracks_json": True,
+            "evidence": {
+                "source": "existing_track_evidence",
+                "save_vehicle_crops": True,
+                "minimum_crop_width": 5,
+                "minimum_crop_height": 5,
+                "minimum_sharpness": 1.0,
+                "minimum_quality_score": 0.0,
+                "border_margin_ratio": 0.02,
+                "scoring": {
+                    "area_weight": 0.25,
+                    "sharpness_weight": 0.25,
+                    "confidence_weight": 0.20,
+                    "role_weight": 0.15,
+                    "border_weight": 0.05,
+                    "clipping_weight": 0.05,
+                    "brightness_weight": 0.05,
+                },
+            },
+            "shared_florence": {
+                "enabled": False,
+                "backend": "florence2",
+                "base_model_id": "microsoft/Florence-2-base-ft",
+                "adapter_path": "model_weights/florence/adaptor_florance_baseFT",
+                "device": "auto",
+                "trust_remote_code": True,
+                "attention_implementation": "eager",
+                "max_new_tokens": 1024,
+                "num_beams": 3,
+                "use_cache": False,
+            },
+            "body_type": {"enabled": False},
+            "colour": {"enabled": False},
+            "make_model": {"enabled": False},
+            "plate": {"detection_enabled": False, "colour_enabled": False},
+            "ocr": {"enabled": False, "run_only_when_plate_detected": True},
+        },
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
@@ -240,15 +297,30 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     lifecycle_metrics = json.loads((run_dir / "track_lifecycle_metrics.json").read_text(encoding="utf-8"))
     evidence_index = json.loads((run_dir / "evidence_index.json").read_text(encoding="utf-8"))
     evidence_metrics = json.loads((run_dir / "evidence_metrics.json").read_text(encoding="utf-8"))
+    enrichment_results = json.loads((run_dir / "vehicle_enrichment.json").read_text(encoding="utf-8"))
+    enrichment_metrics = json.loads((run_dir / "vehicle_enrichment_metrics.json").read_text(encoding="utf-8"))
     tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
     observations = (run_dir / "observations.csv").read_text(encoding="utf-8")
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert run_id == run_dir.name
     assert summary["processed_frames"] == 3
+    assert summary["configured_device"] == "cpu"
+    assert summary["resolved_device"] == "cpu"
+    assert summary["cuda_available"] is False
+    assert summary["cuda_device_name"] is None
     assert metrics["worker_count"] == 7
     assert metrics["enabled_camera_count"] == 1
+    assert metadata["configured_device"] == "cpu"
+    assert metadata["resolved_device"] == "cpu"
+    assert metadata["cuda_available"] is False
+    assert metadata["cuda_device_count"] == 0
+    assert metadata["cuda_device_name"] is None
     assert dt_metrics["detections_by_camera"]["CAM_001"] == 3
+    assert dt_metrics["configured_device"] == "cpu"
+    assert dt_metrics["resolved_device"] == "cpu"
+    assert dt_metrics["cuda_device_name"] is None
     assert bbox_metrics["accepted_detections"] == 3
     assert bbox_metrics["rejected_detections"] == 0
     assert lifecycle_metrics["active_tracks_at_shutdown"] == 0
@@ -257,6 +329,10 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert "FIRST" in tracks[0]["evidence_roles"]
     assert evidence_index[0]["local_track_id"] == "CAM_001:TRACK_1"
     assert evidence_metrics["tracks_with_evidence"] >= 1
+    assert enrichment_metrics["completed_tracks_received"] >= 1
+    assert enrichment_metrics["florence_loaded"] is False
+    assert enrichment_results[0]["vehicle_body_type"]["status"] == "disabled"
+    assert tracks[0]["vehicle_enrichment"]["status"] in {"evidence_ready", "disabled", "no_evidence"}
     assert "CAM_001:TRACK_1" in observations
 
 
@@ -286,6 +362,7 @@ def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path:
     dt_metrics = json.loads((run_dir / "detection_tracking_metrics.json").read_text(encoding="utf-8"))
     lifecycle_metrics = json.loads((run_dir / "track_lifecycle_metrics.json").read_text(encoding="utf-8"))
     evidence_metrics = json.loads((run_dir / "evidence_metrics.json").read_text(encoding="utf-8"))
+    enrichment_metrics = json.loads((run_dir / "vehicle_enrichment_metrics.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert metrics["frames_by_camera"]["CAM_001"] == 4
     assert metrics["frames_by_camera"]["CAM_002"] == 6
@@ -293,6 +370,7 @@ def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path:
     assert dt_metrics["tracked_observations_by_camera"]["CAM_002"] == 6
     assert lifecycle_metrics["tracks_completed_by_camera"]["CAM_001"] >= 1
     assert evidence_metrics["tracks_received"] >= 2
+    assert enrichment_metrics["completed_tracks_received"] >= 2
     assert (run_dir / "raw_frames" / "CAM_001").exists()
     assert (run_dir / "detected_frames" / "CAM_001").exists()
     assert (run_dir / "tracked_frames" / "CAM_001").exists()
@@ -368,3 +446,51 @@ def test_outputs_are_written_only_under_configured_output_root(monkeypatch, tmp_
     exit_code, _run_id, run_directory = run_pipeline(str(config_path))
     assert exit_code == 0
     assert Path(run_directory).is_relative_to(output_root.resolve())
+
+
+def test_enrichment_enabled_does_not_change_tracking_outputs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=4)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    enabled_config = tmp_path / "enabled.yaml"
+    disabled_config = tmp_path / "disabled.yaml"
+    _write_config(
+        enabled_config,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs_enabled"),
+        model_path=str(model_path),
+        max_frames_per_camera=4,
+    )
+    _write_config(
+        disabled_config,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs_disabled"),
+        model_path=str(model_path),
+        max_frames_per_camera=4,
+    )
+    disabled_payload = yaml.safe_load(disabled_config.read_text(encoding="utf-8"))
+    disabled_payload["vehicle_enrichment"]["enabled"] = False
+    disabled_config.write_text(yaml.safe_dump(disabled_payload, sort_keys=False), encoding="utf-8")
+
+    enabled_exit_code, _enabled_run_id, enabled_run_dir = run_pipeline(str(enabled_config))
+    disabled_exit_code, _disabled_run_id, disabled_run_dir = run_pipeline(str(disabled_config))
+
+    assert enabled_exit_code == 0
+    assert disabled_exit_code == 0
+
+    enabled_tracks = json.loads((Path(enabled_run_dir) / "tracks.json").read_text(encoding="utf-8"))
+    disabled_tracks = json.loads((Path(disabled_run_dir) / "tracks.json").read_text(encoding="utf-8"))
+    enabled_observations = (Path(enabled_run_dir) / "observations.csv").read_text(encoding="utf-8")
+    disabled_observations = (Path(disabled_run_dir) / "observations.csv").read_text(encoding="utf-8")
+
+    def _normalize_track(track: dict[str, object]) -> dict[str, object]:
+        payload = {key: value for key, value in track.items() if key != "vehicle_enrichment"}
+        payload["evidence_directory"] = "<normalized>"
+        return payload
+
+    comparable_enabled = [_normalize_track(item) for item in enabled_tracks]
+    comparable_disabled = [_normalize_track(item) for item in disabled_tracks]
+
+    assert comparable_enabled == comparable_disabled
+    assert enabled_observations == disabled_observations

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 from src.models import RUN_STATUS_CREATED, RunMetadata
@@ -62,7 +63,10 @@ def test_effective_config_metadata_summary_and_subdirectories_are_saved(tmp_path
     manager.save_track_lifecycle_metrics({"active_tracks_at_shutdown": 0})
     manager.save_evidence_index([{"local_track_id": "CAM_001:TRACK_1", "role": "FIRST"}])
     manager.save_evidence_metrics({"tracks_with_evidence": 1})
+    manager.save_vehicle_enrichment([{"local_track_id": "CAM_001:TRACK_1", "status": "disabled"}])
+    manager.save_vehicle_enrichment_metrics({"completed_tracks_received": 1})
     manager.save_track_evidence("CAM_001", "CAM_001_TRACK_1", [{"local_track_id": "CAM_001:TRACK_1", "role": "FIRST"}])
+    manager.save_vehicle_enrichment_crop("CAM_001:TRACK_1", 0, np.zeros((8, 8, 3), dtype=np.uint8))
     assert (manager.run_directory / "run_config.yaml").exists()
     assert (manager.run_directory / "run_metadata.json").exists()
     assert (manager.run_directory / "summary.json").exists()
@@ -74,7 +78,10 @@ def test_effective_config_metadata_summary_and_subdirectories_are_saved(tmp_path
     assert (manager.run_directory / "track_lifecycle_metrics.json").exists()
     assert (manager.run_directory / "evidence_index.json").exists()
     assert (manager.run_directory / "evidence_metrics.json").exists()
+    assert (manager.run_directory / "vehicle_enrichment.json").exists()
+    assert (manager.run_directory / "vehicle_enrichment_metrics.json").exists()
     assert (manager.evidence_directory / "CAM_001" / "CAM_001_TRACK_1" / "evidence.json").exists()
+    assert any(manager.vehicle_enrichment_crops_directory.rglob("frame_000000.jpg"))
     assert manager.evidence_directory.exists()
     assert manager.errors_directory.exists()
     assert manager.raw_frames_directory.exists()

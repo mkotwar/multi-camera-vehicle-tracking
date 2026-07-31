@@ -1,33 +1,32 @@
 project:
   name: multicamera_vehicle_tracking
-  environment: development
+  environment: validation
   log_level: INFO
 
 input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: C:\Mukul K\vinfo1\video-search-engine\tests\td_case2\multicamera_vehicle_tracking_pipeline\data\1test.mp4
+      source: data/test_videos/1test.mp4
       enabled: true
-
     - camera_id: CAM_002
       source_type: video
-      source: C:\Mukul K\vinfo1\video-search-engine\tests\td_case2\multicamera_vehicle_tracking_pipeline\data\2test.mp4
-      enabled: false
-  max_frames_per_camera: 100
+      source: data/test_videos/2test.mp4
+      enabled: true
+  max_frames_per_camera: 20
 
 ingestion:
-  worker_count: 7
+  worker_count: 2
   target_read_fps: 10.0
-  frame_queue_size: 200
+  frame_queue_size: 50
   queue_put_timeout_seconds: 2.0
   queue_get_timeout_seconds: 1.0
   stop_on_camera_error: false
   round_robin: true
   raw_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 10
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 2
     image_format: jpg
     jpeg_quality: 90
 
@@ -115,13 +114,12 @@ visualization:
   show_rejected_boxes: false
   detected_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
-
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 2
   tracked_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
+    save_every_n_frames: 2
+    max_saved_frames_per_camera: 2
 
 output:
   root_directory: outputs/runs

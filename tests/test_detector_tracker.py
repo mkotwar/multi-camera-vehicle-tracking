@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.detector_tracker import VehicleDetectorTracker
+import src.detector_tracker as detector_tracker_module
+from src.detector_tracker import VehicleDetectorTracker, resolve_runtime_device
 from src.models import ConfigurationError, FramePacket
 
 
@@ -32,12 +33,17 @@ class FakeResult:
 class FakeModel:
     def __init__(self, path: str):
         self.path = path
-        self.names = {0: "car", 1: "truck", 2: "bus", 3: "motorcycle", 4: "3 wheeler"}
+        self.names = {0: "car", 1: "truck", 2: "bus", 3: "motorcycle", 4: "3 wheeler", 5: "van", 6: "tractor", 7: "pickup"}
         self.predict_calls = []
+        self.call_calls = []
         self.next_result = FakeResult([], [], [])
 
     def predict(self, **kwargs):
         self.predict_calls.append(kwargs)
+        return [self.next_result]
+
+    def __call__(self, source, **kwargs):
+        self.call_calls.append({"source": source, **kwargs})
         return [self.next_result]
 
 
@@ -130,26 +136,31 @@ def _config(
     show_rejected_boxes: bool = False,
     isolation_mode: str = "per_camera",
     agnostic_nms: bool = False,
+    device: str = "cpu",
+    detection_backend: str = "legacy_clean",
+    tracking_backend: str = "supervision_bytetrack",
 ) -> dict:
     return {
         "detection": {
+            "backend": detection_backend,
             "model_path": model_path,
-            "device": "cpu",
-            "confidence_threshold": 0.38,
+            "device": device,
+            "confidence_threshold": 0.2 if detection_backend == "ocr_mukul" else 0.38,
             "iou_threshold": 0.45,
-            "image_size": 640,
+            "image_size": 1024 if detection_backend == "ocr_mukul" else 640,
             "agnostic_nms": agnostic_nms,
             "allowed_classes": ["car", "truck", "bus", "motorcycle", "3wheeler"],
+            "allowed_class_ids": list(range(8)),
             "bbox_quality": bbox_quality or _bbox_quality_config(),
         },
         "tracking": {
-            "backend": "supervision_bytetrack",
+            "backend": tracking_backend,
             "isolation_mode": isolation_mode,
-            "supported_isolation_modes": ["per_camera", "per_camera_class"],
-            "track_activation_threshold": 0.15,
-            "lost_track_buffer": 30,
-            "minimum_matching_threshold": 0.80,
-            "minimum_consecutive_frames": 1,
+            "supported_isolation_modes": ["per_camera"] if tracking_backend == "ocr_mukul_supervision_bytetrack" else ["per_camera", "per_camera_class"],
+            "track_activation_threshold": 0.3 if tracking_backend == "ocr_mukul_supervision_bytetrack" else 0.15,
+            "lost_track_buffer": 40 if tracking_backend == "ocr_mukul_supervision_bytetrack" else 30,
+            "minimum_matching_threshold": 0.6 if tracking_backend == "ocr_mukul_supervision_bytetrack" else 0.80,
+            "minimum_consecutive_frames": 3 if tracking_backend == "ocr_mukul_supervision_bytetrack" else 1,
         },
         "visualization": {
             "show_rejected_boxes": show_rejected_boxes,
@@ -164,6 +175,8 @@ def _build_tracker(
     show_rejected_boxes: bool = False,
     isolation_mode: str = "per_camera",
     agnostic_nms: bool = False,
+    detection_backend: str = "legacy_clean",
+    tracking_backend: str = "supervision_bytetrack",
 ):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
@@ -182,6 +195,8 @@ def _build_tracker(
             show_rejected_boxes=show_rejected_boxes,
             isolation_mode=isolation_mode,
             agnostic_nms=agnostic_nms,
+            detection_backend=detection_backend,
+            tracking_backend=tracking_backend,
         ),
         _logger(),
         model_loader=lambda _: model,
@@ -223,6 +238,127 @@ def test_model_is_loaded_only_once_and_config_is_passed(tmp_path: Path) -> None:
     assert model.predict_calls[0]["iou"] == 0.45
     assert model.predict_calls[0]["imgsz"] == 640
     assert model.predict_calls[0]["agnostic_nms"] is False
+    assert model.predict_calls[0]["device"] == "cpu"
+
+
+def test_auto_resolves_to_cuda0_when_cuda_is_available(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("auto")
+    assert info.configured_device == "auto"
+    assert info.resolved_device == "cuda:0"
+    assert info.cuda_available is True
+    assert info.cuda_device_count == 2
+    assert info.cuda_device_name == "GPU-0"
+
+
+def test_auto_resolves_to_cpu_when_cuda_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
+    info = resolve_runtime_device("auto")
+    assert info.resolved_device == "cpu"
+    assert info.cuda_available is False
+    assert info.cuda_device_count == 0
+    assert info.cuda_device_name is None
+
+
+def test_cpu_always_resolves_to_cpu(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    info = resolve_runtime_device("cpu")
+    assert info.resolved_device == "cpu"
+    assert info.cuda_device_name is None
+
+
+def test_explicit_cuda_resolves_to_cuda0_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
+    info = resolve_runtime_device("cuda")
+    assert info.resolved_device == "cuda:0"
+    assert info.cuda_device_name == "GPU-0"
+
+
+def test_explicit_cuda0_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("cuda:0")
+    assert info.resolved_device == "cuda:0"
+    assert info.cuda_device_name == "GPU-0"
+
+
+def test_explicit_cuda_raises_when_cuda_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ConfigurationError, match="explicitly requested"):
+        resolve_runtime_device("cuda")
+
+
+def test_explicit_valid_cuda_index_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("cuda:1")
+    assert info.resolved_device == "cuda:1"
+    assert info.cuda_device_name == "GPU-1"
+
+
+def test_explicit_invalid_cuda_index_raises(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(ConfigurationError, match="invalid"):
+        resolve_runtime_device("cuda:1")
+
+
+def test_unsupported_device_value_raises(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ConfigurationError, match="Unsupported detection.device value"):
+        resolve_runtime_device("tpu")
+
+
+def test_gpu_name_is_included_when_cuda_is_selected(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "NVIDIA Test GPU")
+    info = resolve_runtime_device("auto")
+    assert info.cuda_device_name == "NVIDIA Test GPU"
+
+
+def test_gpu_name_is_null_when_cpu_is_selected(monkeypatch) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
+    info = resolve_runtime_device("auto")
+    assert info.cuda_device_name is None
+
+
+def test_tracker_instance_count_reflects_created_tracker_count(tmp_path: Path) -> None:
+    tracker, model, created_trackers = _build_tracker(tmp_path)
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120]],
+        cls=[0],
+        conf=[0.9],
+    )
+    tracker.process_frame(_frame_packet(camera_id="CAM_001"))
+    tracker.process_frame(_frame_packet(camera_id="CAM_002", frame_number=1))
+    metrics = tracker.metrics
+    assert len(created_trackers) == 2
+    assert metrics["tracker_instance_count"] == 2
+
+
+def test_resolved_device_is_passed_to_yolo_inference(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    model = FakeModel(str(model_path))
+    tracker = VehicleDetectorTracker(
+        _config(str(model_path), device="auto"),
+        _logger(),
+        model_loader=lambda _: model,
+        tracker_factory=lambda frame_rate: FakeTracker(frame_rate),
+    )
+    tracker.process_frame(_frame_packet())
+    assert model.predict_calls[0]["device"] == "cuda:0"
 
 
 def test_allowed_classes_are_filtered_and_empty_results_do_not_crash(tmp_path: Path) -> None:
@@ -253,7 +389,7 @@ def test_unknown_configured_class_names_are_reported_clearly(tmp_path: Path) -> 
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
     config = _config(str(model_path))
-    config["detection"]["allowed_classes"] = ["tractor"]
+    config["detection"]["allowed_classes"] = ["airplane"]
     with pytest.raises(ConfigurationError):
         VehicleDetectorTracker(config, _logger(), model_loader=lambda _: FakeModel(str(model_path)))
 
@@ -599,3 +735,65 @@ def test_reset_camera_resets_every_class_tracker_for_that_camera(tmp_path: Path)
     assert ("CAM_001", "car") not in detector_tracker._trackers
     assert ("CAM_001", "motorcycle") not in detector_tracker._trackers
     assert ("CAM_002", "car") in detector_tracker._trackers
+
+
+def test_ocr_mukul_backend_uses_callable_model_and_ocr_tracker_params(monkeypatch, tmp_path: Path) -> None:
+    captured_kwargs: list[dict] = []
+
+    class ByteTrackStub:
+        def __init__(self, **kwargs):
+            captured_kwargs.append(kwargs)
+
+        def update_with_detections(self, detections):
+            if len(detections.xyxy) == 0:
+                return FakeTrackedDetections([], [], [], [])
+            return FakeTrackedDetections(
+                xyxy=detections.xyxy,
+                confidence=detections.confidence,
+                class_id=detections.class_id,
+                tracker_id=list(range(1, len(detections.xyxy) + 1)),
+            )
+
+    monkeypatch.setattr(detector_tracker_module.sv, "ByteTrack", ByteTrackStub)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    model = FakeModel(str(model_path))
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[6], conf=[0.91])
+    tracker = VehicleDetectorTracker(
+        _config(
+            str(model_path),
+            detection_backend="ocr_mukul",
+            tracking_backend="ocr_mukul_supervision_bytetrack",
+        ),
+        _logger(),
+        model_loader=lambda _: model,
+    )
+    result = tracker.process_frame(_frame_packet())
+    assert len(model.call_calls) == 1
+    assert model.call_calls[0]["conf"] == 0.2
+    assert model.call_calls[0]["imgsz"] == 1024
+    assert model.predict_calls == []
+    assert captured_kwargs == [
+        {
+            "lost_track_buffer": 40,
+            "track_activation_threshold": 0.3,
+            "minimum_matching_threshold": 0.6,
+            "minimum_consecutive_frames": 3,
+        }
+    ]
+    assert result.tracked_detections[0].raw_class_name == "tractor"
+
+
+def test_ocr_mukul_backend_creates_one_tracker_per_camera(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        detection_backend="ocr_mukul",
+        tracking_backend="ocr_mukul_supervision_bytetrack",
+    )
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[6], conf=[0.9])
+    detector_tracker.process_frame(_frame_packet(camera_id="CAM_001", fps=12.0))
+    detector_tracker.process_frame(_frame_packet(camera_id="CAM_002", fps=20.0))
+    assert len(created_trackers) == 2
+    assert created_trackers[0].frame_rate == 12.0
+    assert created_trackers[1].frame_rate == 20.0
+    assert detector_tracker.metrics["tracker_camera_ids"] == ["CAM_001", "CAM_002"]

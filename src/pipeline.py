@@ -25,6 +25,7 @@ from .models import (
 )
 from .output_writer import RunOutputManager
 from .track_manager import TrackManager
+from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
 
 
 def _normalize_bbox_quality_section(raw_bbox_quality: Any) -> dict[str, Any]:
@@ -121,6 +122,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
+    vehicle_enrichment = raw_config.get("vehicle_enrichment")
     if not isinstance(project, dict):
         raise ConfigurationError("Missing or invalid 'project' section.")
     if not isinstance(input_section, dict):
@@ -137,6 +139,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Missing or invalid 'visualization' section.")
     if not isinstance(output_section, dict):
         raise ConfigurationError("Missing or invalid 'output' section.")
+    if vehicle_enrichment is not None and not isinstance(vehicle_enrichment, dict):
+        raise ConfigurationError("Invalid 'vehicle_enrichment' section.")
 
     cameras = input_section.get("cameras")
     if not isinstance(cameras, list):
@@ -224,10 +228,14 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         resolved_model_path = resolved_model_path.resolve()
     if not resolved_model_path.exists():
         raise ConfigurationError(f"Resolved model path does not exist: {resolved_model_path}")
+    detection_backend = str(detection.get("backend", "ocr_mukul")).strip().lower() or "ocr_mukul"
     allowed_classes = [str(item).strip() for item in detection.get("allowed_classes", []) if str(item).strip()]
-    if not allowed_classes:
-        raise ConfigurationError("detection.allowed_classes must not be empty.")
+    allowed_class_ids = [int(item) for item in detection.get("allowed_class_ids", list(range(8)))]
+    if detection_backend == "legacy_clean" and not allowed_classes:
+        raise ConfigurationError("detection.allowed_classes must not be empty for legacy_clean backend.")
     normalized_bbox_quality = _normalize_bbox_quality_section(detection.get("bbox_quality", {}))
+    if detection_backend == "ocr_mukul":
+        normalized_bbox_quality["enabled"] = False
     lifecycle = dict(raw_config.get("lifecycle", {}) or {})
     track_class = dict(raw_config.get("track_class", {}) or {})
     lifecycle_minimum_observations = int(lifecycle.get("minimum_observations", 3))
@@ -262,6 +270,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         output_root = output_root.resolve()
     evidence_section = dict(evidence or {})
     evidence_weights = dict(evidence_section.get("best_overall_weights", {}) or {})
+    normalized_vehicle_enrichment = normalize_vehicle_enrichment_config(vehicle_enrichment or {})
 
     return {
         "project": {
@@ -290,25 +299,27 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             },
         },
         "detection": {
+            "backend": detection_backend,
             "model_path": str(resolved_model_path),
             "device": str(detection.get("device", "auto")),
-            "confidence_threshold": float(detection.get("confidence_threshold", 0.38)),
+            "confidence_threshold": float(detection.get("confidence_threshold", 0.2 if detection_backend == "ocr_mukul" else 0.38)),
             "iou_threshold": float(detection.get("iou_threshold", 0.45)),
-            "image_size": int(detection.get("image_size", 640)),
+            "image_size": int(detection.get("image_size", 1024 if detection_backend == "ocr_mukul" else 640)),
             "agnostic_nms": bool(detection.get("agnostic_nms", False)),
             "allowed_classes": allowed_classes,
+            "allowed_class_ids": allowed_class_ids,
             "bbox_quality": normalized_bbox_quality,
         },
         "tracking": {
-            "backend": str(tracking.get("backend", "supervision_bytetrack")),
-            "track_activation_threshold": float(tracking.get("track_activation_threshold", 0.15)),
-            "lost_track_buffer": int(tracking.get("lost_track_buffer", 30)),
-            "minimum_matching_threshold": float(tracking.get("minimum_matching_threshold", 0.80)),
-            "minimum_consecutive_frames": int(tracking.get("minimum_consecutive_frames", 1)),
+            "backend": str(tracking.get("backend", "ocr_mukul_supervision_bytetrack")),
+            "track_activation_threshold": float(tracking.get("track_activation_threshold", 0.3 if detection_backend == "ocr_mukul" else 0.15)),
+            "lost_track_buffer": int(tracking.get("lost_track_buffer", 40 if detection_backend == "ocr_mukul" else 30)),
+            "minimum_matching_threshold": float(tracking.get("minimum_matching_threshold", 0.6 if detection_backend == "ocr_mukul" else 0.80)),
+            "minimum_consecutive_frames": int(tracking.get("minimum_consecutive_frames", 3 if detection_backend == "ocr_mukul" else 1)),
             "isolation_mode": str(tracking.get("isolation_mode", "per_camera")).strip() or "per_camera",
             "supported_isolation_modes": [
                 str(item).strip()
-                for item in tracking.get("supported_isolation_modes", ["per_camera", "per_camera_class"])
+                for item in tracking.get("supported_isolation_modes", ["per_camera"] if detection_backend == "ocr_mukul" else ["per_camera", "per_camera_class"])
                 if str(item).strip()
             ],
         },
@@ -372,6 +383,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "root_directory": str(output_root),
             "save_run_config": bool(output_section.get("save_run_config", True)),
         },
+        "vehicle_enrichment": normalized_vehicle_enrichment,
     }
 
 
@@ -433,6 +445,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
     ingestion_manager: MultiCameraIngestionManager | None = None
     track_manager: TrackManager | None = None
     evidence_collector: EvidenceCollector | None = None
+    vehicle_enrichment_manager: VehicleEnrichmentManager | None = None
     try:
         logger.info("Pipeline started")
         if deferred_setup_error is not None:
@@ -448,8 +461,40 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
 
         ingestion_manager = MultiCameraIngestionManager(validated_config, logger)
         detector_tracker = VehicleDetectorTracker(validated_config, logger)
+        device_info = detector_tracker.runtime_device_info
+        metadata.configured_device = device_info.configured_device
+        metadata.resolved_device = device_info.resolved_device
+        metadata.cuda_available = device_info.cuda_available
+        metadata.cuda_device_count = device_info.cuda_device_count
+        metadata.cuda_device_name = device_info.cuda_device_name
+        metadata.torch_version = device_info.torch_version
+        metadata.torch_cuda_version = device_info.torch_cuda_version
+        output_manager.save_metadata(metadata)
+        if device_info.resolved_device.startswith("cuda:"):
+            selected_cuda_index = int(device_info.resolved_device.split(":", 1)[1])
+            logger.info(
+                'Runtime device: configured=%s resolved=%s gpu="%s" cuda_available=%s cuda_device_count=%s selected_cuda_index=%s torch_version=%s torch_cuda_version=%s',
+                device_info.configured_device,
+                device_info.resolved_device,
+                device_info.cuda_device_name,
+                device_info.cuda_available,
+                device_info.cuda_device_count,
+                selected_cuda_index,
+                device_info.torch_version,
+                device_info.torch_cuda_version,
+            )
+        else:
+            logger.info(
+                "Runtime device: configured=%s resolved=%s cuda_available=%s reason=CUDA is not available through the installed PyTorch build torch_version=%s torch_cuda_version=%s",
+                device_info.configured_device,
+                device_info.resolved_device,
+                device_info.cuda_available,
+                device_info.torch_version,
+                device_info.torch_cuda_version,
+            )
         track_manager = TrackManager(validated_config, logger)
         evidence_collector = EvidenceCollector(validated_config, logger, output_manager)
+        vehicle_enrichment_manager = VehicleEnrichmentManager(validated_config, logger, output_manager)
         ingestion_manager.start()
 
         raw_frames_config = dict(validated_config["ingestion"]["raw_frames"])
@@ -471,6 +516,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         lifecycle_completed_tracks: list[LocalTrack] = []
         saved_detected_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         saved_tracked_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
+        enrichment_results = []
 
         while True:
             try:
@@ -505,7 +551,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             evidence_collector.register_frame(packet, result.tracked_detections)
             completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
             lifecycle_completed_tracks.extend(completed_now)
-            evidence_collector.finalize_tracks(completed_now)
+            finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
+            enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
             logger.debug(
                 "camera=%s worker=%s frame=%s timestamp=%.3f queue_size=%s detections=%s tracked=%s",
                 packet.camera_id,
@@ -542,7 +589,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         for camera_id in frames_by_camera:
             completed_now = track_manager.flush_camera(camera_id)
             lifecycle_completed_tracks.extend(completed_now)
-            evidence_collector.finalize_tracks(completed_now)
+            finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
+            enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
             detector_tracker.reset_camera(camera_id)
         ingestion_manager.set_saved_raw_frames_by_camera(saved_raw_frames_by_camera)
         ingestion_manager.stop()
@@ -557,7 +605,16 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         tracker_metrics = detector_tracker.metrics
         inference_times = tracker_metrics["inference_times_ms"]
         detection_tracking_metrics = {
+            "detection_backend": validated_config["detection"]["backend"],
+            "tracking_backend": validated_config["tracking"]["backend"],
             "model_path": validated_config["detection"]["model_path"],
+            "configured_device": device_info.configured_device,
+            "resolved_device": device_info.resolved_device,
+            "cuda_available": device_info.cuda_available,
+            "cuda_device_count": device_info.cuda_device_count,
+            "cuda_device_name": device_info.cuda_device_name,
+            "torch_version": device_info.torch_version,
+            "torch_cuda_version": device_info.torch_cuda_version,
             "device": detector_tracker.device,
             "confidence_threshold": validated_config["detection"]["confidence_threshold"],
             "iou_threshold": validated_config["detection"]["iou_threshold"],
@@ -591,11 +648,23 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         output_observations = track_manager.get_all_observations()
         evidence_index_records = evidence_collector.evidence_index
         evidence_summary_by_track = _build_evidence_summary_by_track(evidence_index_records)
-        tracks_path = output_manager.save_tracks([_serialize_track(track, evidence_summary_by_track) for track in output_tracks])
+        enrichment_by_track = {item.local_track_id: item.to_dict() for item in enrichment_results}
+        tracks_path = output_manager.save_tracks(
+            [
+                _serialize_track(
+                    track,
+                    evidence_summary_by_track,
+                    enrichment_by_track if validated_config["vehicle_enrichment"]["extend_tracks_json"] else None,
+                )
+                for track in output_tracks
+            ]
+        )
         observations_path = output_manager.save_observations([_serialize_observation(item) for item in output_observations])
         lifecycle_metrics_path = output_manager.save_track_lifecycle_metrics(lifecycle_metrics)
         evidence_index_path = output_manager.save_evidence_index(evidence_index_records)
         evidence_metrics_path = output_manager.save_evidence_metrics(evidence_collector.metrics)
+        vehicle_enrichment_path = output_manager.save_vehicle_enrichment([item.to_dict() for item in enrichment_results])
+        vehicle_enrichment_metrics_path = output_manager.save_vehicle_enrichment_metrics(vehicle_enrichment_manager.metrics)
         output_manager.save_bbox_quality_metrics(
             {
                 "raw_detections": raw_detections,
@@ -612,6 +681,15 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "run_id": metadata.run_id,
                 "status": metadata.status,
                 "project_name": metadata.project_name,
+                "detection_backend": validated_config["detection"]["backend"],
+                "tracking_backend": validated_config["tracking"]["backend"],
+                "configured_device": device_info.configured_device,
+                "resolved_device": device_info.resolved_device,
+                "cuda_available": device_info.cuda_available,
+                "cuda_device_count": device_info.cuda_device_count,
+                "cuda_device_name": device_info.cuda_device_name,
+                "torch_version": device_info.torch_version,
+                "torch_cuda_version": device_info.torch_cuda_version,
                 "configured_camera_count": metrics["configured_camera_count"],
                 "enabled_camera_count": metrics["enabled_camera_count"],
                 "worker_count": metrics["worker_count"],
@@ -629,16 +707,20 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "tracks_discarded_by_camera": lifecycle_metrics["tracks_discarded_by_camera"],
                 "observations_by_camera": lifecycle_metrics["observations_by_camera"],
                 "selected_evidence_records": len(evidence_index_records),
+                "vehicle_enrichment_enabled": validated_config["vehicle_enrichment"]["enabled"],
+                "vehicle_enrichment_result_count": len(enrichment_results),
                 "run_directory": str(output_manager.run_directory),
             }
         )
         logger.info(
-            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s",
+            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s",
             tracks_path,
             observations_path,
             lifecycle_metrics_path,
             evidence_index_path,
             evidence_metrics_path,
+            vehicle_enrichment_path,
+            vehicle_enrichment_metrics_path,
         )
         detector_tracker.reset_all()
         logger.info("Pipeline completed")
@@ -682,7 +764,11 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         return 1, output_manager.run_id, str(output_manager.run_directory)
 
 
-def _serialize_track(track: LocalTrack, evidence_summary_by_track: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def _serialize_track(
+    track: LocalTrack,
+    evidence_summary_by_track: dict[str, dict[str, Any]] | None = None,
+    enrichment_by_track: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     summary = (evidence_summary_by_track or {}).get(track.local_track_id, {})
     payload = {
         "local_track_id": track.local_track_id,
@@ -710,6 +796,8 @@ def _serialize_track(track: LocalTrack, evidence_summary_by_track: dict[str, dic
         payload["evidence_record_count"] = 0
         payload["evidence_roles"] = []
         payload["evidence_directory"] = None
+    if enrichment_by_track is not None:
+        payload["vehicle_enrichment"] = enrichment_by_track.get(track.local_track_id)
     return payload
 
 

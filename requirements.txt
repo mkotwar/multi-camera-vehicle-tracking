@@ -4,3 +4,9 @@ pyyaml
 pytest
 ultralytics
 supervision
+transformers
+peft
+pillow
+accelerate
+einops
+timm

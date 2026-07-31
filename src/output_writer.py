@@ -25,11 +25,15 @@ class RunOutputManager:
         self.raw_frames_directory = self.run_directory / "raw_frames"
         self.detected_frames_directory = self.run_directory / "detected_frames"
         self.tracked_frames_directory = self.run_directory / "tracked_frames"
+        self.vehicle_enrichment_directory = self.run_directory / "vehicle_enrichment"
+        self.vehicle_enrichment_crops_directory = self.vehicle_enrichment_directory / "crops"
         self.evidence_directory.mkdir(parents=True, exist_ok=True)
         self.errors_directory.mkdir(parents=True, exist_ok=True)
         self.raw_frames_directory.mkdir(parents=True, exist_ok=True)
         self.detected_frames_directory.mkdir(parents=True, exist_ok=True)
         self.tracked_frames_directory.mkdir(parents=True, exist_ok=True)
+        self.vehicle_enrichment_directory.mkdir(parents=True, exist_ok=True)
+        self.vehicle_enrichment_crops_directory.mkdir(parents=True, exist_ok=True)
         self._write_detected_frames_note()
 
     def _generate_run_id(self) -> str:
@@ -128,6 +132,16 @@ class RunOutputManager:
         path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return path
 
+    def save_vehicle_enrichment(self, records: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "vehicle_enrichment.json"
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        return path
+
+    def save_vehicle_enrichment_metrics(self, metrics: dict[str, Any]) -> Path:
+        path = self.run_directory / "vehicle_enrichment_metrics.json"
+        path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return path
+
     def evidence_track_directory(self, camera_id: str, safe_local_track_id: str) -> Path:
         path = self.evidence_directory / camera_id / safe_local_track_id
         path.mkdir(parents=True, exist_ok=True)
@@ -204,6 +218,30 @@ class RunOutputManager:
         annotated_directory.mkdir(parents=True, exist_ok=True)
         path = annotated_directory / f"frame_{frame_number:06d}.jpg"
         self._write_image(path, frame, jpeg_quality=jpeg_quality)
+        return path
+
+    def vehicle_enrichment_track_directory(self, safe_local_track_id: str) -> Path:
+        normalized = safe_local_track_id.replace(":", "_")
+        path = self.vehicle_enrichment_crops_directory / normalized
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def vehicle_enrichment_track_crop_path(self, safe_local_track_id: str, frame_number: int, *, suffix: str | None = None) -> Path:
+        directory = self.vehicle_enrichment_track_directory(safe_local_track_id)
+        suffix_fragment = f"_{suffix}" if suffix else ""
+        return directory / f"frame_{frame_number:06d}{suffix_fragment}.jpg"
+
+    def save_vehicle_enrichment_crop(
+        self,
+        safe_local_track_id: str,
+        frame_number: int,
+        crop: np.ndarray,
+        *,
+        suffix: str | None = None,
+        jpeg_quality: int = 90,
+    ) -> Path:
+        path = self.vehicle_enrichment_track_crop_path(safe_local_track_id, frame_number, suffix=suffix)
+        self._write_image(path, crop, jpeg_quality=jpeg_quality)
         return path
 
     def future_output_path(self, *parts: str) -> Path:

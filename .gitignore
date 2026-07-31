@@ -19,3 +19,11 @@ data/test_videos/*
 .idea/
 
 *.zip
+
+
+
+# Local test videos
+*.mp4
+*.avi
+*.mov
+*.mkv

@@ -20,9 +20,16 @@ EDGE_MODE_B = "B"
 EDGE_MODE_C = "C"
 EDGE_MODE_LEGACY = "LEGACY"
 SUPPORTED_EDGE_MODES = {EDGE_MODE_A, EDGE_MODE_B, EDGE_MODE_C, EDGE_MODE_LEGACY}
+DETECTION_BACKEND_LEGACY_CLEAN = "legacy_clean"
+DETECTION_BACKEND_OCR_MUKUL = "ocr_mukul"
+SUPPORTED_DETECTION_BACKENDS = {DETECTION_BACKEND_LEGACY_CLEAN, DETECTION_BACKEND_OCR_MUKUL}
 TRACKER_ISOLATION_MODE_PER_CAMERA = "per_camera"
 TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS = "per_camera_class"
 SUPPORTED_TRACKER_ISOLATION_MODES = {TRACKER_ISOLATION_MODE_PER_CAMERA, TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS}
+TRACKING_BACKEND_SUPERVISION_BYTETRACK = "supervision_bytetrack"
+TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK = "ocr_mukul_supervision_bytetrack"
+SUPPORTED_TRACKING_BACKENDS = {TRACKING_BACKEND_SUPERVISION_BYTETRACK, TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK}
+OCR_MUKUL_DEFAULT_ALLOWED_CLASS_IDS = tuple(range(8))
 
 ALIAS_TO_CANONICAL_CLASS = {
     "3wheeler": "3wheeler",
@@ -42,6 +49,12 @@ ALIAS_TO_CANONICAL_CLASS = {
     "motorcycle": "motorcycle",
     "bike": "motorcycle",
     "motorbike": "motorcycle",
+    "2wheeler": "motorcycle",
+    "2 wheeler": "motorcycle",
+    "2-wheeler": "motorcycle",
+    "4wheeler": "car",
+    "4 wheeler": "car",
+    "4-wheeler": "car",
 }
 
 
@@ -67,6 +80,68 @@ class DetectorTrackerResult:
     inference_time_ms: float
 
 
+@dataclass(slots=True, frozen=True)
+class RuntimeDeviceInfo:
+    configured_device: str
+    resolved_device: str
+    cuda_available: bool
+    cuda_device_count: int
+    cuda_device_name: str | None
+    torch_version: str
+    torch_cuda_version: str | None
+
+
+def resolve_runtime_device(configured_device: Any) -> RuntimeDeviceInfo:
+    normalized = str(configured_device or "auto").strip().lower()
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    torch_version = str(torch.__version__)
+    torch_cuda_version = str(torch.version.cuda) if torch.version.cuda is not None else None
+
+    if normalized == "auto":
+        resolved_device = "cuda:0" if cuda_available else "cpu"
+    elif normalized == "cpu":
+        resolved_device = "cpu"
+    elif normalized == "cuda":
+        if not cuda_available:
+            raise ConfigurationError("CUDA was explicitly requested, but torch.cuda.is_available() is False.")
+        resolved_device = "cuda:0"
+    elif normalized.startswith("cuda:"):
+        if not cuda_available:
+            raise ConfigurationError(f"{normalized} was explicitly requested, but CUDA is unavailable.")
+        raw_index = normalized.split(":", 1)[1]
+        try:
+            device_index = int(raw_index)
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"Unsupported detection.device value: {configured_device}. Expected auto, cpu, cuda, or cuda:<index>."
+            ) from exc
+        if device_index < 0 or device_index >= cuda_device_count:
+            raise ConfigurationError(
+                f"Requested CUDA device {normalized} is invalid. Available CUDA device count: {cuda_device_count}."
+            )
+        resolved_device = normalized
+    else:
+        raise ConfigurationError(
+            f"Unsupported detection.device value: {configured_device}. Expected auto, cpu, cuda, or cuda:<index>."
+        )
+
+    cuda_device_name: str | None = None
+    if resolved_device.startswith("cuda:"):
+        cuda_index = int(resolved_device.split(":", 1)[1])
+        cuda_device_name = str(torch.cuda.get_device_name(cuda_index))
+
+    return RuntimeDeviceInfo(
+        configured_device=normalized,
+        resolved_device=resolved_device,
+        cuda_available=cuda_available,
+        cuda_device_count=cuda_device_count,
+        cuda_device_name=cuda_device_name,
+        torch_version=torch_version,
+        torch_cuda_version=torch_cuda_version,
+    )
+
+
 class VehicleDetectorTracker:
     def __init__(
         self,
@@ -84,28 +159,58 @@ class VehicleDetectorTracker:
             raise ConfigurationError("Missing 'detection' configuration.")
         if not tracking_config:
             raise ConfigurationError("Missing 'tracking' configuration.")
+        self.detection_backend = str(detection_config.get("backend", DETECTION_BACKEND_OCR_MUKUL)).strip().lower() or DETECTION_BACKEND_OCR_MUKUL
+        if self.detection_backend not in SUPPORTED_DETECTION_BACKENDS:
+            raise ConfigurationError(f"Unsupported detection.backend value: {self.detection_backend}")
         self.model_path = self._resolve_model_path(detection_config.get("model_path"))
-        self.device = self._resolve_device(detection_config.get("device", "auto"))
-        self.confidence_threshold = float(detection_config.get("confidence_threshold", 0.38))
+        self.runtime_device_info = resolve_runtime_device(detection_config.get("device", "auto"))
+        self.configured_device = self.runtime_device_info.configured_device
+        self.device = self.runtime_device_info.resolved_device
+        self.confidence_threshold = float(
+            detection_config.get(
+                "confidence_threshold",
+                0.2 if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL else 0.38,
+            )
+        )
         self.iou_threshold = float(detection_config.get("iou_threshold", 0.45))
-        self.image_size = int(detection_config.get("image_size", 640))
+        self.image_size = int(
+            detection_config.get(
+                "image_size",
+                1024 if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL else 640,
+            )
+        )
         self.agnostic_nms = bool(detection_config.get("agnostic_nms", False))
-        self.allowed_classes = [self._normalize_class_name(name) for name in detection_config.get("allowed_classes", [])]
-        if not self.allowed_classes:
-            raise ConfigurationError("detection.allowed_classes must not be empty.")
+        self.allowed_classes = [self._normalize_class_name(name) for name in detection_config.get("allowed_classes", []) if str(name).strip()]
+        raw_allowed_class_ids = detection_config.get("allowed_class_ids", OCR_MUKUL_DEFAULT_ALLOWED_CLASS_IDS)
+        self.allowed_class_ids = tuple(int(item) for item in raw_allowed_class_ids)
+        if self.detection_backend == DETECTION_BACKEND_LEGACY_CLEAN and not self.allowed_classes:
+            raise ConfigurationError("detection.allowed_classes must not be empty for legacy_clean backend.")
         self.bbox_quality_enabled = bool(dict(detection_config.get("bbox_quality", {}) or {}).get("enabled", False))
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            self.bbox_quality_enabled = False
         self._default_bbox_quality_profile, self._class_bbox_quality_profiles = self._parse_bbox_quality_profiles(detection_config)
-        self.tracking_backend = str(tracking_config.get("backend", "supervision_bytetrack"))
-        self.track_activation_threshold = float(tracking_config.get("track_activation_threshold", 0.15))
-        self.lost_track_buffer = int(tracking_config.get("lost_track_buffer", 30))
-        self.minimum_matching_threshold = float(tracking_config.get("minimum_matching_threshold", 0.80))
-        self.minimum_consecutive_frames = int(tracking_config.get("minimum_consecutive_frames", 1))
+        self.tracking_backend = (
+            str(tracking_config.get("backend", TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK)).strip().lower()
+            or TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK
+        )
+        if self.tracking_backend not in SUPPORTED_TRACKING_BACKENDS:
+            raise ConfigurationError(f"Unsupported tracking backend: {self.tracking_backend}")
+        default_track_activation_threshold = 0.3 if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK else 0.15
+        default_lost_track_buffer = 40 if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK else 30
+        default_minimum_matching_threshold = 0.6 if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK else 0.80
+        default_minimum_consecutive_frames = 3 if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK else 1
+        self.track_activation_threshold = float(tracking_config.get("track_activation_threshold", default_track_activation_threshold))
+        self.lost_track_buffer = int(tracking_config.get("lost_track_buffer", default_lost_track_buffer))
+        self.minimum_matching_threshold = float(tracking_config.get("minimum_matching_threshold", default_minimum_matching_threshold))
+        self.minimum_consecutive_frames = int(tracking_config.get("minimum_consecutive_frames", default_minimum_consecutive_frames))
         self.isolation_mode = str(tracking_config.get("isolation_mode", TRACKER_ISOLATION_MODE_PER_CAMERA)).strip()
         self.supported_isolation_modes = [str(item).strip() for item in tracking_config.get("supported_isolation_modes", []) if str(item).strip()]
         if not self.supported_isolation_modes:
             self.supported_isolation_modes = [TRACKER_ISOLATION_MODE_PER_CAMERA, TRACKER_ISOLATION_MODE_PER_CAMERA_CLASS]
         if self.isolation_mode not in self.supported_isolation_modes or self.isolation_mode not in SUPPORTED_TRACKER_ISOLATION_MODES:
             raise ConfigurationError(f"Unsupported tracking.isolation_mode value: {self.isolation_mode}")
+        if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK and self.isolation_mode != TRACKER_ISOLATION_MODE_PER_CAMERA:
+            raise ConfigurationError("ocr_mukul_supervision_bytetrack only supports tracking.isolation_mode=per_camera.")
         visualization_config = dict(self.config.get("visualization", {}) or {})
         self.show_rejected_boxes = bool(visualization_config.get("show_rejected_boxes", False))
         self._model_loader = model_loader or YOLO
@@ -126,9 +231,12 @@ class VehicleDetectorTracker:
             "inference_errors": [],
         }
         self._load_model_once()
+        self.logger.info("Detector backend: %s", self.detection_backend)
+        self.logger.info("Tracker backend: %s", self.tracking_backend)
 
     @property
     def metrics(self) -> dict[str, Any]:
+        self._refresh_tracker_metrics()
         return {
             **self._metrics,
             "tracker_camera_ids": list(self._metrics["tracker_camera_ids"]),
@@ -144,6 +252,9 @@ class VehicleDetectorTracker:
         return self._class_bbox_quality_profiles.get(normalized, self._default_bbox_quality_profile)
 
     def infer_yolo_detections(self, packet: FramePacket) -> list[Detection]:
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            raw_result = self._infer_ocr_mukul_result(packet)
+            return self._convert_ocr_mukul_result(raw_result)
         try:
             raw_result = self._model.predict(
                 source=packet.frame,
@@ -199,7 +310,12 @@ class VehicleDetectorTracker:
                 accepted_detections.append(detection)
         return accepted_detections, diagnostics
 
-    def track_detections(self, packet: FramePacket, detections: list[Detection]) -> list[TrackedDetection]:
+    def track_detections(self, packet: FramePacket, detections: list[Detection], raw_result: Any | None = None) -> list[TrackedDetection]:
+        if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK:
+            supervision_detections = self._to_ocr_mukul_supervision_detections(raw_result, detections)
+            tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace="camera")
+            tracked = tracker.update_with_detections(supervision_detections)
+            return self._to_tracked_detections(packet, detections, tracked, tracker_namespace="camera")
         if self.isolation_mode == TRACKER_ISOLATION_MODE_PER_CAMERA:
             supervision_detections = self._to_supervision_detections(detections)
             tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace="camera")
@@ -219,9 +335,14 @@ class VehicleDetectorTracker:
 
     def process_frame(self, packet: FramePacket) -> DetectorTrackerResult:
         started_at = time.perf_counter()
-        raw_detections = self.infer_yolo_detections(packet)
+        raw_result: Any | None = None
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            raw_result = self._infer_ocr_mukul_result(packet)
+            raw_detections = self._convert_ocr_mukul_result(raw_result)
+        else:
+            raw_detections = self.infer_yolo_detections(packet)
         accepted_detections, bbox_quality_diagnostics = self.filter_detections(packet, raw_detections)
-        tracked_detections = self.track_detections(packet, accepted_detections)
+        tracked_detections = self.track_detections(packet, accepted_detections, raw_result=raw_result)
         inference_time_ms = (time.perf_counter() - started_at) * 1000.0
         self._metrics["inference_times_ms"].append(inference_time_ms)
         rejected_detection_count = len([item for item in bbox_quality_diagnostics if not item.accepted_by_bbox_quality])
@@ -314,7 +435,17 @@ class VehicleDetectorTracker:
         self._model = self._model_loader(str(self.model_path))
         self._metrics["model_load_count"] += 1
         self._model_class_names = self._extract_model_class_names(self._model)
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            self._model_class_names[2] = "4Wheeler"
+            self._model_class_names[3] = "2Wheeler"
         self._allowed_model_class_ids = self._resolve_allowed_model_class_ids()
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL and not self.allowed_classes:
+            self.allowed_classes = sorted(
+                {
+                    self._normalize_class_name(self._model_class_names.get(class_id, str(class_id)))
+                    for class_id in self._allowed_model_class_ids
+                }
+            )
         self.logger.info(
             "Model loaded model_path=%s device=%s allowed_classes=%s bbox_quality_enabled=%s",
             self.model_path,
@@ -335,14 +466,6 @@ class VehicleDetectorTracker:
             raise ConfigurationError(f"Resolved model path does not exist: {candidate}")
         return candidate
 
-    def _resolve_device(self, requested_device: Any) -> str:
-        normalized = str(requested_device or "auto").strip().lower()
-        if normalized == "auto":
-            return "cuda:0" if torch.cuda.is_available() else "cpu"
-        if normalized in {"cpu", "cuda", "cuda:0"}:
-            return normalized
-        raise ConfigurationError(f"Unsupported detection.device value: {requested_device}")
-
     def _extract_model_class_names(self, model: Any) -> dict[int, str]:
         names = getattr(model, "names", {})
         if isinstance(names, dict):
@@ -356,6 +479,19 @@ class VehicleDetectorTracker:
         return ALIAS_TO_CANONICAL_CLASS.get(normalized, normalized)
 
     def _resolve_allowed_model_class_ids(self) -> set[int]:
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            available = set(self._model_class_names)
+            missing = [class_id for class_id in self.allowed_class_ids if class_id not in available]
+            if missing:
+                self.logger.warning(
+                    "OCR_MUKUL allowed_class_ids missing from model.names missing=%s available=%s using_intersection_only=True",
+                    missing,
+                    sorted(available),
+                )
+            resolved = {int(class_id) for class_id in self.allowed_class_ids if class_id in available}
+            if not resolved:
+                raise ConfigurationError("Configured detection.allowed_class_ids do not overlap with model.names.")
+            return resolved
         normalized_to_ids: dict[str, list[int]] = {}
         for class_id, class_name in self._model_class_names.items():
             normalized = self._normalize_class_name(class_name)
@@ -635,7 +771,14 @@ class VehicleDetectorTracker:
         return key
 
     def _create_tracker(self, *, frame_rate: float) -> Any:
-        if self.tracking_backend != "supervision_bytetrack":
+        if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK:
+            return sv.ByteTrack(
+                lost_track_buffer=self.lost_track_buffer,
+                track_activation_threshold=self.track_activation_threshold,
+                minimum_matching_threshold=self.minimum_matching_threshold,
+                minimum_consecutive_frames=self.minimum_consecutive_frames,
+            )
+        if self.tracking_backend != TRACKING_BACKEND_SUPERVISION_BYTETRACK:
             raise ConfigurationError(f"Unsupported tracking backend: {self.tracking_backend}")
         return sv.ByteTrack(
             track_activation_threshold=self.track_activation_threshold,
@@ -644,6 +787,54 @@ class VehicleDetectorTracker:
             frame_rate=frame_rate,
             minimum_consecutive_frames=self.minimum_consecutive_frames,
         )
+
+    def _infer_ocr_mukul_result(self, packet: FramePacket) -> Any:
+        try:
+            if callable(self._model):
+                return self._model(packet.frame, conf=self.confidence_threshold, imgsz=self.image_size, verbose=False)[0]
+            return self._model.predict(source=packet.frame, conf=self.confidence_threshold, imgsz=self.image_size, verbose=False)[0]
+        except Exception as exc:
+            self._metrics["inference_errors"].append(
+                {
+                    "camera_id": packet.camera_id,
+                    "frame_number": packet.frame_number,
+                    "model_path": str(self.model_path),
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                }
+            )
+            self.logger.error(
+                "OCR_MUKUL inference failed camera=%s frame=%s model=%s error_type=%s error=%s",
+                packet.camera_id,
+                packet.frame_number,
+                self.model_path,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
+    def _convert_ocr_mukul_result(self, result: Any) -> list[Detection]:
+        detections = self._convert_yolo_result(result)
+        return [item for item in detections if item.class_id in self._allowed_model_class_ids]
+
+    def _to_ocr_mukul_supervision_detections(self, raw_result: Any | None, detections: list[Detection]) -> sv.Detections:
+        if raw_result is None:
+            return self._to_supervision_detections(detections)
+        try:
+            supervision_detections = sv.Detections.from_ultralytics(raw_result)
+        except Exception:
+            return self._to_supervision_detections(detections)
+        if len(supervision_detections.xyxy) == 0:
+            return self._to_supervision_detections(detections)
+        allowed_ids = np.asarray(sorted(self._allowed_model_class_ids), dtype=np.int32)
+        class_ids = np.asarray(supervision_detections.class_id) if getattr(supervision_detections, "class_id", None) is not None else np.array([], dtype=np.int32)
+        if len(class_ids) == 0:
+            return self._to_supervision_detections(detections)
+        mask = np.isin(class_ids.astype(np.int32), allowed_ids)
+        filtered = supervision_detections[mask]
+        if len(filtered.xyxy) != len(detections):
+            return self._to_supervision_detections(detections)
+        return filtered
 
     def _to_tracked_detections(
         self,

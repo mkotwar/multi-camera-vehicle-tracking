@@ -192,6 +192,13 @@ class RunMetadata:
     completed_tracks: int
     error_count: int
     config_path: str
+    configured_device: str | None = None
+    resolved_device: str | None = None
+    cuda_available: bool | None = None
+    cuda_device_count: int | None = None
+    cuda_device_name: str | None = None
+    torch_version: str | None = None
+    torch_cuda_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ALLOWED_RUN_STATUSES:

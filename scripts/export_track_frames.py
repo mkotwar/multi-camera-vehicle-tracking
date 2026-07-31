@@ -129,7 +129,7 @@ def find_latest_run_directory(runs_root: Path) -> Path:
     candidates = [path for path in resolved_root.iterdir() if path.is_dir()]
     if not candidates:
         raise FileNotFoundError(f"No run directories were found under: {resolved_root}")
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    return max(candidates, key=lambda path: path.name)
 
 
 def _load_track_rows(observations_path: Path, local_track_id: str) -> list[dict[str, str]]:
