@@ -153,7 +153,8 @@ vehicle_enrichment:
   shared_florence:
     enabled: true
     backend: florence2
-    base_model_id: microsoft/Florence-2-base-ft
+    base_model_id: C:/Mukul K/vinfo1/video-search-engine/models/florence/Florence-2-base-ft
+    processor_path: C:/Mukul K/vinfo1/video-search-engine/models/florence/Florence-2-base-ft
     adapter_path: C:/Mukul K/OCR_MUKUL/adaptor_florance_baseFT
     adapter_enabled: false
     device: auto
@@ -163,6 +164,7 @@ vehicle_enrichment:
     max_new_tokens: 128
     num_beams: 3
     use_cache: false
+    local_files_only: true
     lazy_load: true
 
   body_type:

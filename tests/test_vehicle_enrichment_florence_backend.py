@@ -59,6 +59,7 @@ def _config(**overrides) -> FlorenceBackendConfig:
         "enabled": True,
         "backend": "florence2",
         "base_model_id": "microsoft/Florence-2-base-ft",
+        "processor_path": "",
         "adapter_path": "",
         "adapter_enabled": False,
         "device": "cpu",
@@ -68,6 +69,7 @@ def _config(**overrides) -> FlorenceBackendConfig:
         "max_new_tokens": 128,
         "num_beams": 3,
         "use_cache": False,
+        "local_files_only": False,
         "lazy_load": True,
     }
     payload.update(overrides)
@@ -112,7 +114,7 @@ def test_non_square_images_are_padded_before_processor_call() -> None:
     result = backend.run_task(image, "<VQA>", "Question")
 
     assert result["status"] == "completed"
-    assert backend._processor.calls[0]["size"] == (40, 40)
+    assert backend._processor.calls[0]["size"] == (40, 20)
 
 
 def test_device_and_dtype_resolution_use_cpu_safe_defaults() -> None:
@@ -163,6 +165,29 @@ def test_model_load_error_is_recorded() -> None:
     with pytest.raises(RuntimeError, match="load failed"):
         backend.load()
     assert backend.metrics["florence_load_failures"] == 1
+
+
+def test_critical_missing_language_keys_fail_clearly() -> None:
+    backend = FlorenceBackend(
+        _config(),
+        model_loader=lambda *a, **k: (
+            FakeModel(),
+            {"missing_keys": ["language_model.lm_head.weight"], "unexpected_keys": [], "mismatched_keys": [], "error_msgs": []},
+        ),
+        processor_loader=lambda *a, **k: FakeProcessor(),
+    )
+    with pytest.raises(RuntimeError, match="critical language weights"):
+        backend.load()
+
+
+def test_explicit_processor_source_is_recorded() -> None:
+    backend = FlorenceBackend(
+        _config(processor_path="custom_processor"),
+        model_loader=lambda *a, **k: FakeModel(),
+        processor_loader=lambda source, **k: FakeProcessor(),
+    )
+    backend.load()
+    assert backend.metrics["florence_processor_path"] == "custom_processor"
 
 
 def test_generation_error_returns_error_status() -> None:

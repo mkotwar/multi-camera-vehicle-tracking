@@ -7,11 +7,19 @@ import time
 from typing import Any
 
 
+CRITICAL_LANGUAGE_KEYS = {
+    "language_model.model.decoder.embed_tokens.weight",
+    "language_model.model.encoder.embed_tokens.weight",
+    "language_model.lm_head.weight",
+}
+
+
 @dataclass(slots=True, frozen=True)
 class FlorenceBackendConfig:
     enabled: bool
     backend: str
     base_model_id: str
+    processor_path: str
     adapter_path: str
     adapter_enabled: bool
     device: str
@@ -21,6 +29,7 @@ class FlorenceBackendConfig:
     max_new_tokens: int
     num_beams: int
     use_cache: bool
+    local_files_only: bool
     lazy_load: bool
 
 
@@ -43,21 +52,35 @@ class FlorenceBackend:
         self._resolved_device = "cpu"
         self._resolved_dtype = "float32"
         self._model_identifier = str(config.base_model_id)
+        self._processor_identifier = str(config.processor_path or config.base_model_id)
         self._adapter_active = False
         self._model_loader = model_loader
         self._processor_loader = processor_loader
         self._adapter_loader = adapter_loader
+        self._loading_info: dict[str, Any] = {
+            "missing_keys": [],
+            "unexpected_keys": [],
+            "mismatched_keys": [],
+            "error_msgs": [],
+        }
         self._metrics: dict[str, Any] = {
             "florence_load_attempts": 0,
             "florence_load_successes": 0,
             "florence_load_failures": 0,
             "florence_loaded": False,
             "florence_model_id": str(config.base_model_id),
+            "florence_processor_path": self._sanitize_path(config.processor_path),
             "florence_adapter_path": self._sanitize_path(config.adapter_path),
             "florence_adapter_active": bool(config.adapter_enabled),
             "florence_device": None,
             "florence_dtype": None,
+            "florence_model_class": None,
+            "florence_processor_class": None,
             "florence_load_duration_ms": 0.0,
+            "florence_missing_keys": [],
+            "florence_unexpected_keys": [],
+            "florence_mismatched_keys": [],
+            "florence_critical_missing_keys": [],
             "gpu_memory_allocated_mb": None,
             "gpu_memory_reserved_mb": None,
         }
@@ -69,6 +92,10 @@ class FlorenceBackend:
     @property
     def model_identifier(self) -> str:
         return self._model_identifier
+
+    @property
+    def processor_identifier(self) -> str:
+        return self._processor_identifier
 
     @property
     def adapter_active(self) -> bool:
@@ -83,8 +110,17 @@ class FlorenceBackend:
         return self._resolved_dtype
 
     @property
+    def loading_info(self) -> dict[str, Any]:
+        return dict(self._loading_info)
+
+    @property
     def metrics(self) -> dict[str, Any]:
-        return dict(self._metrics)
+        payload = dict(self._metrics)
+        payload["florence_missing_keys"] = list(self._metrics["florence_missing_keys"])
+        payload["florence_unexpected_keys"] = list(self._metrics["florence_unexpected_keys"])
+        payload["florence_mismatched_keys"] = list(self._metrics["florence_mismatched_keys"])
+        payload["florence_critical_missing_keys"] = list(self._metrics["florence_critical_missing_keys"])
+        return payload
 
     def load(self) -> None:
         if self._loaded or not self.config.enabled:
@@ -95,64 +131,89 @@ class FlorenceBackend:
         try:
             import torch
             from peft import PeftModel
-            from transformers.configuration_utils import PretrainedConfig
-            from transformers.tokenization_utils_base import PreTrainedTokenizerBase
             from transformers import AutoModelForCausalLM, AutoProcessor
-
-            # Florence-2 remote config expects this attribute during dynamic-config
-            # construction, but newer transformers builds may not define it.
-            if not hasattr(PretrainedConfig, "forced_bos_token_id"):
-                PretrainedConfig.forced_bos_token_id = None
-            if not hasattr(PreTrainedTokenizerBase, "additional_special_tokens"):
-                PreTrainedTokenizerBase.additional_special_tokens = property(
-                    lambda self: list(getattr(self, "extra_special_tokens", []) or [])
-                )
-            if not hasattr(PreTrainedTokenizerBase, "additional_special_tokens_ids"):
-                PreTrainedTokenizerBase.additional_special_tokens_ids = property(
-                    lambda self: list(getattr(self, "extra_special_tokens_ids", []) or [])
-                )
 
             self._resolved_device = self._select_device(torch)
             torch_dtype = self._select_torch_dtype(torch, self._resolved_device)
             self._resolved_dtype = self._dtype_name(torch_dtype)
-            model_source = self._resolve_model_source(self.config.base_model_id)
+            model_source = self._resolve_required_source(self.config.base_model_id, label="model")
+            processor_source = self._resolve_processor_source(model_source)
             self._model_identifier = str(model_source)
-            model_loader = self._model_loader or AutoModelForCausalLM.from_pretrained
+            self._processor_identifier = str(processor_source)
+
+            model_kwargs = {
+                "trust_remote_code": self.config.trust_remote_code,
+                "local_files_only": self.config.local_files_only,
+                "attn_implementation": self.config.attention_implementation,
+                "torch_dtype": torch_dtype,
+            }
+            processor_kwargs = {
+                "trust_remote_code": self.config.trust_remote_code,
+                "local_files_only": self.config.local_files_only,
+            }
+
+            if self._model_loader is None:
+                self._model, loading_info = AutoModelForCausalLM.from_pretrained(
+                    str(model_source),
+                    output_loading_info=True,
+                    **model_kwargs,
+                )
+            else:
+                loaded = self._model_loader(str(model_source), **model_kwargs)
+                if isinstance(loaded, tuple) and len(loaded) == 2:
+                    self._model, loading_info = loaded
+                else:
+                    self._model = loaded
+                    loading_info = {}
             processor_loader = self._processor_loader or AutoProcessor.from_pretrained
-            self._model = model_loader(
-                model_source,
-                trust_remote_code=self.config.trust_remote_code,
-                attn_implementation=self.config.attention_implementation,
-                torch_dtype=torch_dtype,
-            )
-            if hasattr(self._model, "to"):
-                self._model = self._model.to(self._resolved_device)
-            self._processor = processor_loader(
-                model_source,
-                trust_remote_code=self.config.trust_remote_code,
-            )
+            self._processor = processor_loader(str(processor_source), **processor_kwargs)
+            self._loading_info = self._normalize_loading_info(loading_info)
+            self._validate_loading_info()
+
             self._adapter_active = False
             if self.config.adapter_enabled:
                 adapter_path = self._resolve_optional_path(self.config.adapter_path)
                 if adapter_path is None:
                     raise FileNotFoundError(f"Configured Florence adapter path does not exist: {self.config.adapter_path}")
                 adapter_loader = self._adapter_loader or PeftModel.from_pretrained
-                self._model = adapter_loader(self._model, str(adapter_path))
+                if self._adapter_loader is None:
+                    self._model = adapter_loader(
+                        self._model,
+                        str(adapter_path),
+                        local_files_only=self.config.local_files_only,
+                    )
+                else:
+                    self._model = adapter_loader(self._model, str(adapter_path))
                 self._adapter_active = True
+            if hasattr(self._model, "to"):
+                self._model = self._model.to(self._resolved_device)
             if hasattr(self._model, "eval"):
                 self._model.eval()
+
             self._loaded = True
             self._metrics["florence_load_successes"] += 1
             self._metrics["florence_loaded"] = True
             self._metrics["florence_model_id"] = self._model_identifier
+            self._metrics["florence_processor_path"] = self._sanitize_path(self._processor_identifier)
             self._metrics["florence_adapter_active"] = self._adapter_active
             self._metrics["florence_device"] = self._resolved_device
             self._metrics["florence_dtype"] = self._resolved_dtype
+            self._metrics["florence_model_class"] = type(self._model).__name__
+            self._metrics["florence_processor_class"] = type(self._processor).__name__
             self._metrics["florence_load_duration_ms"] = float((time.perf_counter() - started_at) * 1000.0)
+            self._metrics["florence_missing_keys"] = list(self._loading_info["missing_keys"])
+            self._metrics["florence_unexpected_keys"] = list(self._loading_info["unexpected_keys"])
+            self._metrics["florence_mismatched_keys"] = list(self._loading_info["mismatched_keys"])
+            self._metrics["florence_critical_missing_keys"] = [
+                key for key in self._loading_info["missing_keys"] if key in CRITICAL_LANGUAGE_KEYS
+            ]
             self._update_gpu_metrics(torch)
             self.logger.info("Florence model: %s", self._model_identifier)
+            self.logger.info("Florence processor: %s", self._processor_identifier)
             self.logger.info("Florence adapter configured: %s", bool(self.config.adapter_path))
             self.logger.info("Florence adapter active for body type: %s", self._adapter_active)
+            self.logger.info("Florence model class: %s", self._metrics["florence_model_class"])
+            self.logger.info("Florence processor class: %s", self._metrics["florence_processor_class"])
             self.logger.info("Florence device: %s", self._resolved_device)
             self.logger.info("Florence dtype: %s", self._resolved_dtype)
             self.logger.info("Florence loaded once in %.3f seconds", self._metrics["florence_load_duration_ms"] / 1000.0)
@@ -187,36 +248,34 @@ class FlorenceBackend:
             }
         try:
             import cv2
-            import numpy as np
             from PIL import Image
             import torch
 
             if image is None or getattr(image, "size", 0) == 0:
                 raise ValueError("Input image is empty.")
             started_at = time.perf_counter()
-            prepared_image = self._pad_to_square(image, np)
-            image_pil = Image.fromarray(cv2.cvtColor(prepared_image, cv2.COLOR_BGR2RGB))
+            image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             prompt = task_prompt + text_input if text_input else task_prompt
             inputs = self._processor(text=prompt, images=image_pil, return_tensors="pt")
-            prepared_inputs = {
-                key: value.to(self._resolved_device) if hasattr(value, "to") else value
-                for key, value in dict(inputs).items()
-            }
-            with torch.no_grad():
+            if hasattr(inputs, "to"):
+                inputs = inputs.to(self._resolved_device)
+            with torch.inference_mode():
                 generated_ids = self._model.generate(
-                    input_ids=prepared_inputs["input_ids"],
-                    pixel_values=prepared_inputs["pixel_values"],
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
                     max_new_tokens=self.config.max_new_tokens,
                     do_sample=False,
                     num_beams=self.config.num_beams,
                     use_cache=self.config.use_cache,
                 )
             generated_text = self._processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-            parsed_answer = self._processor.post_process_generation(
-                generated_text,
-                task=task_prompt,
-                image_size=(image_pil.width, image_pil.height),
-            )
+            parsed_answer = None
+            if str(task_prompt).startswith("<"):
+                parsed_answer = self._processor.post_process_generation(
+                    generated_text,
+                    task=task_prompt,
+                    image_size=(image_pil.width, image_pil.height),
+                )
             inference_duration_ms = float((time.perf_counter() - started_at) * 1000.0)
             self._update_gpu_metrics(torch)
             return {
@@ -225,10 +284,12 @@ class FlorenceBackend:
                 "payload": {
                     "task_prompt": task_prompt,
                     "prompt_text": text_input,
+                    "generated_ids": self._serialize_generated_ids(generated_ids),
                     "generated_text": generated_text,
                     "parsed_answer": parsed_answer,
                     "adapter_active": self._adapter_active,
                     "model_identifier": self._model_identifier,
+                    "processor_identifier": self._processor_identifier,
                     "device": self._resolved_device,
                     "dtype": self._resolved_dtype,
                     "inference_duration_ms": inference_duration_ms,
@@ -249,9 +310,25 @@ class FlorenceBackend:
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _resolve_model_source(self, raw_value: str) -> str:
+    def _resolve_required_source(self, raw_value: str, *, label: str) -> str:
         resolved = self._resolve_optional_path(raw_value)
-        return str(resolved) if resolved is not None else str(raw_value)
+        if resolved is not None:
+            return str(resolved)
+        if self.config.local_files_only:
+            raise FileNotFoundError(f"Configured Florence {label} path does not exist: {raw_value}")
+        return str(raw_value)
+
+    def _resolve_processor_source(self, model_source: str) -> str:
+        if self.config.processor_path not in ("", None):
+            explicit = self._resolve_optional_path(self.config.processor_path)
+            if explicit is not None:
+                return str(explicit)
+            if not self.config.local_files_only:
+                return str(self.config.processor_path)
+        adapter = self._resolve_optional_path(self.config.adapter_path)
+        if adapter is not None:
+            return str(adapter)
+        return str(model_source)
 
     def _resolve_optional_path(self, raw_value: str) -> Path | None:
         if raw_value in ("", None):
@@ -262,6 +339,24 @@ class FlorenceBackend:
         else:
             candidate = candidate.resolve()
         return candidate if candidate.exists() else None
+
+    def _validate_loading_info(self) -> None:
+        missing_keys = set(self._loading_info.get("missing_keys", []))
+        critical_missing = sorted(key for key in missing_keys if key in CRITICAL_LANGUAGE_KEYS)
+        if critical_missing:
+            raise RuntimeError(
+                "Florence checkpoint is missing critical language weights: " + ", ".join(critical_missing)
+            )
+
+    @staticmethod
+    def _normalize_loading_info(loading_info: Any) -> dict[str, Any]:
+        payload = dict(loading_info or {})
+        return {
+            "missing_keys": list(payload.get("missing_keys", [])),
+            "unexpected_keys": list(payload.get("unexpected_keys", [])),
+            "mismatched_keys": list(payload.get("mismatched_keys", [])),
+            "error_msgs": list(payload.get("error_msgs", [])),
+        }
 
     def _select_device(self, torch_module: Any) -> str:
         requested = str(self.config.device or "auto").strip().lower()
@@ -305,13 +400,10 @@ class FlorenceBackend:
             self._metrics["gpu_memory_reserved_mb"] = round(float(torch_module.cuda.memory_reserved() / (1024 * 1024)), 3)
 
     @staticmethod
-    def _pad_to_square(image: Any, np_module: Any) -> Any:
-        height, width = image.shape[:2]
-        if height == width:
-            return image
-        size = max(height, width)
-        padded = np_module.zeros((size, size, image.shape[2]), dtype=image.dtype)
-        top = (size - height) // 2
-        left = (size - width) // 2
-        padded[top : top + height, left : left + width] = image
-        return padded
+    def _serialize_generated_ids(generated_ids: Any) -> list[int]:
+        if generated_ids is None or len(generated_ids) == 0:
+            return []
+        first = generated_ids[0]
+        if hasattr(first, "tolist"):
+            return list(first.tolist())
+        return list(first)

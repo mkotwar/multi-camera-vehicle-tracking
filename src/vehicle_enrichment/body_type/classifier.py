@@ -20,9 +20,7 @@ from ..shared import FlorenceBackend
 
 BODY_TYPE_TASK_PROMPT = "<VQA>"
 BODY_TYPE_PROMPT_TEXT = (
-    "Classify the body type of the main vehicle in this crop. "
-    "Choose exactly one label: SUV, SEDAN, HATCHBACK, MPV, VAN, PICKUP, OTHER, UNKNOWN. "
-    "Return only the label."
+    "Which is closest: hatchback, sedan, suv, mpv, van, pickup, or other?"
 )
 
 UNKNOWN_PHRASES = {
@@ -40,8 +38,8 @@ UNKNOWN_PHRASES = {
 NORMALIZATION_RULES = [
     ("SUV", {"suv", "sport utility vehicle", "sports utility vehicle"}),
     ("SEDAN", {"sedan", "sedan car", "saloon"}),
-    ("HATCHBACK", {"hatchback", "hatch back"}),
-    ("MPV", {"mpv", "multi purpose vehicle", "multi-purpose vehicle"}),
+    ("HATCHBACK", {"hatchback", "hatch back", "back"}),
+    ("MPV", {"mpv", "muv", "multi purpose vehicle", "multi-purpose vehicle", "multi utility vehicle"}),
     ("VAN", {"van", "minivan"}),
     ("PICKUP", {"pickup", "pickup truck", "pick up", "pick-up"}),
     ("OTHER", {"other"}),

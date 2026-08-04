@@ -80,6 +80,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "enabled": bool(shared_florence.get("enabled", False)),
             "backend": str(shared_florence.get("backend", "florence2")).strip() or "florence2",
             "base_model_id": str(shared_florence.get("base_model_id", "microsoft/Florence-2-base-ft")).strip(),
+            "processor_path": str(shared_florence.get("processor_path", "")).strip(),
             "adapter_path": str(shared_florence.get("adapter_path", "model_weights/florence/adaptor_florance_baseFT")).strip(),
             "adapter_enabled": bool(shared_florence.get("adapter_enabled", False)),
             "device": str(shared_florence.get("device", "auto")).strip() or "auto",
@@ -89,6 +90,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "max_new_tokens": int(shared_florence.get("max_new_tokens", 128)),
             "num_beams": int(shared_florence.get("num_beams", 3)),
             "use_cache": bool(shared_florence.get("use_cache", False)),
+            "local_files_only": bool(shared_florence.get("local_files_only", False)),
             "lazy_load": bool(shared_florence.get("lazy_load", True)),
         },
         "body_type": {
