@@ -49,6 +49,8 @@ class FramePacket:
     timestamp_seconds: float
     source_fps: float
     frame: np.ndarray
+    source_frame_width: int
+    source_frame_height: int
     worker_id: int
     captured_at: str
     source_type: str
@@ -154,6 +156,13 @@ class EvidenceCandidate:
     raw_class_name: str
     final_class: str
     role: str
+    original_bbox_xyxy: tuple[float, float, float, float]
+    expanded_crop_bbox_xyxy: tuple[int, int, int, int]
+    context_padding_ratio: float
+    source_frame_width: int
+    source_frame_height: int
+    original_crop_width: int
+    original_crop_height: int
     bbox_area: float
     sharpness_score: float
     centeredness_score: float
@@ -176,6 +185,13 @@ class TrackEvidence:
     crop_path: str | None
     annotated_frame_path: str | None
     bbox_xyxy: tuple[float, float, float, float]
+    original_bbox_xyxy: tuple[float, float, float, float]
+    expanded_crop_bbox_xyxy: tuple[int, int, int, int]
+    context_padding_ratio: float
+    source_frame_width: int
+    source_frame_height: int
+    original_crop_width: int
+    original_crop_height: int
     sharpness_score: float
     best_overall_score: float
 
@@ -193,7 +209,9 @@ class RunMetadata:
     error_count: int
     config_path: str
     configured_device: str | None = None
+    configured_dtype: str | None = None
     resolved_device: str | None = None
+    resolved_dtype: str | None = None
     cuda_available: bool | None = None
     cuda_device_count: int | None = None
     cuda_device_name: str | None = None

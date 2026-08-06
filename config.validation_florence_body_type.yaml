@@ -7,13 +7,13 @@ input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: data/test_videos/1test.mp4
+      source: "D:/old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4"
       enabled: true
     - camera_id: CAM_002
       source_type: video
-      source: data/test_videos/2test.mp4
-      enabled: true
-  max_frames_per_camera: 20
+      source: "D:/old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4"
+      enabled: false
+  max_frames_per_camera: 100
 
 ingestion:
   worker_count: 2
@@ -32,7 +32,7 @@ ingestion:
 
 detection:
   backend: ocr_mukul
-  model_path: model_weights/best_old.pt
+  model_path: "D:/project/models/best_old.pt"
   device: auto
   confidence_threshold: 0.2
   iou_threshold: 0.45
@@ -153,16 +153,16 @@ vehicle_enrichment:
   shared_florence:
     enabled: true
     backend: florence2
-    base_model_id: C:/Mukul K/vinfo1/video-search-engine/models/florence/Florence-2-base-ft
-    processor_path: C:/Mukul K/vinfo1/video-search-engine/models/florence/Florence-2-base-ft
-    adapter_path: C:/Mukul K/OCR_MUKUL/adaptor_florance_baseFT
+    base_model_id: "D:/project/models/Florence-2-base-ft"
+    processor_path: "D:/project/models/Florence-2-base-ft"
+    adapter_path: null
     adapter_enabled: false
     device: auto
     dtype: auto
     trust_remote_code: true
     attention_implementation: eager
-    max_new_tokens: 128
-    num_beams: 3
+    max_new_tokens: 64
+    num_beams: 1
     use_cache: false
     local_files_only: true
     lazy_load: true
@@ -173,8 +173,8 @@ vehicle_enrichment:
     run_only_when_vehicle_class:
       - CAR
     maximum_crops_per_track: 2
-    minimum_crop_width: 180
-    minimum_crop_height: 120
+    minimum_crop_width: 100
+    minimum_crop_height: 90
     allowed_labels:
       - SUV
       - SEDAN
@@ -186,14 +186,15 @@ vehicle_enrichment:
       - UNKNOWN
 
   colour:
-    enabled: false
+    enabled: true
 
   make_model:
     enabled: false
 
   plate:
-    detection_enabled: false
-    colour_enabled: false
+    detection_enabled: true
+    recognition_enabled: true 
+    colour_enabled: true
 
   ocr:
     enabled: false

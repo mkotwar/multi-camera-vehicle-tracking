@@ -1,0 +1,49 @@
+[
+  {
+    "local_track_id": "CAM_001:TRACK_1",
+    "camera_id": "CAM_001",
+    "vehicle_class": "UNKNOWN",
+    "vehicle_class_confidence": null,
+    "vehicle_body_type": {
+      "label": "UNKNOWN",
+      "predictions": [],
+      "status": "disabled",
+      "source": "body_type.classifier",
+      "reason": "Vehicle body type inference is disabled.",
+      "model": null,
+      "adapter_active": null,
+      "aggregation_reason": null,
+      "agreement_score": null,
+      "accumulated_quality_weight": null,
+      "task_prompt": null,
+      "prompt_text": null
+    },
+    "vehicle_colour": {
+      "label": "UNKNOWN",
+      "predictions": [],
+      "status": "disabled",
+      "source": "colour.classifier",
+      "reason": "Vehicle colour inference is disabled.",
+      "model": null,
+      "adapter_active": null,
+      "aggregation_reason": null,
+      "agreement_score": null,
+      "accumulated_quality_weight": null,
+      "task_prompt": null,
+      "prompt_text": null
+    },
+    "vehicle_make": null,
+    "vehicle_model": null,
+    "plate_detected": false,
+    "plate_colour": null,
+    "registration_category": null,
+    "plate_text": null,
+    "status": "no_evidence",
+    "evidence_used": [],
+    "predictions": [],
+    "errors": [],
+    "processing_started_at": "2026-08-06T08:10:45.297595+00:00",
+    "processing_completed_at": "2026-08-06T08:10:45.297627+00:00",
+    "processing_duration_ms": 0.05370000144466758
+  }
+]

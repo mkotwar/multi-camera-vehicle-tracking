@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .image_size_policy import ImageSizePolicy, RESOLUTION_TIER_ACCEPTABLE, RESOLUTION_TIER_PREFERRED, normalize_image_size_policy
 from .schemas import EnrichmentEvidenceItem
 
 
@@ -28,6 +29,9 @@ class EvidenceQualityConfig:
     minimum_sharpness: float
     minimum_quality_score: float
     border_margin_ratio: float
+    minimum_brightness: float
+    maximum_brightness: float
+    maximum_edge_truncation_ratio: float
     area_weight: float
     sharpness_weight: float
     confidence_weight: float
@@ -40,12 +44,16 @@ class EvidenceQualityConfig:
 def normalize_quality_config(raw_config: dict[str, Any]) -> EvidenceQualityConfig:
     evidence = dict(raw_config.get("evidence", {}) or {})
     scoring = dict(evidence.get("scoring", {}) or {})
+    quality = dict(raw_config.get("evidence_quality", {}) or {})
     return EvidenceQualityConfig(
         minimum_crop_width=int(evidence.get("minimum_crop_width", 100)),
         minimum_crop_height=int(evidence.get("minimum_crop_height", 70)),
         minimum_sharpness=float(evidence.get("minimum_sharpness", 10.0)),
         minimum_quality_score=float(evidence.get("minimum_quality_score", 0.20)),
         border_margin_ratio=float(evidence.get("border_margin_ratio", 0.02)),
+        minimum_brightness=float(quality.get("minimum_brightness", 35.0)),
+        maximum_brightness=float(quality.get("maximum_brightness", 225.0)),
+        maximum_edge_truncation_ratio=float(quality.get("maximum_edge_truncation_ratio", 0.15)),
         area_weight=float(scoring.get("area_weight", 0.25)),
         sharpness_weight=float(scoring.get("sharpness_weight", 0.25)),
         confidence_weight=float(scoring.get("confidence_weight", 0.20)),
@@ -76,8 +84,14 @@ class EvidenceQualityEvaluator:
     - final score is normalized to [0, 1].
     """
 
-    def __init__(self, config: EvidenceQualityConfig) -> None:
+    def __init__(self, config: EvidenceQualityConfig, image_size_policy: ImageSizePolicy | None = None) -> None:
         self.config = config
+        self.image_size_policy = image_size_policy or normalize_image_size_policy(
+            {},
+            fallback_body_type={"minimum_crop_width": 256, "minimum_crop_height": 192},
+            fallback_colour={"minimum_crop_width": 256, "minimum_crop_height": 192},
+            detection={},
+        )
 
     def score_item(self, item: EnrichmentEvidenceItem) -> EnrichmentEvidenceItem:
         reasons = list(item.rejection_reasons)
@@ -96,6 +110,8 @@ class EvidenceQualityEvaluator:
         border_penalty = max(0.0, min(1.0, float(item.border_penalty)))
         clipping_ratio = max(0.0, min(1.0, float(item.clipping_ratio)))
         aspect_ratio = float(crop_width / crop_height) if crop_height > 0 else 0.0
+        tier = self.image_size_policy.florence.resolution_tier(int(item.original_crop_width), int(item.original_crop_height))
+        skip_reason = self.image_size_policy.florence.eligibility_reason(int(item.original_crop_width), int(item.original_crop_height))
 
         if crop_width < self.config.minimum_crop_width:
             reasons.append("crop_width_below_minimum")
@@ -103,9 +119,14 @@ class EvidenceQualityEvaluator:
             reasons.append("crop_height_below_minimum")
         if sharpness < self.config.minimum_sharpness:
             reasons.append("sharpness_below_minimum")
+        if brightness < self.config.minimum_brightness:
+            reasons.append("brightness_below_minimum")
+        if brightness > self.config.maximum_brightness:
+            reasons.append("brightness_above_maximum")
+        if clipping_ratio > self.config.maximum_edge_truncation_ratio:
+            reasons.append("edge_truncation_above_maximum")
         if aspect_ratio <= 0.0 or aspect_ratio > 6.0 or aspect_ratio < 0.2:
             reasons.append("aspect_ratio_out_of_range")
-
         normalized_area_score = self._normalize_area(crop_area)
         normalized_sharpness_score = self._normalize_sharpness(sharpness)
         brightness_penalty = self._brightness_penalty(brightness)
@@ -133,13 +154,33 @@ class EvidenceQualityEvaluator:
 
         if score < self.config.minimum_quality_score:
             reasons.append("quality_score_below_minimum")
+        if any(
+            reason in reasons
+            for reason in (
+                "brightness_below_minimum",
+                "brightness_above_maximum",
+                "edge_truncation_above_maximum",
+                "sharpness_below_minimum",
+            )
+        ):
+            reasons.append("crop_rejected_quality")
 
         item.crop_width = crop_width
         item.crop_height = crop_height
         item.crop_area = crop_area
+        item.original_crop_width = int(item.original_crop_width or crop_width)
+        item.original_crop_height = int(item.original_crop_height or crop_height)
+        item.resolution_tier = tier
+        item.florence_eligible_for_body_type = tier != "below_minimum"
+        item.florence_eligible_for_colour = tier != "below_minimum"
+        item.florence_body_type_skip_reason = skip_reason
+        item.florence_colour_skip_reason = skip_reason
         item.sharpness_score = sharpness
         item.brightness_score = brightness
         item.quality_score = score
+        item.edge_truncated = clipping_ratio > self.config.maximum_edge_truncation_ratio
+        tier_bonus = 0.12 if tier == RESOLUTION_TIER_PREFERRED else 0.05 if tier == RESOLUTION_TIER_ACCEPTABLE else -0.25
+        item.ranking_score = float(score + tier_bonus - (0.20 if "crop_rejected_quality" in reasons else 0.0))
         item.rejection_reasons = self._dedupe_reasons(reasons)
         return item
 

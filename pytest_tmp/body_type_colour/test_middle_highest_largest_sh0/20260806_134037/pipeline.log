@@ -1,0 +1,2 @@
+2026-08-06 13:40:37 | INFO | pipeline | EvidenceCollector normalized best-overall weights={'confidence': 0.0, 'sharpness': 1.0, 'bbox_area': 0.0, 'centeredness': 0.0, 'edge_visibility': 0.0}
+2026-08-06 13:40:37 | INFO | pipeline | EvidenceCollector initialized enabled=True include_discarded_tracks=False fail_pipeline_on_error=False

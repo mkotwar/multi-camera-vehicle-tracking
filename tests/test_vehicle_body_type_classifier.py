@@ -24,6 +24,8 @@ class FakeBackend:
             "reason": None,
             "payload": {
                 "generated_text": response,
+                "decoded_generated_only_text": response,
+                "decoded_generated_only_text_skip_special": response,
                 "parsed_answer": {task_prompt: response},
                 "model_identifier": self.model_identifier,
                 "adapter_active": self.adapter_active,
@@ -34,6 +36,9 @@ class FakeBackend:
 
 class FakeLogger:
     def info(self, *args, **kwargs):
+        return None
+
+    def debug(self, *args, **kwargs):
         return None
 
 
@@ -91,8 +96,8 @@ def _classifier(backend: FakeBackend) -> VehicleBodyTypeClassifier:
             "backend": "florence2",
             "run_only_when_vehicle_class": ["CAR"],
             "maximum_crops_per_track": 2,
-            "minimum_crop_width": 180,
-            "minimum_crop_height": 120,
+            "minimum_crop_width": 256,
+            "minimum_crop_height": 192,
             "allowed_labels": ["SUV", "SEDAN", "HATCHBACK", "MPV", "VAN", "PICKUP", "OTHER", "UNKNOWN"],
         },
         backend=backend,
@@ -112,12 +117,27 @@ def test_crop_dimension_eligibility_and_maximum_crop_count(tmp_path: Path) -> No
     classifier = _classifier(backend)
     items = [
         _item(tmp_path, "big1", width=320, height=240, quality=0.9),
-        _item(tmp_path, "big2", width=300, height=220, quality=0.8),
+        _item(tmp_path, "big2", width=256, height=192, quality=0.8),
         _item(tmp_path, "small", width=100, height=80, quality=0.95),
     ]
     result = classifier.classify(_request(tmp_path, items=items))
     assert result.label == "SUV"
     assert len(backend.calls) == 2
+
+
+def test_exact_minimum_florence_size_is_accepted(tmp_path: Path) -> None:
+    backend = FakeBackend(["SEDAN"])
+    classifier = _classifier(backend)
+    result = classifier.classify(_request(tmp_path, items=[_item(tmp_path, "exact_min", width=256, height=192)]))
+    assert result.status == "completed"
+    assert result.label == "SEDAN"
+
+
+def test_below_minimum_florence_size_is_rejected(tmp_path: Path) -> None:
+    classifier = _classifier(FakeBackend())
+    result = classifier.classify(_request(tmp_path, items=[_item(tmp_path, "too_narrow", width=255, height=192)]))
+    assert result.status == "skipped"
+    assert result.reason == "no_eligible_crops"
 
 
 def test_prompt_construction_uses_vqa_and_constrained_text(tmp_path: Path) -> None:
@@ -134,6 +154,9 @@ def test_synonym_and_ambiguous_normalization_rules(tmp_path: Path) -> None:
     assert classifier.normalize_label("saloon") == ("SEDAN", "exact_phrase_match")
     assert classifier.normalize_label("hatch back") == ("HATCHBACK", "exact_phrase_match")
     assert classifier.normalize_label("van sedan") == ("UNKNOWN", "ambiguous_multiple_labels")
+    assert classifier.normalize_label("sedan") == ("SEDAN", "exact_phrase_match")
+    assert classifier.normalize_label("The closest body type is SUV.") == ("SUV", "contained_phrase_match")
+    assert classifier.normalize_label("qA") == ("UNKNOWN", "unexpected_output")
 
 
 def test_weighted_agreement_and_conflict_rules(tmp_path: Path) -> None:
@@ -166,3 +189,26 @@ def test_failed_crop_does_not_fail_complete_track_and_confidence_is_not_invented
     assert result.label == "UNKNOWN"
     assert result.predictions[0].status == "error"
     assert result.predictions[0].confidence is None
+
+
+def test_parsed_answer_dictionary_values_are_handled(tmp_path: Path) -> None:
+    class ParsedBackend(FakeBackend):
+        def run_task(self, image, task_prompt, text_input=None):
+            self.calls.append({"shape": image.shape, "task_prompt": task_prompt, "text_input": text_input})
+            return {
+                "status": "completed",
+                "reason": None,
+                "payload": {
+                    "generated_text": "qA",
+                    "decoded_generated_only_text": "qA",
+                    "parsed_answer": {task_prompt: {"answer": "sedan"}},
+                    "model_identifier": self.model_identifier,
+                    "adapter_active": self.adapter_active,
+                    "inference_duration_ms": 10.0,
+                },
+            }
+
+    classifier = _classifier(ParsedBackend())
+    result = classifier.classify(_request(tmp_path))
+
+    assert result.label == "SEDAN"

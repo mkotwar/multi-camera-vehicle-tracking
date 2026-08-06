@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 
 import src.detector_tracker as detector_tracker_module
+import src.runtime_device as runtime_device_module
 from src.detector_tracker import VehicleDetectorTracker, resolve_runtime_device
 from src.models import ConfigurationError, FramePacket
+from src.runtime_device import CPU_ONLY_BUILD_REASON
 
 
 class FakeTensor:
@@ -96,6 +98,8 @@ def _frame_packet(
         timestamp_seconds=frame_number / fps,
         source_fps=fps,
         frame=frame,
+        source_frame_width=width,
+        source_frame_height=height,
         worker_id=0,
         captured_at="2026-07-29T00:00:00+00:00",
         source_type="video",
@@ -137,6 +141,7 @@ def _config(
     isolation_mode: str = "per_camera",
     agnostic_nms: bool = False,
     device: str = "cpu",
+    dtype: str = "auto",
     detection_backend: str = "legacy_clean",
     tracking_backend: str = "supervision_bytetrack",
 ) -> dict:
@@ -145,6 +150,7 @@ def _config(
             "backend": detection_backend,
             "model_path": model_path,
             "device": device,
+            "dtype": dtype,
             "confidence_threshold": 0.2 if detection_backend == "ocr_mukul" else 0.38,
             "iou_threshold": 0.45,
             "image_size": 1024 if detection_backend == "ocr_mukul" else 640,
@@ -242,91 +248,104 @@ def test_model_is_loaded_only_once_and_config_is_passed(tmp_path: Path) -> None:
 
 
 def test_auto_resolves_to_cuda0_when_cuda_is_available(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
-    info = resolve_runtime_device("auto")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("auto", "auto")
     assert info.configured_device == "auto"
+    assert info.configured_dtype == "auto"
     assert info.resolved_device == "cuda:0"
+    assert info.resolved_dtype == "float16"
     assert info.cuda_available is True
     assert info.cuda_device_count == 2
     assert info.cuda_device_name == "GPU-0"
 
 
 def test_auto_resolves_to_cpu_when_cuda_is_unavailable(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
-    info = resolve_runtime_device("auto")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(runtime_device_module.torch.version, "cuda", None)
+    info = resolve_runtime_device("auto", "auto")
     assert info.resolved_device == "cpu"
+    assert info.resolved_dtype == "float32"
     assert info.cuda_available is False
     assert info.cuda_device_count == 0
     assert info.cuda_device_name is None
+    assert info.reason == CPU_ONLY_BUILD_REASON
 
 
 def test_cpu_always_resolves_to_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
-    info = resolve_runtime_device("cpu")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 1)
+    info = resolve_runtime_device("cpu", "auto")
     assert info.resolved_device == "cpu"
+    assert info.resolved_dtype == "float32"
     assert info.cuda_device_name is None
 
 
 def test_explicit_cuda_resolves_to_cuda0_when_available(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
-    info = resolve_runtime_device("cuda")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
+    info = resolve_runtime_device("cuda", "auto")
     assert info.resolved_device == "cuda:0"
     assert info.cuda_device_name == "GPU-0"
 
 
 def test_explicit_cuda0_succeeds(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
-    info = resolve_runtime_device("cuda:0")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("cuda:0", "auto")
     assert info.resolved_device == "cuda:0"
     assert info.cuda_device_name == "GPU-0"
 
 
 def test_explicit_cuda_raises_when_cuda_is_unavailable(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(runtime_device_module.torch.version, "cuda", "12.1")
     with pytest.raises(ConfigurationError, match="explicitly requested"):
-        resolve_runtime_device("cuda")
+        resolve_runtime_device("cuda", "auto")
 
 
 def test_explicit_valid_cuda_index_succeeds(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 2)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
-    info = resolve_runtime_device("cuda:1")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    info = resolve_runtime_device("cuda:1", "auto")
     assert info.resolved_device == "cuda:1"
     assert info.cuda_device_name == "GPU-1"
 
 
 def test_explicit_invalid_cuda_index_raises(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 1)
     with pytest.raises(ConfigurationError, match="invalid"):
-        resolve_runtime_device("cuda:1")
+        resolve_runtime_device("cuda:1", "auto")
 
 
 def test_unsupported_device_value_raises(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
-    with pytest.raises(ConfigurationError, match="Unsupported detection.device value"):
-        resolve_runtime_device("tpu")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ConfigurationError, match="Unsupported device value"):
+        resolve_runtime_device("tpu", "auto")
+
+
+def test_explicit_cpu_with_float16_raises(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    with pytest.raises(ConfigurationError, match="float16 requires a CUDA device"):
+        resolve_runtime_device("cpu", "float16")
 
 
 def test_gpu_name_is_included_when_cuda_is_selected(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "NVIDIA Test GPU")
-    info = resolve_runtime_device("auto")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: "NVIDIA Test GPU")
+    info = resolve_runtime_device("auto", "auto")
     assert info.cuda_device_name == "NVIDIA Test GPU"
 
 
 def test_gpu_name_is_null_when_cpu_is_selected(monkeypatch) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: False)
-    info = resolve_runtime_device("auto")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: False)
+    info = resolve_runtime_device("auto", "auto")
     assert info.cuda_device_name is None
 
 
@@ -345,9 +364,9 @@ def test_tracker_instance_count_reflects_created_tracker_count(tmp_path: Path) -
 
 
 def test_resolved_device_is_passed_to_yolo_inference(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(detector_tracker_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(runtime_device_module.torch.cuda, "get_device_name", lambda index: "GPU-0")
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
     model = FakeModel(str(model_path))
@@ -358,7 +377,8 @@ def test_resolved_device_is_passed_to_yolo_inference(monkeypatch, tmp_path: Path
         tracker_factory=lambda frame_rate: FakeTracker(frame_rate),
     )
     tracker.process_frame(_frame_packet())
-    assert model.predict_calls[0]["device"] == "cuda:0"
+    assert model.predict_calls[0]["device"] == 0
+    assert model.predict_calls[0]["half"] is True
 
 
 def test_allowed_classes_are_filtered_and_empty_results_do_not_crash(tmp_path: Path) -> None:

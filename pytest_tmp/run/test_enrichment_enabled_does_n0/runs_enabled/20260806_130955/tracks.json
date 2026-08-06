@@ -1,0 +1,75 @@
+[
+  {
+    "local_track_id": "CAM_001:TRACK_1",
+    "camera_id": "CAM_001",
+    "tracker_namespace": "camera",
+    "native_tracker_id": 1,
+    "status": "COMPLETED",
+    "first_frame": 0,
+    "last_frame": 3,
+    "first_timestamp_seconds": 0.0,
+    "last_timestamp_seconds": 0.3,
+    "observation_count": 4,
+    "lost_frames": 0,
+    "final_class": "car",
+    "final_class_reason": "WEIGHTED_MAJORITY",
+    "class_counts": {
+      "car": 4
+    },
+    "class_confidence_sums": {
+      "car": 3.36
+    },
+    "completion_reason": "END_OF_STREAM",
+    "evidence_record_count": 7,
+    "evidence_roles": [
+      "BEST_OVERALL",
+      "FIRST",
+      "HIGHEST_CONFIDENCE",
+      "LARGEST",
+      "LAST",
+      "MIDDLE",
+      "SHARPEST"
+    ],
+    "evidence_directory": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\run\\test_enrichment_enabled_does_n0\\runs_enabled\\20260806_130955\\evidence\\CAM_001\\CAM_001_TRACK_1",
+    "vehicle_enrichment": {
+      "local_track_id": "CAM_001:TRACK_1",
+      "camera_id": "CAM_001",
+      "vehicle_class": "CAR",
+      "vehicle_class_confidence": 0.84,
+      "vehicle_body_type": {
+        "label": "UNKNOWN",
+        "predictions": [],
+        "status": "disabled",
+        "source": "body_type.classifier",
+        "reason": "Vehicle body type inference is disabled.",
+        "model": null,
+        "adapter_active": null,
+        "aggregation_reason": null,
+        "agreement_score": null,
+        "accumulated_quality_weight": null,
+        "task_prompt": "<VQA>",
+        "prompt_text": "What body type is this vehicle? Answer with one word: hatchback, sedan, suv, mpv, van, pickup, or other."
+      },
+      "vehicle_colour": {
+        "label": "UNKNOWN",
+        "predictions": [],
+        "status": "disabled",
+        "source": "colour.classifier",
+        "reason": "Vehicle colour inference is disabled in Step 2."
+      },
+      "vehicle_make": null,
+      "vehicle_model": null,
+      "plate_detected": false,
+      "plate_colour": null,
+      "registration_category": null,
+      "plate_text": null,
+      "status": "no_evidence",
+      "evidence_used": [],
+      "predictions": [],
+      "errors": [],
+      "processing_started_at": "2026-08-06T07:39:55.876521+00:00",
+      "processing_completed_at": "2026-08-06T07:39:55.887797+00:00",
+      "processing_duration_ms": 11.292800001683645
+    }
+  }
+]

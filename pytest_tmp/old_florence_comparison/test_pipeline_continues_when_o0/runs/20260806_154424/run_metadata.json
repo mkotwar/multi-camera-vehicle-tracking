@@ -1,0 +1,21 @@
+{
+  "run_id": "20260806_154424",
+  "project_name": "test_project",
+  "started_at": "2026-08-06T10:14:25.082923+00:00",
+  "completed_at": "2026-08-06T10:14:25.601747+00:00",
+  "status": "COMPLETED",
+  "camera_count": 2,
+  "processed_frames": 3,
+  "completed_tracks": 1,
+  "error_count": 1,
+  "config_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\old_florence_comparison\\test_pipeline_continues_when_o0\\config.yaml",
+  "configured_device": "cpu",
+  "configured_dtype": "auto",
+  "resolved_device": "cpu",
+  "resolved_dtype": "float32",
+  "cuda_available": false,
+  "cuda_device_count": 0,
+  "cuda_device_name": null,
+  "torch_version": "test-torch",
+  "torch_cuda_version": null
+}

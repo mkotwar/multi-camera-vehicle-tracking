@@ -1,0 +1,2 @@
+camera_id,local_track_id,vehicle_class,crop_path,predicted_body_type,body_type_raw_response,predicted_colour,colour_raw_response,manual_body_type,manual_colour,body_type_correct,colour_correct
+CAM_001,CAM_001:TRACK_1,UNKNOWN,,UNKNOWN,,UNKNOWN,,,,,

@@ -1,0 +1,296 @@
+[
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "FIRST",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "MIDDLE",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "LAST",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "HIGHEST_CONFIDENCE",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "LARGEST",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "SHARPEST",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  },
+  {
+    "local_track_id": "CAM_001:TRACK_2",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 2,
+    "tracker_namespace": "camera",
+    "track_status": "COMPLETED",
+    "final_class": "car",
+    "role": "BEST_OVERALL",
+    "frame_number": 5,
+    "timestamp_seconds": 0.5,
+    "raw_class_name": "car",
+    "confidence": 0.8,
+    "bbox_xyxy": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "original_bbox": [
+      20.0,
+      20.0,
+      60.0,
+      60.0
+    ],
+    "expanded_crop_bbox": [
+      20,
+      20,
+      60,
+      60
+    ],
+    "context_padding_ratio": 0.0,
+    "source_frame_width": 120,
+    "source_frame_height": 80,
+    "original_crop_width": 40,
+    "original_crop_height": 40,
+    "crop_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\crops\\frame_000005.jpg",
+    "annotated_frame_path": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_frame_referenced_by_pendi0\\20260806_183650\\evidence\\CAM_001\\CAM_001_TRACK_2\\annotated_frames\\frame_000005.jpg",
+    "sharpness_score": 29093.75,
+    "centeredness_score": 0.7226499018873854,
+    "edge_visibility_score": 0.5,
+    "best_overall_score": 0.8522649901887386
+  }
+]

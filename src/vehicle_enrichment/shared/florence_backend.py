@@ -6,6 +6,8 @@ from pathlib import Path
 import time
 from typing import Any
 
+from src.runtime_device import RuntimeDevice, move_batch_to_device, resolve_runtime_device
+
 
 CRITICAL_LANGUAGE_KEYS = {
     "language_model.model.decoder.embed_tokens.weight",
@@ -42,6 +44,7 @@ class FlorenceBackend:
         model_loader: Any | None = None,
         processor_loader: Any | None = None,
         adapter_loader: Any | None = None,
+        adapter_enabled_override: bool | None = None,
     ) -> None:
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
@@ -51,12 +54,19 @@ class FlorenceBackend:
         self._processor: Any | None = None
         self._resolved_device = "cpu"
         self._resolved_dtype = "float32"
+        self._runtime_device: RuntimeDevice | None = None
         self._model_identifier = str(config.base_model_id)
         self._processor_identifier = str(config.processor_path or config.base_model_id)
         self._adapter_active = False
+        self._adapter_requested = bool(
+            config.adapter_enabled if adapter_enabled_override is None else adapter_enabled_override
+        )
+        self._adapter_path_resolved: str | None = None
+        self._effective_model_type = "base_model"
         self._model_loader = model_loader
         self._processor_loader = processor_loader
         self._adapter_loader = adapter_loader
+        self._adapter_enabled_override = adapter_enabled_override
         self._loading_info: dict[str, Any] = {
             "missing_keys": [],
             "unexpected_keys": [],
@@ -69,9 +79,16 @@ class FlorenceBackend:
             "florence_load_failures": 0,
             "florence_loaded": False,
             "florence_model_id": str(config.base_model_id),
+            "florence_base_model_path": self._sanitize_path(config.base_model_id),
             "florence_processor_path": self._sanitize_path(config.processor_path),
+            "florence_adapter_requested": bool(config.adapter_enabled),
             "florence_adapter_path": self._sanitize_path(config.adapter_path),
             "florence_adapter_active": bool(config.adapter_enabled),
+            "florence_adapter_load_attempts": 0,
+            "florence_adapter_load_successes": 0,
+            "florence_adapter_loaded": False,
+            "florence_adapter_load_error": None,
+            "florence_effective_model_type": "base_model",
             "florence_device": None,
             "florence_dtype": None,
             "florence_model_class": None,
@@ -133,19 +150,25 @@ class FlorenceBackend:
             from peft import PeftModel
             from transformers import AutoModelForCausalLM, AutoProcessor
 
-            self._resolved_device = self._select_device(torch)
-            torch_dtype = self._select_torch_dtype(torch, self._resolved_device)
-            self._resolved_dtype = self._dtype_name(torch_dtype)
+            runtime_device = resolve_runtime_device(self.config.device, self.config.dtype)
+            self._runtime_device = runtime_device
+            self._resolved_device = runtime_device.resolved_device
+            self._resolved_dtype = runtime_device.resolved_dtype
             model_source = self._resolve_required_source(self.config.base_model_id, label="model")
             processor_source = self._resolve_processor_source(model_source)
             self._model_identifier = str(model_source)
             self._processor_identifier = str(processor_source)
+            self._metrics["florence_base_model_path"] = self._sanitize_path(self._model_identifier)
+            self._metrics["florence_processor_path"] = self._sanitize_path(self._processor_identifier)
+            self._metrics["florence_adapter_requested"] = self._adapter_requested
+            self._metrics["florence_adapter_path"] = self._sanitize_path(self.config.adapter_path)
+            self._metrics["florence_adapter_load_error"] = None
 
             model_kwargs = {
                 "trust_remote_code": self.config.trust_remote_code,
                 "local_files_only": self.config.local_files_only,
                 "attn_implementation": self.config.attention_implementation,
-                "torch_dtype": torch_dtype,
+                "torch_dtype": runtime_device.dtype,
             }
             processor_kwargs = {
                 "trust_remote_code": self.config.trust_remote_code,
@@ -171,22 +194,35 @@ class FlorenceBackend:
             self._validate_loading_info()
 
             self._adapter_active = False
-            if self.config.adapter_enabled:
+            self._adapter_path_resolved = None
+            self._effective_model_type = "base_model"
+            if self._adapter_requested:
+                self._metrics["florence_adapter_load_attempts"] += 1
                 adapter_path = self._resolve_optional_path(self.config.adapter_path)
                 if adapter_path is None:
+                    self._metrics["florence_adapter_load_error"] = f"Configured Florence adapter path does not exist: {self.config.adapter_path}"
                     raise FileNotFoundError(f"Configured Florence adapter path does not exist: {self.config.adapter_path}")
                 adapter_loader = self._adapter_loader or PeftModel.from_pretrained
-                if self._adapter_loader is None:
-                    self._model = adapter_loader(
-                        self._model,
-                        str(adapter_path),
-                        local_files_only=self.config.local_files_only,
-                    )
-                else:
-                    self._model = adapter_loader(self._model, str(adapter_path))
-                self._adapter_active = True
+                try:
+                    if self._adapter_loader is None:
+                        self._model = adapter_loader(
+                            self._model,
+                            str(adapter_path),
+                            local_files_only=self.config.local_files_only,
+                        )
+                    else:
+                        self._model = adapter_loader(self._model, str(adapter_path))
+                    self._adapter_active = True
+                    self._adapter_path_resolved = str(adapter_path)
+                    self._effective_model_type = "peft_adapter"
+                    self._metrics["florence_adapter_load_successes"] += 1
+                    self._metrics["florence_adapter_loaded"] = True
+                except Exception as exc:
+                    self._metrics["florence_adapter_load_error"] = str(exc)
+                    self._metrics["florence_adapter_loaded"] = False
+                    raise
             if hasattr(self._model, "to"):
-                self._model = self._model.to(self._resolved_device)
+                self._model = self._model.to(runtime_device.device)
             if hasattr(self._model, "eval"):
                 self._model.eval()
 
@@ -194,8 +230,11 @@ class FlorenceBackend:
             self._metrics["florence_load_successes"] += 1
             self._metrics["florence_loaded"] = True
             self._metrics["florence_model_id"] = self._model_identifier
+            self._metrics["florence_base_model_path"] = self._sanitize_path(self._model_identifier)
             self._metrics["florence_processor_path"] = self._sanitize_path(self._processor_identifier)
             self._metrics["florence_adapter_active"] = self._adapter_active
+            self._metrics["florence_adapter_loaded"] = self._adapter_active
+            self._metrics["florence_effective_model_type"] = self._effective_model_type
             self._metrics["florence_device"] = self._resolved_device
             self._metrics["florence_dtype"] = self._resolved_dtype
             self._metrics["florence_model_class"] = type(self._model).__name__
@@ -210,17 +249,29 @@ class FlorenceBackend:
             self._update_gpu_metrics(torch)
             self.logger.info("Florence model: %s", self._model_identifier)
             self.logger.info("Florence processor: %s", self._processor_identifier)
-            self.logger.info("Florence adapter configured: %s", bool(self.config.adapter_path))
+            self.logger.info("Florence adapter requested: %s", self._adapter_requested)
+            self.logger.info("Florence adapter configured path: %s", self._sanitize_path(self.config.adapter_path))
+            self.logger.info("Florence adapter resolved path: %s", self._sanitize_path(self._adapter_path_resolved))
             self.logger.info("Florence adapter active for body type: %s", self._adapter_active)
+            self.logger.info("Florence effective model type: %s", self._effective_model_type)
             self.logger.info("Florence model class: %s", self._metrics["florence_model_class"])
             self.logger.info("Florence processor class: %s", self._metrics["florence_processor_class"])
             self.logger.info("Florence device: %s", self._resolved_device)
             self.logger.info("Florence dtype: %s", self._resolved_dtype)
+            self.logger.info("Florence model loaded device=%s dtype=%s", self._resolved_device, self._resolved_dtype)
+            if runtime_device.device.type == "cuda":
+                self.logger.info(
+                    "Florence GPU memory allocated_mib=%.3f reserved_mib=%.3f",
+                    self._metrics["gpu_memory_allocated_mb"] or 0.0,
+                    self._metrics["gpu_memory_reserved_mb"] or 0.0,
+                )
             self.logger.info("Florence loaded once in %.3f seconds", self._metrics["florence_load_duration_ms"] / 1000.0)
         except Exception:
             self._loaded = False
             self._metrics["florence_load_failures"] += 1
             self._metrics["florence_loaded"] = False
+            if self._adapter_requested and self._metrics["florence_adapter_load_error"] is None:
+                self._metrics["florence_adapter_load_error"] = "Adapter load failed before completion."
             raise
 
     def run_task(
@@ -230,6 +281,7 @@ class FlorenceBackend:
         text_input: str | None = None,
         *,
         adapter_active: bool | None = None,
+        generation_overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.config.enabled:
             return {"status": "disabled", "reason": "Florence backend disabled.", "payload": None}
@@ -255,27 +307,68 @@ class FlorenceBackend:
                 raise ValueError("Input image is empty.")
             started_at = time.perf_counter()
             image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-            prompt = task_prompt + text_input if text_input else task_prompt
-            inputs = self._processor(text=prompt, images=image_pil, return_tensors="pt")
-            if hasattr(inputs, "to"):
-                inputs = inputs.to(self._resolved_device)
+            processor_text = self._build_processor_text(task_prompt, text_input)
+            self.logger.debug("Florence task_prompt=%s", task_prompt)
+            self.logger.debug("Florence prompt_text=%s", text_input)
+            self.logger.debug("Florence final_processor_text=%s", processor_text)
+            inputs = self._processor(text=processor_text, images=image_pil, return_tensors="pt")
+            if self._runtime_device is None:
+                raise RuntimeError("Florence runtime device was not resolved.")
+            inputs = move_batch_to_device(
+                dict(inputs),
+                device=self._runtime_device.device,
+                dtype=self._runtime_device.dtype,
+            )
+            input_ids = inputs["input_ids"]
+            pixel_values = inputs["pixel_values"]
+            attention_mask = inputs.get("attention_mask")
+            self.logger.debug("Florence input_ids shape=%s dtype=%s", self._shape_of(input_ids), self._dtype_of(input_ids))
+            self.logger.debug("Florence pixel_values shape=%s dtype=%s", self._shape_of(pixel_values), self._dtype_of(pixel_values))
+            generation = self._resolve_generation_settings(generation_overrides)
             with torch.inference_mode():
-                generated_ids = self._model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=self.config.max_new_tokens,
-                    do_sample=False,
-                    num_beams=self.config.num_beams,
-                    use_cache=self.config.use_cache,
-                )
-            generated_text = self._processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+                if self._runtime_device.device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        generated_ids = self._model.generate(
+                            input_ids=input_ids,
+                            pixel_values=pixel_values,
+                            attention_mask=attention_mask,
+                            max_new_tokens=generation["max_new_tokens"],
+                            do_sample=generation["do_sample"],
+                            num_beams=generation["num_beams"],
+                            use_cache=generation["use_cache"],
+                            early_stopping=generation["early_stopping"],
+                        )
+                else:
+                    generated_ids = self._model.generate(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        attention_mask=attention_mask,
+                        max_new_tokens=generation["max_new_tokens"],
+                        do_sample=generation["do_sample"],
+                        num_beams=generation["num_beams"],
+                        use_cache=generation["use_cache"],
+                        early_stopping=generation["early_stopping"],
+                    )
+            prompt_token_count = self._token_count(input_ids)
+            generated_only_ids = self._slice_generated_only_ids(generated_ids, prompt_token_count)
+            decoded_full = self._processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+            decoded_full_skip_special = self._processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            decoded_generated_only = self._decode_generated_only(generated_only_ids, skip_special_tokens=False)
+            decoded_generated_only_skip_special = self._decode_generated_only(generated_only_ids, skip_special_tokens=True)
+            generated_text = decoded_generated_only or decoded_full
+            self.logger.debug("Florence generated token IDs=%s", self._serialize_generated_ids(generated_ids))
+            self.logger.debug("Florence decoded raw text full=%s", decoded_full)
+            self.logger.debug("Florence decoded raw text full_skip_special=%s", decoded_full_skip_special)
+            self.logger.debug("Florence decoded raw text generated_only=%s", decoded_generated_only)
+            self.logger.debug("Florence decoded raw text generated_only_skip_special=%s", decoded_generated_only_skip_special)
             parsed_answer = None
-            if str(task_prompt).startswith("<"):
+            if str(task_prompt).startswith("<") and hasattr(self._processor, "post_process_generation"):
                 parsed_answer = self._processor.post_process_generation(
                     generated_text,
                     task=task_prompt,
                     image_size=(image_pil.width, image_pil.height),
                 )
+                self.logger.debug("Florence post_processed output=%s", parsed_answer)
             inference_duration_ms = float((time.perf_counter() - started_at) * 1000.0)
             self._update_gpu_metrics(torch)
             return {
@@ -284,8 +377,16 @@ class FlorenceBackend:
                 "payload": {
                     "task_prompt": task_prompt,
                     "prompt_text": text_input,
+                    "final_processor_text": processor_text,
+                    "input_ids_shape": self._shape_of(input_ids),
+                    "pixel_values_shape": self._shape_of(pixel_values),
                     "generated_ids": self._serialize_generated_ids(generated_ids),
+                    "generated_only_ids": self._serialize_generated_ids(generated_only_ids),
                     "generated_text": generated_text,
+                    "decoded_full_text": decoded_full,
+                    "decoded_full_text_skip_special": decoded_full_skip_special,
+                    "decoded_generated_only_text": decoded_generated_only,
+                    "decoded_generated_only_text_skip_special": decoded_generated_only_skip_special,
                     "parsed_answer": parsed_answer,
                     "adapter_active": self._adapter_active,
                     "model_identifier": self._model_identifier,
@@ -293,6 +394,7 @@ class FlorenceBackend:
                     "device": self._resolved_device,
                     "dtype": self._resolved_dtype,
                     "inference_duration_ms": inference_duration_ms,
+                    "generation_settings": generation,
                 },
             }
         except Exception as exc:
@@ -358,35 +460,6 @@ class FlorenceBackend:
             "error_msgs": list(payload.get("error_msgs", [])),
         }
 
-    def _select_device(self, torch_module: Any) -> str:
-        requested = str(self.config.device or "auto").strip().lower()
-        if requested == "auto":
-            return "cuda" if torch_module.cuda.is_available() else "cpu"
-        if requested == "cuda" and not torch_module.cuda.is_available():
-            raise RuntimeError("CUDA requested for Florence, but CUDA is unavailable.")
-        if requested not in {"cpu", "cuda"}:
-            raise RuntimeError(f"Unsupported Florence device value: {self.config.device}")
-        return requested
-
-    def _select_torch_dtype(self, torch_module: Any, device: str) -> Any:
-        normalized = str(self.config.dtype or "auto").strip().lower()
-        if normalized == "auto":
-            return torch_module.float16 if device == "cuda" else torch_module.float32
-        mapping = {
-            "float16": torch_module.float16,
-            "fp16": torch_module.float16,
-            "float32": torch_module.float32,
-            "fp32": torch_module.float32,
-            "bfloat16": torch_module.bfloat16,
-            "bf16": torch_module.bfloat16,
-        }
-        return mapping.get(normalized, torch_module.float32)
-
-    @staticmethod
-    def _dtype_name(value: Any) -> str:
-        raw = str(value)
-        return raw.split(".")[-1] if "." in raw else raw
-
     @staticmethod
     def _sanitize_path(raw_value: str) -> str | None:
         if raw_value in ("", None):
@@ -395,7 +468,7 @@ class FlorenceBackend:
         return path.name if path.is_absolute() else str(path).replace("\\", "/")
 
     def _update_gpu_metrics(self, torch_module: Any) -> None:
-        if torch_module.cuda.is_available():
+        if self._runtime_device is not None and self._runtime_device.device.type == "cuda" and torch_module.cuda.is_available():
             self._metrics["gpu_memory_allocated_mb"] = round(float(torch_module.cuda.memory_allocated() / (1024 * 1024)), 3)
             self._metrics["gpu_memory_reserved_mb"] = round(float(torch_module.cuda.memory_reserved() / (1024 * 1024)), 3)
 
@@ -407,3 +480,70 @@ class FlorenceBackend:
         if hasattr(first, "tolist"):
             return list(first.tolist())
         return list(first)
+
+    @staticmethod
+    def _shape_of(value: Any) -> list[int] | None:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            return None
+        return [int(item) for item in shape]
+
+    @staticmethod
+    def _dtype_of(value: Any) -> str | None:
+        dtype = getattr(value, "dtype", None)
+        return None if dtype is None else str(dtype)
+
+    @staticmethod
+    def _token_count(input_ids: Any) -> int:
+        shape = getattr(input_ids, "shape", None)
+        if shape is not None and len(shape) >= 2:
+            return int(shape[1])
+        first = input_ids[0] if hasattr(input_ids, "__getitem__") else []
+        return len(first)
+
+    @staticmethod
+    def _slice_generated_only_ids(generated_ids: Any, prompt_token_count: int) -> Any:
+        if generated_ids is None:
+            return generated_ids
+        try:
+            return generated_ids[:, prompt_token_count:]
+        except Exception:
+            first = generated_ids[0] if len(generated_ids) > 0 else []
+            if hasattr(first, "__getitem__"):
+                return [first[prompt_token_count:]]
+            return generated_ids
+
+    def _decode_generated_only(self, generated_only_ids: Any, *, skip_special_tokens: bool) -> str:
+        try:
+            decoded = self._processor.batch_decode(generated_only_ids, skip_special_tokens=skip_special_tokens)
+        except Exception:
+            return ""
+        if not decoded:
+            return ""
+        return str(decoded[0])
+
+    @staticmethod
+    def _build_processor_text(task_prompt: str, text_input: str | None) -> str:
+        if task_prompt and text_input:
+            return f"{task_prompt}{text_input}"
+        if task_prompt:
+            return str(task_prompt)
+        if text_input:
+            return str(text_input)
+        return ""
+
+    def _resolve_generation_settings(self, generation_overrides: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(generation_overrides or {})
+        num_beams = int(payload.get("num_beams", self.config.num_beams))
+        do_sample = bool(payload.get("do_sample", False))
+        early_stopping_default = bool(num_beams > 1)
+        early_stopping = bool(payload.get("early_stopping", early_stopping_default))
+        if num_beams <= 1:
+            early_stopping = False
+        return {
+            "max_new_tokens": int(payload.get("max_new_tokens", self.config.max_new_tokens)),
+            "num_beams": num_beams,
+            "do_sample": do_sample,
+            "use_cache": bool(payload.get("use_cache", self.config.use_cache)),
+            "early_stopping": early_stopping,
+        }

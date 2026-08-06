@@ -1,0 +1,158 @@
+{
+  "prompt_a": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  },
+  "prompt_b": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  },
+  "prompt_c": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  },
+  "prompt_d": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  },
+  "prompt_e": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  },
+  "prompt_f": {
+    "total_images": 1,
+    "successful_inferences": 1,
+    "valid_colour_labels": 1,
+    "unknown_labels": 0,
+    "generic_responses": 0,
+    "ambiguous_responses": 0,
+    "failed_inferences": 0,
+    "valid_label_rate": 1.0,
+    "unknown_rate": 0.0,
+    "generic_response_rate": 0.0,
+    "average_inference_duration_ms": 12.5,
+    "raw_response_frequency": {
+      "white": 1
+    },
+    "label_counts": {
+      "WHITE": 1
+    },
+    "unknown_reason_counts": {},
+    "same_track_consistency": {
+      "matching_valid_predictions": 0,
+      "conflicting_valid_predictions": 0,
+      "one_valid_one_invalid": 0,
+      "all_invalid": 0
+    }
+  }
+}

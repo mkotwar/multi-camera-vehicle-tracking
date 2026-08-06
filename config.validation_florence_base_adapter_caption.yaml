@@ -1,0 +1,110 @@
+project:
+  name: multicamera_vehicle_tracking
+  environment: validation
+  log_level: INFO
+vehicle_enrichment:
+  enabled: true
+  trigger: track_completed
+  fail_open: true
+  best_crops_per_track: 3
+  write_separate_output: true
+  extend_tracks_json: true
+  image_size_policy:
+    ingestion:
+      preserve_source_resolution: true
+    detection:
+      inference_size: 1024
+      preserve_aspect_ratio: true
+      resize_mode: letterbox
+    evidence_crop:
+      preserve_original_crop: true
+      context_padding_ratio: 0.08
+      clamp_to_frame: true
+      store_original_dimensions: true
+    florence:
+      minimum_original_width: 256
+      minimum_original_height: 192
+      preferred_original_width: 320
+      preferred_original_height: 240
+      eligibility_dimensions_source: original_crop
+      preserve_aspect_ratio: true
+      pad_to_square: true
+      square_padding_value: 114
+      reject_upscaled_eligibility: true
+  track_evidence:
+    enabled: true
+    maximum_candidates_per_track: 12
+    final_crops_per_attribute: 3
+    minimum_frame_gap: 3
+    preferred_frame_gap: 8
+    deduplicate_similar_crops: true
+    classify_at_track_completion: true
+    early_classification:
+      enabled: false
+      require_preferred_resolution: true
+      minimum_quality_score: 0.8
+  shared_florence:
+    enabled: true
+    backend: florence2
+    base_model_id: D:/project/models/Florence-2-base-ft
+    processor_path: D:/project/models/Florence-2-base-ft
+    adapter_path: D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT
+    adapter_enabled: true
+    device: auto
+    dtype: auto
+    trust_remote_code: true
+    attention_implementation: eager
+    max_new_tokens: 64
+    num_beams: 1
+    use_cache: false
+    local_files_only: true
+    lazy_load: true
+  body_type:
+    enabled: true
+    backend: florence2
+    run_only_when_vehicle_class:
+    - CAR
+    maximum_crops_per_track: 3
+    minimum_crop_width: 256
+    minimum_crop_height: 192
+    allowed_labels:
+    - SUV
+    - SEDAN
+    - HATCHBACK
+    - MPV
+    - VAN
+    - PICKUP
+    - OTHER
+    - UNKNOWN
+  colour:
+    enabled: true
+    backend: florence2
+    prompt_variant: prompt_c
+    retry_on_invalid_response: false
+    maximum_prompt_attempts: 1
+    run_only_when_vehicle_class:
+    - 3WHEELER
+    - BUS
+    - CAR
+    - MOTORCYCLE
+    - TRUCK
+    maximum_crops_per_track: 3
+    minimum_crop_width: 256
+    minimum_crop_height: 192
+    allowed_labels:
+    - BLACK
+    - WHITE
+    - GREY
+    - SILVER
+    - RED
+    - BLUE
+    - GREEN
+    - YELLOW
+    - ORANGE
+    - BROWN
+    - BEIGE
+    - PURPLE
+    - OTHER
+    - UNKNOWN
+benchmark:
+  prompt_mode: caption

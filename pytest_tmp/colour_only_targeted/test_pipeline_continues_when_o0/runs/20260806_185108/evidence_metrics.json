@@ -1,0 +1,55 @@
+{
+  "tracks_received": 1,
+  "tracks_with_evidence": 1,
+  "tracks_without_valid_evidence": 0,
+  "candidate_observations": 3,
+  "candidate_crops_seen": 3,
+  "candidate_crops_retained": 3,
+  "candidate_crops_rejected": 0,
+  "candidate_crops_replaced": 0,
+  "candidate_crops_deduplicated": 0,
+  "candidate_pool_peak_per_track": 3,
+  "candidate_pool_average_per_track": 2.5,
+  "tracks_with_candidate_evidence": 1,
+  "tracks_without_candidate_evidence": 0,
+  "invalid_candidates": 0,
+  "selected_evidence_records": 7,
+  "unique_crop_files": 3,
+  "unique_annotated_frame_files": 3,
+  "role_counts": {
+    "FIRST": 1,
+    "MIDDLE": 1,
+    "LAST": 1,
+    "HIGHEST_CONFIDENCE": 1,
+    "LARGEST": 1,
+    "SHARPEST": 1,
+    "BEST_OVERALL": 1
+  },
+  "tracks_by_camera": {
+    "CAM_001": 1
+  },
+  "saved_files_by_camera": {
+    "CAM_001": 6
+  },
+  "cache_peak_frames": 3,
+  "cache_frames_released": 3,
+  "cache_release_attempts": 3,
+  "cache_release_deferred": 0,
+  "missing_cache_frame_count": 0,
+  "evidence_items_skipped_missing_frame": 0,
+  "tracks_with_partial_evidence": 0,
+  "pending_evidence_tracks_at_shutdown": 0,
+  "pending_frame_reference_count": 0,
+  "duplicate_frame_candidates_skipped": 0,
+  "source_frame_resolution_counts": {
+    "32x24": 3
+  },
+  "evidence_crop_count": 7,
+  "evidence_crop_width_min": 12,
+  "evidence_crop_width_max": 12,
+  "evidence_crop_width_average": 12.0,
+  "evidence_crop_height_min": 14,
+  "evidence_crop_height_max": 14,
+  "evidence_crop_height_average": 14.0,
+  "errors": []
+}

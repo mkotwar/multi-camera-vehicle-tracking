@@ -142,6 +142,126 @@ class RunOutputManager:
         path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         return path
 
+    def save_vehicle_enrichment_validation_report(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "vehicle_enrichment_validation_report.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "vehicle_class",
+            "crop_path",
+            "candidate_crop_count",
+            "eligible_crop_count",
+            "preferred_crop_count",
+            "selected_body_type_crop_paths",
+            "selected_colour_crop_paths",
+            "classification_trigger",
+            "source_frame_width",
+            "source_frame_height",
+            "original_bbox",
+            "expanded_crop_bbox",
+            "context_padding_ratio",
+            "original_crop_width",
+            "original_crop_height",
+            "resolution_tier",
+            "sharpness",
+            "brightness",
+            "edge_truncated",
+            "quality_score",
+            "square_padding_applied",
+            "padded_width",
+            "padded_height",
+            "florence_input_width",
+            "florence_input_height",
+            "predicted_body_type",
+            "body_type_raw_response",
+            "body_type_reason",
+            "predicted_colour",
+            "colour_raw_response",
+            "colour_reason",
+            "final_body_type",
+            "final_colour",
+            "final_reason",
+            "manual_body_type",
+            "manual_colour",
+            "body_type_correct",
+            "colour_correct",
+            "review_notes",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        return path
+
+    def save_vehicle_enrichment_crop_diagnostics(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "vehicle_enrichment_crop_diagnostics.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "evidence_role",
+            "frame_index",
+            "timestamp",
+            "candidate_rank",
+            "candidate_retained",
+            "candidate_rejection_reason",
+            "frame_gap_from_previous_selected",
+            "duplicate_score",
+            "crop_path",
+            "source_frame_width",
+            "source_frame_height",
+            "original_crop_width",
+            "original_crop_height",
+            "resolution_tier",
+            "sharpness",
+            "brightness",
+            "quality_score",
+            "eligible_for_body_type",
+            "eligible_for_colour",
+            "body_type_skip_reason",
+            "colour_skip_reason",
+            "selected_for_body_type",
+            "selected_for_colour",
+            "body_type_crop_result",
+            "colour_crop_result",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        return path
+
+    def save_vehicle_enrichment_track_evidence_summary(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "vehicle_enrichment_track_evidence_summary.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "vehicle_class",
+            "track_start_frame",
+            "track_end_frame",
+            "track_duration_frames",
+            "candidate_crops_seen",
+            "candidate_crops_retained",
+            "acceptable_crops",
+            "preferred_crops",
+            "selected_body_type_crops",
+            "selected_colour_crops",
+            "largest_original_crop_width",
+            "largest_original_crop_height",
+            "best_quality_score",
+            "body_type_status",
+            "body_type_label",
+            "colour_status",
+            "colour_label",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        return path
+
     def evidence_track_directory(self, camera_id: str, safe_local_track_id: str) -> Path:
         path = self.evidence_directory / camera_id / safe_local_track_id
         path.mkdir(parents=True, exist_ok=True)

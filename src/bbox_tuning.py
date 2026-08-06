@@ -110,7 +110,8 @@ def run_bbox_tuning(config_path: str | Path) -> dict[str, Any]:
         "default": dict(PERMISSIVE_PROFILE),
         "classes": {},
     }
-    minimum_requested_frames = max(int(validated_config["input"]["max_frames_per_camera"]), 600)
+    configured_frame_limit = validated_config["input"]["max_frames_per_camera"]
+    minimum_requested_frames = max(600, int(configured_frame_limit)) if configured_frame_limit is not None else 600
 
     logger.info("BBox tuning started run_id=%s frame_target=%s", output_manager.run_id, minimum_requested_frames)
     detector = VehicleDetectorTracker(experiment_config, logger)
@@ -597,6 +598,8 @@ def _synthetic_packet(row: dict[str, Any], source_fps: float) -> FramePacket:
         timestamp_seconds=float(row["timestamp_seconds"]),
         source_fps=float(source_fps),
         frame=frame,
+        source_frame_width=int(row["frame_width"]),
+        source_frame_height=int(row["frame_height"]),
         worker_id=0,
         captured_at="",
         source_type="video",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import queue
 import traceback
 from dataclasses import asdict
 from datetime import datetime, timezone
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -189,9 +191,18 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     if enabled_count < 1:
         raise ConfigurationError("At least one enabled camera is required.")
 
-    max_frames_per_camera = int(input_section.get("max_frames_per_camera", 0))
-    if max_frames_per_camera <= 0:
-        raise ConfigurationError("input.max_frames_per_camera must be a positive integer.")
+    _missing = object()
+    raw_max_frames_per_camera = input_section.get("max_frames_per_camera", _missing)
+    if raw_max_frames_per_camera is None:
+        max_frames_per_camera = None
+    else:
+        default_value = 0 if raw_max_frames_per_camera is _missing else raw_max_frames_per_camera
+        try:
+            max_frames_per_camera = int(default_value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError("input.max_frames_per_camera must be an integer or null.") from exc
+        if max_frames_per_camera <= 0:
+            raise ConfigurationError("input.max_frames_per_camera must be a positive integer or null.")
 
     worker_count = int(ingestion.get("worker_count", 7))
     target_read_fps = ingestion.get("target_read_fps", 10.0)
@@ -302,6 +313,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "backend": detection_backend,
             "model_path": str(resolved_model_path),
             "device": str(detection.get("device", "auto")),
+            "dtype": str(detection.get("dtype", "auto")),
             "confidence_threshold": float(detection.get("confidence_threshold", 0.2 if detection_backend == "ocr_mukul" else 0.38)),
             "iou_threshold": float(detection.get("iou_threshold", 0.45)),
             "image_size": int(detection.get("image_size", 1024 if detection_backend == "ocr_mukul" else 640)),
@@ -451,11 +463,31 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         if deferred_setup_error is not None:
             raise deferred_setup_error
         validated_config = _validate_config(raw_config or _load_raw_config(config_file), config_file)
+        for camera in validated_config["input"]["cameras"]:
+            if camera["enabled"]:
+                logger.info(
+                    "Resolved input source camera_id=%s source_type=%s source=%s",
+                    camera["camera_id"],
+                    camera["source_type"],
+                    camera["source"],
+                )
         metadata.project_name = validated_config["project"]["name"]
         metadata.camera_count = len([camera for camera in validated_config["input"]["cameras"] if camera["enabled"]])
         if bool(validated_config["output"]["save_run_config"]):
             output_manager.save_effective_config(validated_config)
         logger.info("Config loaded")
+        frame_limit = validated_config["input"]["max_frames_per_camera"]
+        logger.info(
+            "Frame limit per camera: %s",
+            "unlimited" if frame_limit is None else frame_limit,
+        )
+        logger.info(
+            "Vehicle enrichment startup: colour_enabled=%s body_type_enabled=%s adapter_enabled=%s plate_ocr_enabled=%s",
+            bool(validated_config["vehicle_enrichment"].get("vehicle_attributes", {}).get("colour", {}).get("enabled", False)),
+            bool(validated_config["vehicle_enrichment"].get("vehicle_attributes", {}).get("body_type", {}).get("enabled", True)),
+            bool(validated_config["vehicle_enrichment"].get("shared_florence", {}).get("adapter_enabled", False)),
+            bool(validated_config["vehicle_enrichment"].get("plate", {}).get("ocr", {}).get("enabled", False)),
+        )
         metadata.status = RUN_STATUS_RUNNING
         output_manager.save_metadata(metadata)
 
@@ -463,35 +495,27 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         detector_tracker = VehicleDetectorTracker(validated_config, logger)
         device_info = detector_tracker.runtime_device_info
         metadata.configured_device = device_info.configured_device
+        metadata.configured_dtype = device_info.configured_dtype
         metadata.resolved_device = device_info.resolved_device
+        metadata.resolved_dtype = device_info.resolved_dtype
         metadata.cuda_available = device_info.cuda_available
         metadata.cuda_device_count = device_info.cuda_device_count
         metadata.cuda_device_name = device_info.cuda_device_name
         metadata.torch_version = device_info.torch_version
         metadata.torch_cuda_version = device_info.torch_cuda_version
         output_manager.save_metadata(metadata)
-        if device_info.resolved_device.startswith("cuda:"):
-            selected_cuda_index = int(device_info.resolved_device.split(":", 1)[1])
-            logger.info(
-                'Runtime device: configured=%s resolved=%s gpu="%s" cuda_available=%s cuda_device_count=%s selected_cuda_index=%s torch_version=%s torch_cuda_version=%s',
-                device_info.configured_device,
-                device_info.resolved_device,
-                device_info.cuda_device_name,
-                device_info.cuda_available,
-                device_info.cuda_device_count,
-                selected_cuda_index,
-                device_info.torch_version,
-                device_info.torch_cuda_version,
-            )
-        else:
-            logger.info(
-                "Runtime device: configured=%s resolved=%s cuda_available=%s reason=CUDA is not available through the installed PyTorch build torch_version=%s torch_cuda_version=%s",
-                device_info.configured_device,
-                device_info.resolved_device,
-                device_info.cuda_available,
-                device_info.torch_version,
-                device_info.torch_cuda_version,
-            )
+        logger.info(
+            "Runtime device: configured_device=%s configured_dtype=%s resolved_device=%s resolved_dtype=%s cuda_available=%s cuda_device_name=%s torch_version=%s torch_cuda_version=%s reason=%s",
+            device_info.configured_device,
+            device_info.configured_dtype,
+            device_info.resolved_device,
+            device_info.resolved_dtype,
+            device_info.cuda_available,
+            device_info.cuda_device_name,
+            device_info.torch_version,
+            device_info.torch_cuda_version,
+            device_info.reason,
+        )
         track_manager = TrackManager(validated_config, logger)
         evidence_collector = EvidenceCollector(validated_config, logger, output_manager)
         vehicle_enrichment_manager = VehicleEnrichmentManager(validated_config, logger, output_manager)
@@ -609,7 +633,9 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "tracking_backend": validated_config["tracking"]["backend"],
             "model_path": validated_config["detection"]["model_path"],
             "configured_device": device_info.configured_device,
+            "configured_dtype": device_info.configured_dtype,
             "resolved_device": device_info.resolved_device,
+            "resolved_dtype": device_info.resolved_dtype,
             "cuda_available": device_info.cuda_available,
             "cuda_device_count": device_info.cuda_device_count,
             "cuda_device_name": device_info.cuda_device_name,
@@ -647,6 +673,13 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         output_tracks = track_manager.get_all_output_tracks()
         output_observations = track_manager.get_all_observations()
         evidence_index_records = evidence_collector.evidence_index
+        evidence_metrics = evidence_collector.metrics
+        if evidence_metrics.get("pending_evidence_tracks_at_shutdown", 0) != 0 or evidence_metrics.get("pending_frame_reference_count", 0) != 0:
+            logger.error(
+                "EvidenceCollector shutdown state pending_tracks=%s pending_frame_references=%s",
+                evidence_metrics.get("pending_evidence_tracks_at_shutdown", 0),
+                evidence_metrics.get("pending_frame_reference_count", 0),
+            )
         evidence_summary_by_track = _build_evidence_summary_by_track(evidence_index_records)
         enrichment_by_track = {item.local_track_id: item.to_dict() for item in enrichment_results}
         tracks_path = output_manager.save_tracks(
@@ -662,9 +695,70 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         observations_path = output_manager.save_observations([_serialize_observation(item) for item in output_observations])
         lifecycle_metrics_path = output_manager.save_track_lifecycle_metrics(lifecycle_metrics)
         evidence_index_path = output_manager.save_evidence_index(evidence_index_records)
-        evidence_metrics_path = output_manager.save_evidence_metrics(evidence_collector.metrics)
+        evidence_metrics_path = output_manager.save_evidence_metrics(evidence_metrics)
         vehicle_enrichment_path = output_manager.save_vehicle_enrichment([item.to_dict() for item in enrichment_results])
         vehicle_enrichment_metrics_path = output_manager.save_vehicle_enrichment_metrics(vehicle_enrichment_manager.metrics)
+        vehicle_enrichment_validation_report_path = output_manager.save_vehicle_enrichment_validation_report(
+            _build_vehicle_enrichment_validation_rows(enrichment_results)
+        )
+        vehicle_enrichment_crop_diagnostics_path = output_manager.save_vehicle_enrichment_crop_diagnostics(
+            _build_vehicle_enrichment_crop_diagnostics_rows(enrichment_results)
+        )
+        vehicle_enrichment_track_evidence_summary_path = output_manager.save_vehicle_enrichment_track_evidence_summary(
+            _build_vehicle_enrichment_track_evidence_summary_rows(enrichment_results, track_manager.get_all_output_tracks())
+        )
+        ocr_mukul_result_rows = _build_ocr_mukul_result_rows(enrichment_results)
+        if ocr_mukul_result_rows:
+            with (output_manager.run_directory / "ocr_mukul_florence_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(ocr_mukul_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(ocr_mukul_result_rows)
+            (output_manager.run_directory / "ocr_mukul_florence_results.json").write_text(
+                json.dumps(ocr_mukul_result_rows, indent=2),
+                encoding="utf-8",
+            )
+        if validated_config["vehicle_enrichment"].get("florence_mode") == "comparison":
+            _write_current_vs_ocr_mukul_artifacts(output_manager.run_directory, enrichment_results)
+        vehicle_attribute_result_rows = _build_vehicle_attribute_result_rows(enrichment_results)
+        if vehicle_attribute_result_rows:
+            with (output_manager.run_directory / "vehicle_attribute_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_attribute_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_attribute_result_rows)
+            (output_manager.run_directory / "vehicle_attribute_results.json").write_text(
+                json.dumps(vehicle_attribute_result_rows, indent=2),
+                encoding="utf-8",
+            )
+        vehicle_colour_result_rows = _build_vehicle_colour_result_rows(enrichment_results)
+        if vehicle_colour_result_rows:
+            with (output_manager.run_directory / "vehicle_colour_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_colour_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_colour_result_rows)
+            (output_manager.run_directory / "vehicle_colour_results.json").write_text(
+                json.dumps(vehicle_colour_result_rows, indent=2),
+                encoding="utf-8",
+            )
+        vehicle_colour_track_summary_rows = _build_vehicle_colour_track_summary_rows(enrichment_results)
+        if vehicle_colour_track_summary_rows:
+            with (output_manager.run_directory / "vehicle_colour_track_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_colour_track_summary_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_colour_track_summary_rows)
+            (output_manager.run_directory / "vehicle_colour_track_summary.json").write_text(
+                json.dumps(vehicle_colour_track_summary_rows, indent=2),
+                encoding="utf-8",
+            )
+        plate_ocr_result_rows = _build_plate_ocr_result_rows(enrichment_results)
+        if plate_ocr_result_rows:
+            with (output_manager.run_directory / "plate_ocr_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(plate_ocr_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(plate_ocr_result_rows)
+            (output_manager.run_directory / "plate_ocr_results.json").write_text(
+                json.dumps(plate_ocr_result_rows, indent=2),
+                encoding="utf-8",
+            )
         output_manager.save_bbox_quality_metrics(
             {
                 "raw_detections": raw_detections,
@@ -684,7 +778,9 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "detection_backend": validated_config["detection"]["backend"],
                 "tracking_backend": validated_config["tracking"]["backend"],
                 "configured_device": device_info.configured_device,
+                "configured_dtype": device_info.configured_dtype,
                 "resolved_device": device_info.resolved_device,
+                "resolved_dtype": device_info.resolved_dtype,
                 "cuda_available": device_info.cuda_available,
                 "cuda_device_count": device_info.cuda_device_count,
                 "cuda_device_name": device_info.cuda_device_name,
@@ -692,6 +788,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "torch_cuda_version": device_info.torch_cuda_version,
                 "configured_camera_count": metrics["configured_camera_count"],
                 "enabled_camera_count": metrics["enabled_camera_count"],
+                "max_frames_per_camera": validated_config["input"]["max_frames_per_camera"],
+                "frame_limit_mode": "unlimited" if validated_config["input"]["max_frames_per_camera"] is None else "limited",
                 "worker_count": metrics["worker_count"],
                 "processed_frames": metadata.processed_frames,
                 "frames_by_camera": metrics["frames_by_camera"],
@@ -713,7 +811,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             }
         )
         logger.info(
-            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s",
+            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
             tracks_path,
             observations_path,
             lifecycle_metrics_path,
@@ -721,6 +819,9 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             evidence_metrics_path,
             vehicle_enrichment_path,
             vehicle_enrichment_metrics_path,
+            vehicle_enrichment_validation_report_path,
+            vehicle_enrichment_crop_diagnostics_path,
+            vehicle_enrichment_track_evidence_summary_path,
         )
         detector_tracker.reset_all()
         logger.info("Pipeline completed")
@@ -843,3 +944,390 @@ def _build_evidence_summary_by_track(evidence_index_records: list[dict[str, Any]
     for summary in summary_by_track.values():
         summary["evidence_roles"] = sorted(set(summary["evidence_roles"]))
     return summary_by_track
+
+
+def _build_vehicle_enrichment_validation_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        body_predictions = list(getattr(result.vehicle_body_type, "predictions", []) or [])
+        colour_predictions = list(getattr(result.vehicle_colour, "predictions", []) or [])
+        crop_paths = sorted(
+            {
+                str(item)
+                for item in [
+                    *[prediction.source_crop_path for prediction in body_predictions if prediction.source_crop_path],
+                    *[prediction.source_crop_path for prediction in colour_predictions if prediction.source_crop_path],
+                ]
+                if item
+            }
+        )
+        body_raw = [str(prediction.raw_response) for prediction in body_predictions if prediction.raw_response not in (None, "")]
+        colour_raw = [str(prediction.raw_response) for prediction in colour_predictions if prediction.raw_response not in (None, "")]
+        evidence_item = (list(getattr(result, "evidence_used", []) or []) or [None])[0]
+        body_prediction = body_predictions[0] if body_predictions else None
+        colour_prediction = colour_predictions[0] if colour_predictions else None
+        rows.append(
+            {
+                "camera_id": result.camera_id,
+                "local_track_id": result.local_track_id,
+                "vehicle_class": result.vehicle_class,
+                "crop_path": " | ".join(crop_paths),
+                "candidate_crop_count": getattr(result, "candidate_crop_count", 0),
+                "eligible_crop_count": getattr(result, "eligible_crop_count", 0),
+                "preferred_crop_count": getattr(result, "preferred_crop_count", 0),
+                "selected_body_type_crop_paths": " | ".join(getattr(result, "selected_body_type_crop_paths", []) or []),
+                "selected_colour_crop_paths": " | ".join(getattr(result, "selected_colour_crop_paths", []) or []),
+                "florence_mode": getattr(result, "florence_mode", None),
+                "adapter_loaded": getattr(result, "adapter_loaded", None),
+                "selected_crop_paths": " | ".join(getattr(result, "selected_crop_paths", []) or []),
+                "caption_inference_count": getattr(result, "caption_inference_count", 0),
+                "classification_trigger": getattr(result, "classification_trigger", None),
+                "source_frame_width": getattr(evidence_item, "source_frame_width", None),
+                "source_frame_height": getattr(evidence_item, "source_frame_height", None),
+                "original_bbox": list(getattr(evidence_item, "original_bbox_xyxy", []) or []),
+                "expanded_crop_bbox": list(getattr(evidence_item, "expanded_crop_bbox_xyxy", []) or []),
+                "context_padding_ratio": getattr(evidence_item, "context_padding_ratio", None),
+                "original_crop_width": getattr(evidence_item, "original_crop_width", None),
+                "original_crop_height": getattr(evidence_item, "original_crop_height", None),
+                "resolution_tier": getattr(evidence_item, "resolution_tier", None),
+                "sharpness": getattr(evidence_item, "sharpness_score", None),
+                "brightness": getattr(evidence_item, "brightness_score", None),
+                "edge_truncated": getattr(evidence_item, "edge_truncated", None),
+                "quality_score": getattr(evidence_item, "quality_score", None),
+                "square_padding_applied": getattr(body_prediction or colour_prediction, "square_padding_applied", None),
+                "padded_width": getattr(body_prediction or colour_prediction, "padded_width", None),
+                "padded_height": getattr(body_prediction or colour_prediction, "padded_height", None),
+                "florence_input_width": getattr(body_prediction or colour_prediction, "florence_input_width", None),
+                "florence_input_height": getattr(body_prediction or colour_prediction, "florence_input_height", None),
+                "predicted_body_type": result.vehicle_body_type.label,
+                "body_type_raw_response": " | ".join(body_raw),
+                "body_type_reason": result.vehicle_body_type.aggregation_reason or result.vehicle_body_type.reason,
+                "final_body_type_reason": getattr(result, "final_body_type_reason", None),
+                "predicted_colour": result.vehicle_colour.label,
+                "colour_raw_response": " | ".join(colour_raw),
+                "colour_reason": result.vehicle_colour.aggregation_reason or result.vehicle_colour.reason,
+                "final_colour_reason": getattr(result, "final_colour_reason", None),
+                "final_body_type": result.vehicle_body_type.label,
+                "final_colour": result.vehicle_colour.label,
+                "final_reason": getattr(result, "final_reason", None),
+                "manual_body_type": "",
+                "manual_colour": "",
+                "body_type_correct": "",
+                "colour_correct": "",
+                "review_notes": "",
+            }
+        )
+    return rows
+
+
+def _build_vehicle_enrichment_crop_diagnostics_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        for item in list(getattr(result, "evidence_used", []) or []):
+            rows.append(
+                {
+                    "camera_id": result.camera_id,
+                    "local_track_id": result.local_track_id,
+                    "evidence_role": getattr(item, "evidence_role", None),
+                    "frame_index": getattr(item, "frame_number", None),
+                    "timestamp": getattr(item, "timestamp_seconds", None),
+                    "candidate_rank": getattr(item, "candidate_rank", None),
+                    "candidate_retained": getattr(item, "candidate_retained", None),
+                    "candidate_rejection_reason": getattr(item, "candidate_rejection_reason", None),
+                    "frame_gap_from_previous_selected": getattr(item, "frame_gap_from_previous_selected", None),
+                    "duplicate_score": getattr(item, "duplicate_score", None),
+                    "crop_path": getattr(item, "vehicle_crop_path", None),
+                    "source_frame_width": getattr(item, "source_frame_width", None),
+                    "source_frame_height": getattr(item, "source_frame_height", None),
+                    "original_crop_width": getattr(item, "original_crop_width", None),
+                    "original_crop_height": getattr(item, "original_crop_height", None),
+                    "resolution_tier": getattr(item, "resolution_tier", None),
+                    "sharpness": getattr(item, "sharpness_score", None),
+                    "brightness": getattr(item, "brightness_score", None),
+                    "quality_score": getattr(item, "quality_score", None),
+                    "eligible_for_body_type": getattr(item, "florence_eligible_for_body_type", None),
+                    "eligible_for_colour": getattr(item, "florence_eligible_for_colour", None),
+                    "body_type_skip_reason": getattr(item, "florence_body_type_skip_reason", None),
+                    "colour_skip_reason": getattr(item, "florence_colour_skip_reason", None),
+                    "selected_for_body_type": getattr(item, "selected_for_body_type", None),
+                    "selected_for_colour": getattr(item, "selected_for_colour", None),
+                    "body_type_crop_result": getattr(item, "body_type_crop_result", None),
+                    "colour_crop_result": getattr(item, "colour_crop_result", None),
+                    "florence_mode": getattr(result, "florence_mode", None),
+                }
+            )
+    return rows
+
+
+def _build_vehicle_enrichment_track_evidence_summary_rows(enrichment_results: list[Any], tracks: list[Any]) -> list[dict[str, Any]]:
+    results_by_track = {str(result.local_track_id): result for result in enrichment_results}
+    rows: list[dict[str, Any]] = []
+    for track in tracks:
+        result = results_by_track.get(str(track.local_track_id))
+        if result is None:
+            continue
+        evidence_items = list(getattr(result, "evidence_used", []) or [])
+        rows.append(
+            {
+                "camera_id": result.camera_id,
+                "local_track_id": result.local_track_id,
+                "vehicle_class": result.vehicle_class,
+                "track_start_frame": int(track.first_frame),
+                "track_end_frame": int(track.last_frame),
+                "track_duration_frames": int(max(0, track.last_frame - track.first_frame + 1)),
+                "candidate_crops_seen": int(getattr(result, "candidate_crop_count", 0)),
+                "candidate_crops_retained": int(len(evidence_items)),
+                "acceptable_crops": int(len([item for item in evidence_items if getattr(item, "resolution_tier", "") == "acceptable"])),
+                "preferred_crops": int(len([item for item in evidence_items if getattr(item, "resolution_tier", "") == "preferred"])),
+                "selected_body_type_crops": " | ".join(getattr(result, "selected_body_type_crop_paths", []) or []),
+                "selected_colour_crops": " | ".join(getattr(result, "selected_colour_crop_paths", []) or []),
+                "selected_crop_paths": " | ".join(getattr(result, "selected_crop_paths", []) or []),
+                "caption_inference_count": int(getattr(result, "caption_inference_count", 0)),
+                "largest_original_crop_width": max((int(getattr(item, "original_crop_width", 0)) for item in evidence_items), default=0),
+                "largest_original_crop_height": max((int(getattr(item, "original_crop_height", 0)) for item in evidence_items), default=0),
+                "best_quality_score": max((float(getattr(item, "quality_score", 0.0)) for item in evidence_items), default=0.0),
+                "body_type_status": result.vehicle_body_type.status,
+                "body_type_label": result.vehicle_body_type.label,
+                "colour_status": result.vehicle_colour.status,
+                "colour_label": result.vehicle_colour.label,
+                "florence_mode": getattr(result, "florence_mode", None),
+                "adapter_loaded": getattr(result, "adapter_loaded", None),
+            }
+        )
+    return rows
+
+
+def _build_ocr_mukul_result_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        for caption_row in list(getattr(result, "crop_level_captions", []) or []):
+            frame_index = caption_row.get("frame_index")
+            crop_path = caption_row.get("crop_path")
+            body_item = next((item for item in list(getattr(result, "crop_level_body_types", []) or []) if item.get("crop_path") == crop_path and item.get("frame_index") == frame_index), {})
+            colour_item = next((item for item in list(getattr(result, "crop_level_colours", []) or []) if item.get("crop_path") == crop_path and item.get("frame_index") == frame_index), {})
+            evidence = next((item for item in list(getattr(result, "evidence_used", []) or []) if str(getattr(item, "vehicle_crop_path", "")) == str(crop_path) and int(getattr(item, "frame_number", -1)) == int(frame_index)), None)
+            rows.append(
+                {
+                    "camera_id": result.camera_id,
+                    "local_track_id": result.local_track_id,
+                    "frame_index": frame_index,
+                    "crop_path": crop_path,
+                    "original_crop_width": getattr(evidence, "original_crop_width", None),
+                    "original_crop_height": getattr(evidence, "original_crop_height", None),
+                    "resolution_tier": getattr(evidence, "resolution_tier", None),
+                    "quality_score": getattr(evidence, "quality_score", None),
+                    "caption": caption_row.get("caption"),
+                    "raw_body_type_phrase": body_item.get("raw_body_type_phrase"),
+                    "normalized_body_type": body_item.get("normalized_body_type"),
+                    "raw_colour_phrase": colour_item.get("raw_colour_phrase"),
+                    "normalized_colour": colour_item.get("normalized_colour"),
+                    "inference_time_ms": "",
+                }
+            )
+    return rows
+
+
+def _build_vehicle_attribute_result_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        if getattr(result, "attribute_backend", None) != "base_florence":
+            continue
+        for caption_row in list(getattr(result, "crop_level_captions", []) or []):
+            frame_index = caption_row.get("frame_index")
+            crop_path = caption_row.get("crop_path")
+            body_item = next((item for item in list(getattr(result, "crop_level_body_types", []) or []) if item.get("crop_path") == crop_path and item.get("frame_index") == frame_index), {})
+            colour_item = next((item for item in list(getattr(result, "crop_level_colours", []) or []) if item.get("crop_path") == crop_path and item.get("frame_index") == frame_index), {})
+            rows.append(
+                {
+                    "camera_id": result.camera_id,
+                    "local_track_id": result.local_track_id,
+                    "frame_index": frame_index,
+                    "vehicle_crop_path": crop_path,
+                    "task_token": getattr(result.vehicle_colour, "task_prompt", None) or getattr(result.vehicle_body_type, "task_prompt", None),
+                    "prompt": getattr(result.vehicle_colour, "prompt_text", None) or getattr(result.vehicle_body_type, "prompt_text", None),
+                    "effective_processor_text": f"{getattr(result.vehicle_colour, 'task_prompt', '') or getattr(result.vehicle_body_type, 'task_prompt', '')}{getattr(result.vehicle_colour, 'prompt_text', '') or getattr(result.vehicle_body_type, 'prompt_text', '')}",
+                    "raw_response": caption_row.get("caption"),
+                    "parsed_colour": colour_item.get("normalized_colour"),
+                    "parsed_body_type": body_item.get("normalized_body_type"),
+                    "colour_reason": result.final_colour_reason,
+                    "body_type_reason": result.final_body_type_reason,
+                    "inference_time_ms": "",
+                    "adapter_loaded": False,
+                }
+            )
+    return rows
+
+
+def _build_vehicle_colour_result_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        if getattr(result, "attribute_backend", None) != "base_florence":
+            continue
+        colour_predictions = list(getattr(result.vehicle_colour, "predictions", []) or [])
+        prediction_lookup = {
+            (str(prediction.source_crop_path or ""), int(prediction.source_frame_number if prediction.source_frame_number is not None else -1)): prediction
+            for prediction in colour_predictions
+        }
+        caption_lookup = {
+            (str(item.get("crop_path") or ""), int(item.get("frame_index", -1))): item
+            for item in list(getattr(result, "crop_level_captions", []) or [])
+        }
+        for colour_item in list(getattr(result, "crop_level_colours", []) or []):
+            crop_path = str(colour_item.get("crop_path") or "")
+            frame_index = int(colour_item.get("frame_index", -1))
+            prediction = prediction_lookup.get((crop_path, frame_index))
+            caption_row = caption_lookup.get((crop_path, frame_index), {})
+            evidence = next(
+                (
+                    item
+                    for item in list(getattr(result, "evidence_used", []) or [])
+                    if str(getattr(item, "vehicle_crop_path", "") or "") == crop_path
+                    and int(getattr(item, "frame_number", -1)) == frame_index
+                ),
+                None,
+            )
+            rows.append(
+                {
+                    "camera_id": result.camera_id,
+                    "local_track_id": result.local_track_id,
+                    "frame_index": frame_index,
+                    "vehicle_class": result.vehicle_class,
+                    "vehicle_crop_path": crop_path,
+                    "crop_quality_score": getattr(evidence, "quality_score", None),
+                    "task_token": getattr(result.vehicle_colour, "task_prompt", None),
+                    "prompt": getattr(result.vehicle_colour, "prompt_text", None),
+                    "effective_processor_text": f"{getattr(result.vehicle_colour, 'task_prompt', '') or ''}{getattr(result.vehicle_colour, 'prompt_text', '') or ''}",
+                    "raw_response": "" if prediction is None or prediction.raw_response in (None, "") else str(prediction.raw_response),
+                    "post_processed_response": caption_row.get("caption"),
+                    "parsed_colour": colour_item.get("normalized_colour"),
+                    "colour_status": "completed" if prediction is not None else "skipped",
+                    "colour_reason": colour_item.get("reason") or getattr(result, "final_colour_reason", None),
+                    "inference_time_ms": None if prediction is None else prediction.inference_duration_ms,
+                    "adapter_loaded": False,
+                    "crop_source": colour_item.get("crop_source"),
+                    "crop_available": colour_item.get("crop_available"),
+                    "crop_skip_reason": colour_item.get("crop_skip_reason"),
+                }
+            )
+    return rows
+
+
+def _build_vehicle_colour_track_summary_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        if getattr(result, "attribute_backend", None) != "base_florence":
+            continue
+        colour_predictions = list(getattr(result.vehicle_colour, "predictions", []) or [])
+        crop_colour_predictions = [
+            {
+                "frame_index": prediction.source_frame_number,
+                "label": prediction.label,
+                "raw_response": prediction.raw_response,
+            }
+            for prediction in colour_predictions
+        ]
+        valid_prediction_count = sum(1 for prediction in colour_predictions if str(prediction.label) not in {"", "UNKNOWN", "None"})
+        unknown_prediction_count = sum(1 for prediction in colour_predictions if str(prediction.label) in {"", "UNKNOWN", "None"})
+        rows.append(
+            {
+                "camera_id": result.camera_id,
+                "local_track_id": result.local_track_id,
+                "vehicle_class": result.vehicle_class,
+                "selected_crop_count": len(list(getattr(result, "evidence_used", []) or [])),
+                "colour_inference_count": int(getattr(result, "vehicle_attribute_inference_count", 0) or len(colour_predictions)),
+                "crop_colour_predictions": crop_colour_predictions,
+                "final_vehicle_colour": result.vehicle_colour.label,
+                "colour_consensus_status": result.vehicle_colour.status,
+                "colour_consensus_reason": getattr(result, "final_colour_reason", None),
+                "valid_prediction_count": valid_prediction_count,
+                "unknown_prediction_count": unknown_prediction_count,
+            }
+        )
+    return rows
+
+
+def _build_plate_ocr_result_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        if not (getattr(result, "plate_detected", False) or getattr(result, "plate_ocr_attempted", False) or getattr(result, "plate_ocr_reason", None)):
+            continue
+        rows.append(
+            {
+                "camera_id": result.camera_id,
+                "local_track_id": result.local_track_id,
+                "frame_index": "",
+                "vehicle_crop_path": " | ".join(getattr(result, "selected_crop_paths", []) or []),
+                "plate_bbox": getattr(result, "plate_bbox", None),
+                "plate_crop_path": getattr(result, "plate_crop_path", None),
+                "plate_detection_confidence": getattr(result, "plate_detection_confidence", None),
+                "plate_quality_status": getattr(result, "plate_quality_status", None),
+                "raw_ocr_response": getattr(result, "plate_ocr_raw_response", None),
+                "normalized_plate_text": getattr(result, "plate_text", None),
+                "ocr_status": "completed" if getattr(result, "plate_text", None) else "skipped",
+                "ocr_reason": getattr(result, "plate_ocr_reason", None),
+                "inference_time_ms": "",
+                "adapter_loaded": bool(getattr(result, "plate_ocr_attempted", False)),
+            }
+        )
+    return rows
+
+
+def _write_current_vs_ocr_mukul_artifacts(run_directory: Path, enrichment_results: list[Any]) -> None:
+    comparison_rows: list[dict[str, Any]] = []
+    manual_rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        payload = getattr(result, "comparison_payload", None)
+        if not payload:
+            continue
+        comparison_row = {
+            "camera_id": result.camera_id,
+            "local_track_id": result.local_track_id,
+            "selected_crop_paths": " | ".join(getattr(result, "selected_crop_paths", []) or []),
+            "current_body_type": payload["current"]["body_type_label"],
+            "ocr_mukul_body_type": payload["ocr_mukul"]["body_type_label"],
+            "current_colour": payload["current"]["colour_label"],
+            "ocr_mukul_colour": payload["ocr_mukul"]["colour_label"],
+            "current_body_type_raw": " | ".join(payload["current"]["body_type_raw_responses"]),
+            "current_colour_raw": " | ".join(payload["current"]["colour_raw_responses"]),
+            "ocr_mukul_captions": " | ".join(str(item.get("caption", "")) for item in payload["ocr_mukul"]["captions"]),
+            "current_body_type_reason": payload["current"]["body_type_reason"],
+            "ocr_mukul_body_type_reason": payload["ocr_mukul"]["body_type_reason"],
+            "current_colour_reason": payload["current"]["colour_reason"],
+            "ocr_mukul_colour_reason": payload["ocr_mukul"]["colour_reason"],
+            "manual_body_type": "",
+            "manual_colour": "",
+            "review_notes": "",
+        }
+        comparison_rows.append(comparison_row)
+        if payload["current"]["body_type_label"] != payload["ocr_mukul"]["body_type_label"] or payload["current"]["colour_label"] != payload["ocr_mukul"]["colour_label"]:
+            manual_rows.append(dict(comparison_row))
+    if not comparison_rows:
+        return
+    output_dir = run_directory.parent.parent / "current_vs_ocr_mukul"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(comparison_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(comparison_rows)
+    summary = {
+        "tracks_compared": len(comparison_rows),
+        "body_type_disagreements": sum(1 for row in comparison_rows if row["current_body_type"] != row["ocr_mukul_body_type"]),
+        "colour_disagreements": sum(1 for row in comparison_rows if row["current_colour"] != row["ocr_mukul_colour"]),
+    }
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (output_dir / "report.md").write_text(
+        "\n".join(
+            [
+                "# Current vs OCR_MUKUL Report",
+                "",
+                f"- Tracks compared: `{summary['tracks_compared']}`",
+                f"- Body type disagreements: `{summary['body_type_disagreements']}`",
+                f"- Colour disagreements: `{summary['colour_disagreements']}`",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with (output_dir / "manual_review.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(manual_rows[0].keys()) if manual_rows else ["camera_id", "local_track_id", "review_notes"])
+        writer.writeheader()
+        writer.writerows(manual_rows)

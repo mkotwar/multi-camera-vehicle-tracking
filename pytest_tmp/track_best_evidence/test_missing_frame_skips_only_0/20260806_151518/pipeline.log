@@ -1,0 +1,7 @@
+2026-08-06 15:15:18 | INFO | pipeline | EvidenceCollector normalized best-overall weights={'confidence': 0.35, 'sharpness': 0.25, 'bbox_area': 0.2, 'centeredness': 0.1, 'edge_visibility': 0.1}
+2026-08-06 15:15:18 | INFO | pipeline | EvidenceCollector initialized enabled=True include_discarded_tracks=False fail_pipeline_on_error=False
+2026-08-06 15:15:18 | ERROR | pipeline | EvidenceCollector error camera_id=CAM_001 local_track_id=CAM_001:TRACK_1 frame_number=0 role=FIRST,HIGHEST_CONFIDENCE,LARGEST,MIDDLE cache_size=1 error_class=RuntimeError error=Evidence frame missing from cache for CAM_001:TRACK_1 frame=0
+Traceback (most recent call last):
+  File "D:\project\multi-camera-vehicle-tracking\src\evidence.py", line 577, in _save_selected_assets
+    raise RuntimeError(f"Evidence frame missing from cache for {track.local_track_id} frame={frame_number}")
+RuntimeError: Evidence frame missing from cache for CAM_001:TRACK_1 frame=0

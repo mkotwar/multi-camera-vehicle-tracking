@@ -1,0 +1,38 @@
+2026-08-06 19:05:33 | INFO | pipeline | Pipeline started
+2026-08-06 19:05:33 | INFO | pipeline | Resolved input source camera_id=CAM_001 source_type=video source=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\sample.mp4
+2026-08-06 19:05:33 | INFO | pipeline | Config loaded
+2026-08-06 19:05:33 | INFO | pipeline | Frame limit per camera: 2
+2026-08-06 19:05:33 | INFO | pipeline | Vehicle enrichment startup: colour_enabled=False body_type_enabled=True adapter_enabled=False plate_ocr_enabled=False
+2026-08-06 19:05:33 | INFO | pipeline | Runtime device: configured_device=cpu configured_dtype=auto resolved_device=cpu resolved_dtype=float32 cuda_available=False cuda_device_name=None torch_version=test-torch torch_cuda_version=None reason=CUDA unavailable because installed PyTorch build is CPU-only.
+2026-08-06 19:05:33 | INFO | pipeline | TrackManager initialized minimum_observations=3 maximum_lost_frames=30 minimum_winner_ratio=0.60 keep_discarded_tracks=True
+2026-08-06 19:05:33 | INFO | pipeline | EvidenceCollector normalized best-overall weights={'confidence': 0.35, 'sharpness': 0.25, 'bbox_area': 0.2, 'centeredness': 0.1, 'edge_visibility': 0.1}
+2026-08-06 19:05:33 | INFO | pipeline | EvidenceCollector initialized enabled=True include_discarded_tracks=False fail_pipeline_on_error=False
+2026-08-06 19:05:33 | INFO | pipeline | Starting ingestion manager enabled_cameras=1 worker_count=7 frame_queue_size=50 frame_limit=2
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=0 cameras=['CAM_001']
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=1 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=2 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=3 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=4 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=5 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker assignment worker=6 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=0 cameras=['CAM_001']
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=1 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=1
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=2 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=2
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=3 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=3
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=4 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=4
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=5 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=5
+2026-08-06 19:05:33 | INFO | pipeline | Worker started worker=6 cameras=[]
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=6
+2026-08-06 19:05:33 | INFO | pipeline | track created camera=CAM_001 native_tracker_id=1 local_track_id=CAM_001:TRACK_1 status=TENTATIVE
+2026-08-06 19:05:33 | INFO | pipeline | Camera completed camera=CAM_001
+2026-08-06 19:05:33 | INFO | pipeline | Worker stopped worker=0
+2026-08-06 19:05:33 | INFO | pipeline | track discarded camera=CAM_001 local_track_id=CAM_001:TRACK_1 observations=2 final_class=UNKNOWN reason=INSUFFICIENT_OBSERVATIONS completion_reason=END_OF_STREAM
+2026-08-06 19:05:33 | WARNING | pipeline | final class returned UNKNOWN local_track_id=CAM_001:TRACK_1 reason=INSUFFICIENT_OBSERVATIONS
+2026-08-06 19:05:33 | INFO | pipeline | camera flushed camera_id=CAM_001 finalized_tracks=1
+2026-08-06 19:05:33 | INFO | pipeline | track output paths tracks=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\tracks.json observations=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\observations.csv lifecycle_metrics=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\track_lifecycle_metrics.json evidence_index=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\evidence_index.json evidence_metrics=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\evidence_metrics.json vehicle_enrichment=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\vehicle_enrichment.json vehicle_enrichment_metrics=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\vehicle_enrichment_metrics.json vehicle_enrichment_validation_report=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\vehicle_enrichment_validation_report.csv vehicle_enrichment_crop_diagnostics=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\vehicle_enrichment_crop_diagnostics.csv vehicle_enrichment_track_evidence_summary=D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit_targeted\test_outputs_are_written_only_0\custom_runs\20260806_190533\vehicle_enrichment_track_evidence_summary.csv
+2026-08-06 19:05:33 | INFO | pipeline | Pipeline completed

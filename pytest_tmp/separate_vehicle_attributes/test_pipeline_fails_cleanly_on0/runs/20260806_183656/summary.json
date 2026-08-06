@@ -1,0 +1,9 @@
+{
+  "run_id": "20260806_183656",
+  "status": "FAILED",
+  "processed_frames": 0,
+  "error_count": 1,
+  "error_type": "ConfigurationError",
+  "error_message": "At least one enabled camera is required.",
+  "run_directory": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\separate_vehicle_attributes\\test_pipeline_fails_cleanly_on0\\runs\\20260806_183656"
+}

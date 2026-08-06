@@ -30,9 +30,18 @@ class MultiCameraIngestionManager:
             raise ConfigurationError("ingestion.worker_count must be at least 1.")
         if self.frame_queue_size < 1:
             raise ConfigurationError("ingestion.frame_queue_size must be at least 1.")
-        self.max_frames_per_camera = int(self.input_config.get("max_frames_per_camera", 0))
-        if self.max_frames_per_camera <= 0:
-            raise ConfigurationError("input.max_frames_per_camera must be a positive integer.")
+        _missing = object()
+        raw_max_frames_per_camera = self.input_config.get("max_frames_per_camera", _missing)
+        if raw_max_frames_per_camera is None:
+            self.max_frames_per_camera: int | None = None
+        else:
+            default_value = 0 if raw_max_frames_per_camera is _missing else raw_max_frames_per_camera
+            try:
+                self.max_frames_per_camera = int(default_value)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("input.max_frames_per_camera must be a positive integer or null.") from exc
+            if self.max_frames_per_camera <= 0:
+                raise ConfigurationError("input.max_frames_per_camera must be a positive integer or null.")
 
         self.frame_queue: queue.Queue[FramePacket] = queue.Queue(maxsize=self.frame_queue_size)
         self.readers_by_camera = {
@@ -75,10 +84,11 @@ class MultiCameraIngestionManager:
         started_at = datetime.now(timezone.utc).isoformat()
         self.metrics["started_at"] = started_at
         self.logger.info(
-            "Starting ingestion manager enabled_cameras=%s worker_count=%s frame_queue_size=%s",
+            "Starting ingestion manager enabled_cameras=%s worker_count=%s frame_queue_size=%s frame_limit=%s",
             len(self.enabled_cameras),
             self.worker_count,
             self.frame_queue_size,
+            "unlimited" if self.max_frames_per_camera is None else self.max_frames_per_camera,
         )
         for worker_id, camera_ids in self.camera_assignments.items():
             self.logger.info("Worker assignment worker=%s cameras=%s", worker_id, list(camera_ids))
@@ -205,7 +215,11 @@ class MultiCameraIngestionManager:
                             self._stop_event.set()
                             break
                         continue
-                    if packet is None or packet.frame_number >= self.max_frames_per_camera:
+                    if packet is None or (
+                        self.max_frames_per_camera is not None
+                        and self.max_frames_per_camera > 0
+                        and packet.frame_number >= self.max_frames_per_camera
+                    ):
                         self._mark_camera_completed(camera_id)
                         continue
                     if not self._enqueue_packet(packet):

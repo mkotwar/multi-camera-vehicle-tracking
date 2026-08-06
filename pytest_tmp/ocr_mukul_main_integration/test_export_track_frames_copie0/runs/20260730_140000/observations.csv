@@ -1,0 +1,5 @@
+local_track_id,camera_id,tracker_namespace,native_tracker_id,frame_number,timestamp_seconds,x1,y1,x2,y2,confidence,raw_class_id,raw_class_name
+CAM_001:TRACK_2,CAM_001,camera,2,0,0.0,1,2,3,4,0.9,3,motorcycle
+CAM_001:TRACK_2,CAM_001,camera,2,2,0.2,1,2,3,4,0.8,3,motorcycle
+CAM_001:TRACK_2,CAM_001,camera,2,4,0.4,1,2,3,4,0.7,3,motorcycle
+CAM_001:TRACK_9,CAM_001,camera,9,6,0.6,1,2,3,4,0.6,0,car

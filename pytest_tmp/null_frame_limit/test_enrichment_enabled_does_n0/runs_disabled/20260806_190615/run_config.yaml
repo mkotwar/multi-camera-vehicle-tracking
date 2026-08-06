@@ -1,0 +1,251 @@
+project:
+  name: test_project
+  environment: test
+  log_level: INFO
+input:
+  cameras:
+  - camera_id: CAM_001
+    source_type: video
+    source: D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit\test_enrichment_enabled_does_n0\sample.mp4
+    enabled: true
+  max_frames_per_camera: 4
+ingestion:
+  worker_count: 7
+  target_read_fps: 10.0
+  frame_queue_size: 50
+  queue_put_timeout_seconds: 0.1
+  queue_get_timeout_seconds: 0.1
+  stop_on_camera_error: false
+  round_robin: true
+  raw_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5
+    image_format: jpg
+    jpeg_quality: 90
+detection:
+  backend: ocr_mukul
+  model_path: D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit\test_enrichment_enabled_does_n0\model.pt
+  device: cpu
+  dtype: auto
+  confidence_threshold: 0.38
+  iou_threshold: 0.45
+  image_size: 640
+  agnostic_nms: false
+  allowed_classes:
+  - car
+  - truck
+  - bus
+  - motorcycle
+  - 3wheeler
+  allowed_class_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  bbox_quality:
+    enabled: false
+    default:
+      minimum_width_pixels: 60.0
+      minimum_height_pixels: 60.0
+      minimum_area_ratio: 0.005
+      maximum_area_ratio: 0.9
+      minimum_aspect_ratio: 0.3
+      maximum_aspect_ratio: 4.5
+      edge_margin_pixels: 8.0
+      edge_mode: LEGACY
+    classes: {}
+tracking:
+  backend: supervision_bytetrack
+  track_activation_threshold: 0.15
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.8
+  minimum_consecutive_frames: 1
+  isolation_mode: per_camera
+  supported_isolation_modes:
+  - per_camera
+  - per_camera_class
+lifecycle:
+  minimum_observations: 3
+  maximum_lost_frames: 30
+  keep_discarded_tracks: true
+track_class:
+  minimum_observations: 3
+  minimum_winner_ratio: 0.6
+  strategy: confidence_weighted_majority
+  unknown_class_name: UNKNOWN
+evidence:
+  enabled: true
+  collect_first: true
+  collect_middle: true
+  collect_last: true
+  collect_highest_confidence: true
+  collect_largest: true
+  collect_sharpest: true
+  collect_best_overall: true
+  maximum_candidates_per_track: 7
+  minimum_crop_width_pixels: 5
+  minimum_crop_height_pixels: 5
+  crop_padding_ratio_x: 0.08
+  crop_padding_ratio_y: 0.08
+  minimum_padding_pixels: 2
+  clamp_bbox_to_frame: true
+  reject_invalid_bbox: true
+  sharpness_enabled: true
+  jpeg_quality: 90
+  save_vehicle_crops: true
+  save_annotated_full_frames: true
+  save_all_candidates: false
+  include_discarded_tracks: false
+  fail_pipeline_on_error: false
+  best_overall_weights:
+    confidence: 0.35
+    sharpness: 0.25
+    bbox_area: 0.2
+    centeredness: 0.1
+    edge_visibility: 0.1
+visualization:
+  show_rejected_boxes: false
+  detected_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5
+  tracked_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5
+output:
+  root_directory: D:\project\multi-camera-vehicle-tracking\pytest_tmp\null_frame_limit\test_enrichment_enabled_does_n0\runs_disabled
+  save_run_config: true
+vehicle_enrichment:
+  enabled: false
+  trigger: track_completed
+  florence_mode: current
+  fail_open: true
+  best_crops_per_track: 3
+  write_separate_output: true
+  extend_tracks_json: true
+  florence_comparison:
+    enabled: false
+    current_flow: true
+    old_td_case2_flow: false
+    old_project_root: ''
+    output_directory: ''
+  evidence:
+    source: existing_track_evidence
+    save_vehicle_crops: true
+    minimum_crop_width: 5
+    minimum_crop_height: 5
+    minimum_sharpness: 1.0
+    minimum_quality_score: 0.0
+    border_margin_ratio: 0.02
+    scoring:
+      area_weight: 0.25
+      sharpness_weight: 0.25
+      confidence_weight: 0.2
+      role_weight: 0.15
+      border_weight: 0.05
+      clipping_weight: 0.05
+      brightness_weight: 0.05
+  shared_florence:
+    enabled: false
+    backend: florence2
+    base_model_id: microsoft/Florence-2-base-ft
+    processor_path: ''
+    adapter_path: model_weights/florence/adaptor_florance_baseFT
+    adapter_enabled: false
+    device: auto
+    dtype: auto
+    trust_remote_code: true
+    attention_implementation: eager
+    max_new_tokens: 1024
+    num_beams: 3
+    use_cache: false
+    local_files_only: false
+    lazy_load: true
+    fail_if_adapter_missing: false
+  image_size_policy: {}
+  evidence_quality: {}
+  track_evidence:
+    enabled: true
+    maximum_candidates_per_track: 12
+    final_crops_per_attribute: 3
+    minimum_frame_gap: 3
+    preferred_frame_gap: 8
+    deduplicate_similar_crops: true
+    classify_at_track_completion: true
+    early_classification:
+      enabled: false
+      require_preferred_resolution: true
+      minimum_quality_score: 0.8
+  body_type:
+    enabled: false
+    backend: florence2
+    run_only_when_vehicle_class:
+    - CAR
+    maximum_crops_per_track: 3
+    minimum_crop_width: 256
+    minimum_crop_height: 192
+    allowed_labels: []
+  colour:
+    enabled: false
+    backend: florence2
+    run_only_when_vehicle_class:
+    - 3WHEELER
+    - BUS
+    - CAR
+    - MOTORCYCLE
+    - TRUCK
+    maximum_crops_per_track: 3
+    minimum_crop_width: 256
+    minimum_crop_height: 192
+    allowed_labels: []
+  ocr_mukul:
+    enabled: false
+    task_token: <CAPTION>
+    prompt: ''
+    reuse_caption_for_attributes: true
+    maximum_crops_per_track: 3
+    body_type_vehicle_classes:
+    - CAR
+    colour_vehicle_classes:
+    - 3WHEELER
+    - BUS
+    - CAR
+    - MOTORCYCLE
+    - TRUCK
+  vehicle_attributes:
+    enabled: false
+    backend: base_florence
+    maximum_crops_per_track: 3
+    reuse_single_response_for_attributes: true
+    task_token: <VQA>
+    prompt: ''
+    colour:
+      enabled: false
+      backend: base_florence
+      task_token: <VQA>
+      prompt: ''
+      generation: {}
+    body_type:
+      enabled: true
+      backend: base_florence
+      task_token: <VQA>
+      prompt: ''
+      generation: {}
+    florence: {}
+  make_model:
+    enabled: false
+  plate:
+    detection_enabled: false
+    colour_enabled: false
+    recognition_enabled: false
+    detector: {}
+    ocr: {}
+  ocr:
+    enabled: false
+    run_only_when_plate_detected: true

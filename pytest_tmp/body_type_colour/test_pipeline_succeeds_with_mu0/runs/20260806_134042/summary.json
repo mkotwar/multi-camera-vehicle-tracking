@@ -1,0 +1,68 @@
+{
+  "run_id": "20260806_134042",
+  "status": "COMPLETED",
+  "project_name": "test_project",
+  "detection_backend": "ocr_mukul",
+  "tracking_backend": "supervision_bytetrack",
+  "configured_device": "cpu",
+  "configured_dtype": "auto",
+  "resolved_device": "cpu",
+  "resolved_dtype": "float32",
+  "cuda_available": false,
+  "cuda_device_count": 0,
+  "cuda_device_name": null,
+  "torch_version": "test-torch",
+  "torch_cuda_version": null,
+  "configured_camera_count": 2,
+  "enabled_camera_count": 2,
+  "worker_count": 7,
+  "processed_frames": 10,
+  "frames_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 6
+  },
+  "frames_by_worker": {
+    "0": 4,
+    "1": 6,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0
+  },
+  "detections_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 6
+  },
+  "tracked_observations_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 6
+  },
+  "saved_raw_frames_by_camera": {
+    "CAM_001": 2,
+    "CAM_002": 2
+  },
+  "saved_detected_frames_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 5
+  },
+  "saved_tracked_frames_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 5
+  },
+  "camera_errors": {},
+  "queue_full_events": 0,
+  "tracks_completed_by_camera": {
+    "CAM_001": 1,
+    "CAM_002": 1
+  },
+  "tracks_discarded_by_camera": {},
+  "observations_by_camera": {
+    "CAM_001": 4,
+    "CAM_002": 6
+  },
+  "selected_evidence_records": 14,
+  "vehicle_enrichment_enabled": true,
+  "vehicle_enrichment_result_count": 2,
+  "run_directory": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\body_type_colour\\test_pipeline_succeeds_with_mu0\\runs\\20260806_134042"
+}

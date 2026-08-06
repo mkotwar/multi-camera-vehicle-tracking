@@ -1,0 +1,22 @@
+[
+  {
+    "local_track_id": "CAM_001:TRACK_1",
+    "camera_id": "CAM_001",
+    "native_tracker_id": 1,
+    "status": "COMPLETED",
+    "first_frame": 0,
+    "last_frame": 2,
+    "first_timestamp_seconds": 0.0,
+    "last_timestamp_seconds": 0.2,
+    "observation_count": 3,
+    "final_class": "car",
+    "final_class_reason": "WEIGHTED_MAJORITY",
+    "class_counts": {
+      "car": 3
+    },
+    "class_confidence_sums": {
+      "car": 2.4000000000000004
+    },
+    "completion_reason": "END_OF_STREAM"
+  }
+]

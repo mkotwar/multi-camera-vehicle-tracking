@@ -104,6 +104,8 @@ class VideoCameraReader:
             timestamp_seconds=timestamp_seconds,
             source_fps=self._source_fps,
             frame=frame,
+            source_frame_width=int(frame.shape[1]),
+            source_frame_height=int(frame.shape[0]),
             worker_id=int(worker_id),
             captured_at=captured_at,
             source_type=self.source_type,

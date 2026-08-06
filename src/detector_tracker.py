@@ -9,10 +9,10 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 import supervision as sv
-import torch
 from ultralytics import YOLO
 
 from .models import BBoxQualityDiagnostic, ConfigurationError, Detection, FramePacket, TrackedDetection
+from .runtime_device import RuntimeDevice, resolve_runtime_device
 
 
 EDGE_MODE_A = "A"
@@ -80,68 +80,6 @@ class DetectorTrackerResult:
     inference_time_ms: float
 
 
-@dataclass(slots=True, frozen=True)
-class RuntimeDeviceInfo:
-    configured_device: str
-    resolved_device: str
-    cuda_available: bool
-    cuda_device_count: int
-    cuda_device_name: str | None
-    torch_version: str
-    torch_cuda_version: str | None
-
-
-def resolve_runtime_device(configured_device: Any) -> RuntimeDeviceInfo:
-    normalized = str(configured_device or "auto").strip().lower()
-    cuda_available = bool(torch.cuda.is_available())
-    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
-    torch_version = str(torch.__version__)
-    torch_cuda_version = str(torch.version.cuda) if torch.version.cuda is not None else None
-
-    if normalized == "auto":
-        resolved_device = "cuda:0" if cuda_available else "cpu"
-    elif normalized == "cpu":
-        resolved_device = "cpu"
-    elif normalized == "cuda":
-        if not cuda_available:
-            raise ConfigurationError("CUDA was explicitly requested, but torch.cuda.is_available() is False.")
-        resolved_device = "cuda:0"
-    elif normalized.startswith("cuda:"):
-        if not cuda_available:
-            raise ConfigurationError(f"{normalized} was explicitly requested, but CUDA is unavailable.")
-        raw_index = normalized.split(":", 1)[1]
-        try:
-            device_index = int(raw_index)
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"Unsupported detection.device value: {configured_device}. Expected auto, cpu, cuda, or cuda:<index>."
-            ) from exc
-        if device_index < 0 or device_index >= cuda_device_count:
-            raise ConfigurationError(
-                f"Requested CUDA device {normalized} is invalid. Available CUDA device count: {cuda_device_count}."
-            )
-        resolved_device = normalized
-    else:
-        raise ConfigurationError(
-            f"Unsupported detection.device value: {configured_device}. Expected auto, cpu, cuda, or cuda:<index>."
-        )
-
-    cuda_device_name: str | None = None
-    if resolved_device.startswith("cuda:"):
-        cuda_index = int(resolved_device.split(":", 1)[1])
-        cuda_device_name = str(torch.cuda.get_device_name(cuda_index))
-
-    return RuntimeDeviceInfo(
-        configured_device=normalized,
-        resolved_device=resolved_device,
-        cuda_available=cuda_available,
-        cuda_device_count=cuda_device_count,
-        cuda_device_name=cuda_device_name,
-        torch_version=torch_version,
-        torch_cuda_version=torch_cuda_version,
-    )
-
-
 class VehicleDetectorTracker:
     def __init__(
         self,
@@ -163,9 +101,14 @@ class VehicleDetectorTracker:
         if self.detection_backend not in SUPPORTED_DETECTION_BACKENDS:
             raise ConfigurationError(f"Unsupported detection.backend value: {self.detection_backend}")
         self.model_path = self._resolve_model_path(detection_config.get("model_path"))
-        self.runtime_device_info = resolve_runtime_device(detection_config.get("device", "auto"))
+        self.runtime_device_info: RuntimeDevice = resolve_runtime_device(
+            detection_config.get("device", "auto"),
+            detection_config.get("dtype", "auto"),
+        )
         self.configured_device = self.runtime_device_info.configured_device
+        self.configured_dtype = self.runtime_device_info.configured_dtype
         self.device = self.runtime_device_info.resolved_device
+        self.dtype = self.runtime_device_info.resolved_dtype
         self.confidence_threshold = float(
             detection_config.get(
                 "confidence_threshold",
@@ -261,7 +204,8 @@ class VehicleDetectorTracker:
                 conf=self.confidence_threshold,
                 iou=self.iou_threshold,
                 imgsz=self.image_size,
-                device=self.device,
+                device=self.runtime_device_info.yolo_device,
+                half=self.runtime_device_info.yolo_half,
                 agnostic_nms=self.agnostic_nms,
                 verbose=False,
             )[0]
@@ -447,9 +391,15 @@ class VehicleDetectorTracker:
                 }
             )
         self.logger.info(
-            "Model loaded model_path=%s device=%s allowed_classes=%s bbox_quality_enabled=%s",
+            "YOLO model loaded device=%s precision=%s",
+            self.device,
+            self.dtype,
+        )
+        self.logger.info(
+            "Model loaded model_path=%s device=%s dtype=%s allowed_classes=%s bbox_quality_enabled=%s",
             self.model_path,
             self.device,
+            self.dtype,
             self.allowed_classes,
             self.bbox_quality_enabled,
         )
@@ -791,8 +741,22 @@ class VehicleDetectorTracker:
     def _infer_ocr_mukul_result(self, packet: FramePacket) -> Any:
         try:
             if callable(self._model):
-                return self._model(packet.frame, conf=self.confidence_threshold, imgsz=self.image_size, verbose=False)[0]
-            return self._model.predict(source=packet.frame, conf=self.confidence_threshold, imgsz=self.image_size, verbose=False)[0]
+                return self._model(
+                    packet.frame,
+                    conf=self.confidence_threshold,
+                    imgsz=self.image_size,
+                    device=self.runtime_device_info.yolo_device,
+                    half=self.runtime_device_info.yolo_half,
+                    verbose=False,
+                )[0]
+            return self._model.predict(
+                source=packet.frame,
+                conf=self.confidence_threshold,
+                imgsz=self.image_size,
+                device=self.runtime_device_info.yolo_device,
+                half=self.runtime_device_info.yolo_half,
+                verbose=False,
+            )[0]
         except Exception as exc:
             self._metrics["inference_errors"].append(
                 {

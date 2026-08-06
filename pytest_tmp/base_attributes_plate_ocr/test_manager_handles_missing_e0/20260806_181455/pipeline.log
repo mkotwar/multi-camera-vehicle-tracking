@@ -1,0 +1,13 @@
+2026-08-06 18:14:56 | ERROR | pipeline | vehicle enrichment failed for track=CAM_001:TRACK_1
+Traceback (most recent call last):
+  File "D:\project\multi-camera-vehicle-tracking\src\vehicle_enrichment\enrichment_manager.py", line 365, in enrich_completed_tracks
+    result = self._enrich_single_track(
+        track,
+    ...<2 lines>...
+        started_monotonic,
+    )
+  File "D:\project\multi-camera-vehicle-tracking\src\vehicle_enrichment\enrichment_manager.py", line 401, in _enrich_single_track
+    adapted = self.adapter.adapt_track(track, evidence_records)
+  File "D:\project\multi-camera-vehicle-tracking\tests\test_vehicle_enrichment_manager.py", line 178, in _boom
+    raise RuntimeError("boom")
+RuntimeError: boom

@@ -6,7 +6,10 @@ import re
 from typing import Any
 
 import cv2
+import numpy as np
+from PIL import Image
 
+from ..image_size_policy import ImageSizePolicy, normalize_image_size_policy, pad_to_square
 from ..schemas import (
     ATTRIBUTE_STATUS_DISABLED,
     ATTRIBUTE_STATUS_ERROR,
@@ -20,7 +23,7 @@ from ..shared import FlorenceBackend
 
 BODY_TYPE_TASK_PROMPT = "<VQA>"
 BODY_TYPE_PROMPT_TEXT = (
-    "Which is closest: hatchback, sedan, suv, mpv, van, pickup, or other?"
+    "What body type is this vehicle? Answer with one word: hatchback, sedan, suv, mpv, van, pickup, or other."
 )
 
 UNKNOWN_PHRASES = {
@@ -38,7 +41,7 @@ UNKNOWN_PHRASES = {
 NORMALIZATION_RULES = [
     ("SUV", {"suv", "sport utility vehicle", "sports utility vehicle"}),
     ("SEDAN", {"sedan", "sedan car", "saloon"}),
-    ("HATCHBACK", {"hatchback", "hatch back", "back"}),
+    ("HATCHBACK", {"hatchback", "hatch back"}),
     ("MPV", {"mpv", "muv", "multi purpose vehicle", "multi-purpose vehicle", "multi utility vehicle"}),
     ("VAN", {"van", "minivan"}),
     ("PICKUP", {"pickup", "pickup truck", "pick up", "pick-up"}),
@@ -47,9 +50,15 @@ NORMALIZATION_RULES = [
 
 
 class VehicleBodyTypeClassifier:
-    def __init__(self, config: dict[str, Any], *, backend: FlorenceBackend, logger: logging.Logger) -> None:
+    def __init__(self, config: dict[str, Any], *, backend: FlorenceBackend, image_size_policy: ImageSizePolicy | None = None, logger: logging.Logger) -> None:
         self.config = dict(config)
         self.backend = backend
+        self.image_size_policy = image_size_policy or normalize_image_size_policy(
+            {},
+            fallback_body_type=self.config,
+            fallback_colour={"minimum_crop_width": 256, "minimum_crop_height": 192},
+            detection={},
+        )
         self.logger = logger
         self.enabled = bool(self.config.get("enabled", False))
         self.allowed_labels = [str(item).strip().upper() for item in self.config.get("allowed_labels", []) if str(item).strip()]
@@ -59,8 +68,8 @@ class VehicleBodyTypeClassifier:
             if str(item).strip()
         }
         self.maximum_crops_per_track = max(1, int(self.config.get("maximum_crops_per_track", 2)))
-        self.minimum_crop_width = max(1, int(self.config.get("minimum_crop_width", 180)))
-        self.minimum_crop_height = max(1, int(self.config.get("minimum_crop_height", 120)))
+        self.minimum_crop_width = int(self.image_size_policy.florence.minimum_original_width)
+        self.minimum_crop_height = int(self.image_size_policy.florence.minimum_original_height)
         self._metrics: dict[str, Any] = {
             "body_type_eligible_tracks": 0,
             "body_type_ineligible_tracks": 0,
@@ -72,6 +81,10 @@ class VehicleBodyTypeClassifier:
             "body_type_total_inference_duration_ms": 0.0,
             "body_type_average_inference_duration_ms": 0.0,
             "body_type_labels": {},
+            "body_type_crops_below_minimum": 0,
+            "body_type_crops_acceptable": 0,
+            "body_type_crops_preferred": 0,
+            "body_type_crops_rejected_quality": 0,
         }
 
     @property
@@ -107,8 +120,8 @@ class VehicleBodyTypeClassifier:
         self.logger.info("Body type eligible track: %s", request.local_track_id)
         eligible_evidence = [
             item
-            for item in request.evidence_items[: self.maximum_crops_per_track]
-            if item.crop_width >= self.minimum_crop_width and item.crop_height >= self.minimum_crop_height
+            for item in request.evidence_items
+            if self._is_evidence_item_eligible(item)
         ]
         if not eligible_evidence:
             self._metrics["body_type_tracks_skipped_small_crop"] += 1
@@ -120,11 +133,12 @@ class VehicleBodyTypeClassifier:
                 reason="no_eligible_crops",
                 model=self.backend.model_identifier,
                 adapter_active=self.backend.adapter_active,
-                aggregation_reason="no_eligible_crops",
+                aggregation_reason=self._no_evidence_reason(request.evidence_items),
                 task_prompt=BODY_TYPE_TASK_PROMPT,
                 prompt_text=BODY_TYPE_PROMPT_TEXT,
             )
 
+        eligible_evidence = self._select_final_evidence_items(eligible_evidence)
         predictions = [self._infer_single_crop(item) for item in eligible_evidence]
         final_label, aggregation_reason, agreement_score, accumulated_weight = self._aggregate_predictions(predictions)
         self._metrics["body_type_tracks_processed"] += 1
@@ -170,16 +184,33 @@ class VehicleBodyTypeClassifier:
         if image is None or image.size == 0:
             self._metrics["body_type_tracks_failed"] += 1
             return self._error_prediction(evidence_item, crop_path, "invalid_crop_image", "Crop image could not be decoded.")
-        response = self.backend.run_task(image, BODY_TYPE_TASK_PROMPT, BODY_TYPE_PROMPT_TEXT)
+        prepared_image, padding_metadata = self._prepare_image_for_florence(image)
+        self.logger.debug(
+            "Body type Florence input original_crop_size=%sx%s resolution_tier=%s padded_size=%sx%s",
+            evidence_item.original_crop_width,
+            evidence_item.original_crop_height,
+            evidence_item.resolution_tier,
+            padding_metadata["padded_width"],
+            padding_metadata["padded_height"],
+        )
+        response = self.backend.run_task(prepared_image, BODY_TYPE_TASK_PROMPT, BODY_TYPE_PROMPT_TEXT)
         if response["status"] != "completed":
             self._metrics["body_type_tracks_failed"] += 1
             return self._error_prediction(evidence_item, crop_path, "backend_error", str(response.get("reason")))
         payload = dict(response.get("payload") or {})
         raw_response = self._extract_body_type_text(payload)
         normalized_label, normalization_reason = self.normalize_label(raw_response)
+        self.logger.debug(
+            "Body type raw_response=%s parsed_answer=%s normalized_label=%s normalization_reason=%s",
+            raw_response,
+            payload.get("parsed_answer"),
+            normalized_label,
+            normalization_reason,
+        )
         inference_duration_ms = float(payload.get("inference_duration_ms", 0.0))
         self._metrics["body_type_crop_inference_count"] += 1
         self._metrics["body_type_total_inference_duration_ms"] += inference_duration_ms
+        original_width, original_height = self._original_dimensions(evidence_item)
         return AttributePrediction(
             attribute_name="vehicle_body_type",
             label=normalized_label,
@@ -193,6 +224,14 @@ class VehicleBodyTypeClassifier:
             evidence_role=evidence_item.evidence_role,
             adapter_active=bool(payload.get("adapter_active", self.backend.adapter_active)),
             inference_duration_ms=inference_duration_ms,
+            original_crop_width=original_width,
+            original_crop_height=original_height,
+            resolution_tier=str(getattr(evidence_item, "resolution_tier", self.image_size_policy.florence.resolution_tier(original_width, original_height))),
+            square_padding_applied=bool(padding_metadata["square_padding_applied"]),
+            padded_width=int(padding_metadata["padded_width"]),
+            padded_height=int(padding_metadata["padded_height"]),
+            florence_input_width=int(padding_metadata["padded_width"]),
+            florence_input_height=int(padding_metadata["padded_height"]),
             status="completed",
             reason=normalization_reason,
             error=None,
@@ -212,10 +251,103 @@ class VehicleBodyTypeClassifier:
             evidence_role=evidence_item.evidence_role,
             adapter_active=self.backend.adapter_active,
             inference_duration_ms=None,
+            original_crop_width=self._original_dimensions(evidence_item)[0],
+            original_crop_height=self._original_dimensions(evidence_item)[1],
+            resolution_tier=str(getattr(evidence_item, "resolution_tier", "below_minimum")),
             status=ATTRIBUTE_STATUS_ERROR,
             reason=reason,
             error=error,
         )
+
+    def _is_evidence_item_eligible(self, evidence_item: Any) -> bool:
+        original_width, original_height = self._original_dimensions(evidence_item)
+        tier = self.image_size_policy.florence.resolution_tier(original_width, original_height)
+        if tier == "below_minimum":
+            self._metrics["body_type_crops_below_minimum"] += 1
+            return False
+        if getattr(evidence_item, "rejection_reasons", []):
+            if any(reason in evidence_item.rejection_reasons for reason in ("crop_rejected_quality", "brightness_below_minimum", "brightness_above_maximum", "edge_truncation_above_maximum", "sharpness_below_minimum")):
+                self._metrics["body_type_crops_rejected_quality"] += 1
+                return False
+        if tier == "acceptable":
+            self._metrics["body_type_crops_acceptable"] += 1
+        elif tier == "preferred":
+            self._metrics["body_type_crops_preferred"] += 1
+        return True
+
+    def _select_final_evidence_items(self, eligible_evidence: list[Any]) -> list[Any]:
+        ordered = sorted(
+            eligible_evidence,
+            key=lambda item: (
+                1 if getattr(item, "resolution_tier", "") == "preferred" else 0,
+                float(getattr(item, "quality_score", 0.0)),
+                float(getattr(item, "sharpness_score", 0.0)),
+                float(getattr(item, "original_crop_width", 0)),
+                float(getattr(item, "original_crop_height", 0)),
+                -float(getattr(item, "clipping_ratio", 0.0)),
+            ),
+            reverse=True,
+        )
+        selected: list[Any] = []
+        for item in ordered:
+            if len(selected) >= self.maximum_crops_per_track:
+                break
+            if self._is_temporally_too_close(selected, item):
+                continue
+            selected.append(item)
+        if not selected:
+            return ordered[: self.maximum_crops_per_track]
+        return selected
+
+    def _is_temporally_too_close(self, selected: list[Any], candidate: Any) -> bool:
+        minimum_gap = 3
+        for existing in selected:
+            if int(existing.frame_number) == int(candidate.frame_number):
+                continue
+            if abs(int(existing.frame_number) - int(candidate.frame_number)) < minimum_gap:
+                return True
+        return False
+
+    def _no_evidence_reason(self, evidence_items: list[Any]) -> str:
+        if not evidence_items:
+            return "no_track_evidence"
+        if all(not self._is_dimension_eligible(item) for item in evidence_items):
+            return "all_crops_below_minimum"
+        if all("crop_rejected_quality" in getattr(item, "rejection_reasons", []) for item in evidence_items):
+            return "all_crops_failed_quality"
+        return "no_eligible_track_evidence"
+
+    def _is_dimension_eligible(self, evidence_item: Any) -> bool:
+        original_width, original_height = self._original_dimensions(evidence_item)
+        return self.image_size_policy.florence.is_eligible(original_width, original_height)
+
+    @staticmethod
+    def _original_dimensions(evidence_item: Any) -> tuple[int, int]:
+        width = int(getattr(evidence_item, "original_crop_width", 0) or getattr(evidence_item, "crop_width", 0) or 0)
+        height = int(getattr(evidence_item, "original_crop_height", 0) or getattr(evidence_item, "crop_height", 0) or 0)
+        return width, height
+
+    def _prepare_image_for_florence(self, image: Any) -> tuple[Any, dict[str, Any]]:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(image_rgb)
+        padded = pil_image
+        square_padding_applied = False
+        if self.image_size_policy.florence.pad_to_square and pil_image.width != pil_image.height:
+            padded = pad_to_square(
+                pil_image,
+                fill=(
+                    self.image_size_policy.florence.square_padding_value,
+                    self.image_size_policy.florence.square_padding_value,
+                    self.image_size_policy.florence.square_padding_value,
+                ),
+            )
+            square_padding_applied = True
+        prepared_bgr = cv2.cvtColor(np.array(padded), cv2.COLOR_RGB2BGR)
+        return prepared_bgr, {
+            "square_padding_applied": square_padding_applied,
+            "padded_width": int(padded.width),
+            "padded_height": int(padded.height),
+        }
 
     @staticmethod
     def _extract_body_type_text(payload: dict[str, Any]) -> str:
@@ -224,6 +356,29 @@ class VehicleBodyTypeClassifier:
             answer = parsed.get(BODY_TYPE_TASK_PROMPT)
             if isinstance(answer, str):
                 return answer
+            if isinstance(answer, dict):
+                for value in answer.values():
+                    if isinstance(value, str):
+                        return value
+            for value in parsed.values():
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, dict):
+                    for nested in value.values():
+                        if isinstance(nested, str):
+                            return nested
+        if isinstance(parsed, str):
+            return parsed
+        for key in (
+            "decoded_generated_only_text_skip_special",
+            "decoded_generated_only_text",
+            "decoded_full_text_skip_special",
+            "decoded_full_text",
+            "generated_text",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
         return str(payload.get("generated_text") or "")
 
     def normalize_label(self, raw_value: str) -> tuple[str, str]:
@@ -235,11 +390,10 @@ class VehicleBodyTypeClassifier:
         exact_matches = [label for label, phrases in NORMALIZATION_RULES if cleaned in phrases]
         if len(exact_matches) == 1:
             return exact_matches[0], "exact_phrase_match"
-        tokenized = f" {cleaned} "
         matches: list[str] = []
         for label, phrases in NORMALIZATION_RULES:
             for phrase in phrases:
-                if f" {phrase} " in tokenized:
+                if re.search(rf"\b{re.escape(phrase)}\b", cleaned):
                     matches.append(label)
                     break
         unique_matches = sorted(set(matches))

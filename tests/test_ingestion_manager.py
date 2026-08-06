@@ -27,7 +27,7 @@ def _build_config(
     *,
     worker_count: int = 7,
     frame_queue_size: int = 20,
-    max_frames_per_camera: int = 10,
+    max_frames_per_camera: int | None = 10,
     stop_on_camera_error: bool = False,
 ) -> dict[str, object]:
     return {
@@ -199,3 +199,34 @@ def test_bounded_queue_timeout_does_not_deadlock_and_all_workers_stop_and_releas
     assert manager.all_workers_stopped() is True
     assert manager.readers_by_camera["CAM_001"].released is True
     assert manager.get_metrics()["queue_full_events"] >= 0
+
+
+def test_null_max_frames_per_camera_allows_full_video_processing(tmp_path: Path) -> None:
+    video_a = _create_test_video(tmp_path / "a.mp4", frame_count=6)
+    manager = MultiCameraIngestionManager(
+        _build_config(
+            [{"camera_id": "CAM_001", "source_type": "video", "source": str(video_a), "enabled": True}],
+            max_frames_per_camera=None,
+        ),
+        _logger(),
+    )
+
+    manager.start()
+    packets = _collect_all_packets(manager)
+    manager.stop()
+
+    assert len(packets) == 6
+    assert manager.max_frames_per_camera is None
+
+
+def test_invalid_and_negative_max_frames_per_camera_fail_clearly(tmp_path: Path) -> None:
+    video_a = _create_test_video(tmp_path / "a.mp4", frame_count=2)
+    for bad_value in ("all", "", -10, 0):
+        with pytest.raises(ConfigurationError, match="positive integer or null"):
+            MultiCameraIngestionManager(
+                _build_config(
+                    [{"camera_id": "CAM_001", "source_type": "video", "source": str(video_a), "enabled": True}],
+                    max_frames_per_camera=bad_value,  # type: ignore[arg-type]
+                ),
+                _logger(),
+            )

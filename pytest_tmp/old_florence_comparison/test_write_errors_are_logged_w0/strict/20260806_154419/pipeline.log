@@ -1,0 +1,13 @@
+2026-08-06 15:44:20 | INFO | pipeline | EvidenceCollector normalized best-overall weights={'confidence': 0.35, 'sharpness': 0.25, 'bbox_area': 0.2, 'centeredness': 0.1, 'edge_visibility': 0.1}
+2026-08-06 15:44:20 | INFO | pipeline | EvidenceCollector initialized enabled=True include_discarded_tracks=False fail_pipeline_on_error=True
+2026-08-06 15:44:20 | ERROR | pipeline | EvidenceCollector error camera_id=CAM_001 local_track_id=CAM_001:TRACK_1 frame_number=0 role=BEST_OVERALL,FIRST,HIGHEST_CONFIDENCE,LARGEST,LAST,MIDDLE,SHARPEST cache_size=1 error_class=OSError error=crop write failed
+Traceback (most recent call last):
+  File "D:\project\multi-camera-vehicle-tracking\src\evidence.py", line 598, in _save_selected_assets
+    crop_file = self.output_manager.save_evidence_crop(
+        track.camera_id,
+    ...<3 lines>...
+        jpeg_quality=self.config["jpeg_quality"],
+    )
+  File "D:\project\multi-camera-vehicle-tracking\tests\test_evidence.py", line 328, in _fail_crop
+    raise OSError("crop write failed")
+OSError: crop write failed

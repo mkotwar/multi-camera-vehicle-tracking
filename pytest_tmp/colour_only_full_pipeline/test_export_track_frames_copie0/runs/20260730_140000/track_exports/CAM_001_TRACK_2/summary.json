@@ -1,0 +1,12 @@
+{
+  "run_directory": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\colour_only_full_pipeline\\test_export_track_frames_copie0\\runs\\20260730_140000",
+  "local_track_id": "CAM_001:TRACK_2",
+  "camera_id": "CAM_001",
+  "frame_source": "tracked_frames",
+  "export_directory": "D:\\project\\multi-camera-vehicle-tracking\\pytest_tmp\\colour_only_full_pipeline\\test_export_track_frames_copie0\\runs\\20260730_140000\\track_exports\\CAM_001_TRACK_2",
+  "observation_count": 3,
+  "copied_frame_count": 2,
+  "missing_frame_count": 1,
+  "first_frame": 0,
+  "last_frame": 4
+}

@@ -49,6 +49,8 @@ class EvidenceAdapter:
             return None
 
         bbox_xyxy = tuple(float(item) for item in payload.get("bbox_xyxy", (0, 0, 0, 0)))
+        original_bbox_xyxy = tuple(float(item) for item in payload.get("original_bbox", bbox_xyxy))
+        expanded_crop_bbox_xyxy = tuple(float(item) for item in payload.get("expanded_crop_bbox", bbox_xyxy))
         frame_number = int(payload.get("frame_number", 0))
         timestamp_seconds = float(payload.get("timestamp_seconds", 0.0))
         source_image_path = self._pick_source_image(payload)
@@ -68,8 +70,15 @@ class EvidenceAdapter:
                 vehicle_crop_path=str(crop_path) if crop_path else None,
                 annotated_frame_path=str(annotated_frame_path) if annotated_frame_path else None,
                 bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
+                original_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
+                expanded_crop_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
                 evidence_role=str(payload.get("role", "UNKNOWN")),
                 detection_confidence=float(payload.get("confidence", 0.0)),
+                source_frame_width=int(payload.get("source_frame_width", 0)),
+                source_frame_height=int(payload.get("source_frame_height", 0)),
+                context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
+                original_crop_width=0,
+                original_crop_height=0,
                 crop_width=0,
                 crop_height=0,
                 crop_area=0,
@@ -96,8 +105,15 @@ class EvidenceAdapter:
                 vehicle_crop_path=str(crop_path) if crop_path else None,
                 annotated_frame_path=str(annotated_frame_path) if annotated_frame_path else None,
                 bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
+                original_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
+                expanded_crop_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
                 evidence_role=str(payload.get("role", "UNKNOWN")),
                 detection_confidence=float(payload.get("confidence", 0.0)),
+                source_frame_width=int(payload.get("source_frame_width", 0)),
+                source_frame_height=int(payload.get("source_frame_height", 0)),
+                context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
+                original_crop_width=0,
+                original_crop_height=0,
                 crop_width=0,
                 crop_height=0,
                 crop_area=0,
@@ -120,6 +136,9 @@ class EvidenceAdapter:
             if crop_path is None:
                 rejection_reasons.append("crop_extraction_failed")
 
+        fallback_dimensions = self._read_image_dimensions(crop_path)
+        original_crop_width = int(payload.get("original_crop_width", fallback_dimensions[0] if fallback_dimensions else 0))
+        original_crop_height = int(payload.get("original_crop_height", fallback_dimensions[1] if fallback_dimensions else 0))
         crop_width = max(0, int(round(clipped_bbox[2] - clipped_bbox[0])))
         crop_height = max(0, int(round(clipped_bbox[3] - clipped_bbox[1])))
         if crop_width <= 0 or crop_height <= 0:
@@ -135,8 +154,15 @@ class EvidenceAdapter:
             vehicle_crop_path=str(crop_path) if crop_path else None,
             annotated_frame_path=str(annotated_frame_path) if annotated_frame_path else None,
             bbox_xyxy=clipped_bbox,
+            original_bbox_xyxy=original_bbox_xyxy,
+            expanded_crop_bbox_xyxy=expanded_crop_bbox_xyxy,
             evidence_role=str(payload.get("role", "UNKNOWN")),
             detection_confidence=float(payload.get("confidence", 0.0)),
+            source_frame_width=int(payload.get("source_frame_width", source_size[0] if source_size else 0)),
+            source_frame_height=int(payload.get("source_frame_height", source_size[1] if source_size else 0)),
+            context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
+            original_crop_width=original_crop_width,
+            original_crop_height=original_crop_height,
             crop_width=crop_width,
             crop_height=crop_height,
             crop_area=crop_width * crop_height,
@@ -166,6 +192,13 @@ class EvidenceAdapter:
             "crop_path": record.crop_path,
             "annotated_frame_path": record.annotated_frame_path,
             "bbox_xyxy": record.bbox_xyxy,
+            "original_bbox": record.original_bbox_xyxy,
+            "expanded_crop_bbox": record.expanded_crop_bbox_xyxy,
+            "context_padding_ratio": record.context_padding_ratio,
+            "source_frame_width": record.source_frame_width,
+            "source_frame_height": record.source_frame_height,
+            "original_crop_width": record.original_crop_width,
+            "original_crop_height": record.original_crop_height,
             "sharpness_score": record.sharpness_score,
             "best_overall_score": record.best_overall_score,
         }
@@ -238,3 +271,13 @@ class EvidenceAdapter:
             crop,
             suffix=f"{str(role).upper()}_fallback",
         )
+
+    @staticmethod
+    def _read_image_dimensions(image_path: Path | None) -> tuple[int, int] | None:
+        if image_path is None or not image_path.exists():
+            return None
+        image = cv2.imread(str(image_path))
+        if image is None or image.size == 0:
+            return None
+        height, width = image.shape[:2]
+        return int(width), int(height)

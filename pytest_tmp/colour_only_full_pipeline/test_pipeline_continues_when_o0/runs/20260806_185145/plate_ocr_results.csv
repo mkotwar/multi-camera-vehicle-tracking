@@ -1,0 +1,2 @@
+camera_id,local_track_id,frame_index,vehicle_crop_path,plate_bbox,plate_crop_path,plate_detection_confidence,plate_quality_status,raw_ocr_response,normalized_plate_text,ocr_status,ocr_reason,inference_time_ms,adapter_loaded
+CAM_001,CAM_001:TRACK_1,,,,,,plate_quality_disabled,,,skipped,no_plate_detected,,False

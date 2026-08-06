@@ -1,0 +1,1 @@
+camera_id,local_track_id,evidence_role,crop_path,source_frame_width,source_frame_height,original_crop_width,original_crop_height,resolution_tier,sharpness,brightness,quality_score,eligible_for_body_type,eligible_for_colour,body_type_skip_reason,colour_skip_reason

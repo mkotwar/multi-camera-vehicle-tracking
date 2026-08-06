@@ -79,6 +79,8 @@ def _packet(frame_number: int, frame: np.ndarray, *, camera_id: str = "CAM_001")
         timestamp_seconds=frame_number / 10.0,
         source_fps=10.0,
         frame=frame,
+        source_frame_width=int(frame.shape[1]),
+        source_frame_height=int(frame.shape[0]),
         worker_id=0,
         captured_at="2026-07-30T00:00:00+00:00",
         source_type="video",
@@ -202,6 +204,7 @@ def test_register_and_finalize_track_creates_evidence_files_and_reuses_paths(tmp
     assert payload[0]["final_class"] == "motorcycle"
     assert collector.metrics["cache_frames_released"] == 1
     assert collector._frame_cache == {}
+    assert collector.metrics["cache_release_attempts"] >= 1
 
 
 def test_middle_highest_largest_sharpest_and_best_overall_selection_are_correct(tmp_path: Path) -> None:
@@ -328,12 +331,145 @@ def test_write_errors_are_logged_when_non_strict_and_raised_when_strict(tmp_path
     evidence = collector.finalize_track(track)
     assert evidence
     assert collector.metrics["errors"]
+    assert collector.metrics["errors"][0]["error_class"] == "OSError"
+    assert collector.metrics["errors"][0]["camera_id"] == "CAM_001"
 
     strict_collector, strict_output_manager = _collector(tmp_path / "strict", fail_pipeline_on_error=True)
     strict_collector.register_frame(_packet(0, frame), [_tracked(0)])
     monkeypatch.setattr(strict_output_manager, "save_evidence_crop", _fail_crop)
     with pytest.raises(PipelineRuntimeError):
         strict_collector.finalize_track(track)
+
+
+def test_exception_logging_captures_active_traceback_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    collector, output_manager = _collector(tmp_path, fail_pipeline_on_error=False)
+    frame = _make_frame()
+    collector.register_frame(_packet(0, frame), [_tracked(0)])
+    track = _track([_observation(0)])
+    logged = {}
+
+    def _capture(message, *args, **kwargs):
+        logged["message"] = message
+        logged["args"] = args
+        logged["exc_info"] = kwargs.get("exc_info")
+
+    def _fail_crop(*args, **kwargs):
+        raise OSError("crop write failed")
+
+    monkeypatch.setattr(output_manager, "save_evidence_crop", _fail_crop)
+    monkeypatch.setattr(collector.logger, "error", _capture)
+
+    collector.finalize_track(track)
+
+    assert "EvidenceCollector error" in logged["message"]
+    exc_info = logged["exc_info"]
+    assert exc_info is not None and exc_info is not False
+    assert exc_info[0] is OSError
+    assert str(exc_info[1]) == "crop write failed"
+    assert exc_info[2] is not None
+
+
+def test_frame_referenced_by_pending_other_track_is_not_released_early(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    packet = _packet(5, frame)
+    collector.register_frame(
+        packet,
+        [
+            _tracked(5, tracker_id=1),
+            _tracked(5, tracker_id=2),
+        ],
+    )
+    track_one = _track([_observation(5, tracker_id=1, local_track_id="CAM_001:TRACK_1")], local_track_id="CAM_001:TRACK_1", tracker_id=1)
+    track_two = _track([_observation(5, tracker_id=2, local_track_id="CAM_001:TRACK_2")], local_track_id="CAM_001:TRACK_2", tracker_id=2)
+
+    collector.finalize_track(track_one)
+
+    assert ("CAM_001", 5) in collector._frame_cache
+    assert collector.metrics["cache_release_deferred"] >= 1
+
+    collector.finalize_track(track_two)
+
+    assert ("CAM_001", 5) not in collector._frame_cache
+
+
+def test_finalize_tracks_batch_keeps_shared_frame_until_batch_completes(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    packet = _packet(12, frame)
+    collector.register_frame(packet, [_tracked(12, tracker_id=1), _tracked(12, tracker_id=2)])
+    track_one = _track([_observation(12, tracker_id=1, local_track_id="CAM_001:TRACK_1")], local_track_id="CAM_001:TRACK_1", tracker_id=1)
+    track_two = _track([_observation(12, tracker_id=2, local_track_id="CAM_001:TRACK_2")], local_track_id="CAM_001:TRACK_2", tracker_id=2)
+    observed_cache_presence: list[bool] = []
+    original_save = collector._save_selected_assets
+
+    def _wrapped_save(*args, **kwargs):
+        observed_cache_presence.append(("CAM_001", 12) in collector._frame_cache)
+        return original_save(*args, **kwargs)
+
+    collector._save_selected_assets = _wrapped_save  # type: ignore[method-assign]
+
+    evidence = collector.finalize_tracks([track_one, track_two])
+
+    assert evidence
+    assert observed_cache_presence == [True, True]
+    assert ("CAM_001", 12) not in collector._frame_cache
+
+
+def test_missing_frame_skips_only_affected_evidence_item_and_records_metrics(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path, fail_pipeline_on_error=False)
+    collector.register_frame(_packet(0, _make_frame(fill=40)), [_tracked(0, confidence=0.95)])
+    collector.register_frame(_packet(1, _make_frame(sharp=True, fill=90)), [_tracked(1, confidence=0.70)])
+    track = _track([
+        _observation(0, confidence=0.95),
+        _observation(1, confidence=0.70),
+    ])
+    collector._frame_cache.pop(("CAM_001", 0), None)
+
+    evidence = collector.finalize_track(track)
+
+    assert evidence
+    assert any(item.crop_path is None for item in evidence if item.frame_number == 0)
+    assert any(item.crop_path is not None for item in evidence if item.frame_number == 1)
+    assert collector.metrics["missing_cache_frame_count"] >= 1
+    assert collector.metrics["evidence_items_skipped_missing_frame"] >= 1
+    assert collector.metrics["tracks_with_partial_evidence"] >= 1
+    assert collector.metrics["errors"][0]["error_type"] == "missing_frame_from_cache"
+
+
+def test_pending_evidence_tracks_metric_reflects_shutdown_state(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    collector.register_frame(_packet(0, _make_frame()), [_tracked(0)])
+
+    assert collector.metrics["pending_evidence_tracks_at_shutdown"] == 1
+    assert collector.metrics["pending_frame_reference_count"] == 1
+
+
+def test_duplicate_same_frame_candidate_is_skipped_without_double_counting(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    packet = _packet(94, _make_frame())
+    detection = _tracked(94, tracker_id=30)
+
+    collector.register_frame(packet, [detection])
+    collector.register_frame(packet, [detection])
+
+    assert collector.metrics["duplicate_frame_candidates_skipped"] == 1
+    assert collector._frame_ref_counts[("CAM_001", 94)] == 1
+    assert len(collector._track_candidates["CAM_001:TRACK_30"]) == 1
+
+
+def test_missing_frame_fail_closed_raises_pipeline_runtime_error(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path, fail_pipeline_on_error=True)
+    collector.register_frame(_packet(0, _make_frame(fill=40)), [_tracked(0, confidence=0.95)])
+    collector.register_frame(_packet(1, _make_frame(sharp=True, fill=90)), [_tracked(1, confidence=0.70)])
+    track = _track([
+        _observation(0, confidence=0.95),
+        _observation(1, confidence=0.70),
+    ])
+    collector._frame_cache.pop(("CAM_001", 0), None)
+
+    with pytest.raises(PipelineRuntimeError, match="Evidence frame missing from cache"):
+        collector.finalize_track(track)
 
 
 def test_evidence_index_and_metrics_files_can_be_written_from_collector_results(tmp_path: Path) -> None:

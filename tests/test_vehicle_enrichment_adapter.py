@@ -48,6 +48,13 @@ def _record(crop_path: str | None, annotated_path: str | None, *, bbox=(10.0, 10
         crop_path=crop_path,
         annotated_frame_path=annotated_path,
         bbox_xyxy=bbox,
+        original_bbox_xyxy=bbox,
+        expanded_crop_bbox_xyxy=tuple(int(value) for value in bbox),
+        context_padding_ratio=0.0,
+        source_frame_width=120,
+        source_frame_height=80,
+        original_crop_width=int(bbox[2] - bbox[0]),
+        original_crop_height=int(bbox[3] - bbox[1]),
         sharpness_score=11.0,
         best_overall_score=0.75,
     )

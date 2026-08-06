@@ -7,9 +7,12 @@ import cv2
 import numpy as np
 import yaml
 
+import pytest
+
 import src.pipeline as pipeline_module
 from src.models import BBoxQualityDiagnostic, Detection, TrackedDetection
-from src.pipeline import run_pipeline
+from src.pipeline import _build_vehicle_colour_result_rows, _build_vehicle_colour_track_summary_rows, _load_raw_config, _validate_config, run_pipeline
+from src.vehicle_enrichment.schemas import TrackEnrichmentResult, VehicleBodyTypeResult, VehicleColourResult, AttributePrediction
 
 
 def _create_test_video(path: Path, *, fps: float = 10.0, frame_count: int = 5, width: int = 32, height: int = 24) -> Path:
@@ -87,12 +90,15 @@ class FakeVehicleDetectorTracker:
             (),
             {
                 "configured_device": "cpu",
+                "configured_dtype": "auto",
                 "resolved_device": "cpu",
+                "resolved_dtype": "float32",
                 "cuda_available": False,
                 "cuda_device_count": 0,
                 "cuda_device_name": None,
                 "torch_version": "test-torch",
                 "torch_cuda_version": None,
+                "reason": "CUDA unavailable because installed PyTorch build is CPU-only.",
             },
         )()
         self.metrics = {
@@ -124,7 +130,7 @@ def _write_config(
     cameras: list[dict[str, object]],
     output_root: str,
     model_path: str,
-    max_frames_per_camera: int = 3,
+    max_frames_per_camera: int | None = 3,
     worker_count: int = 7,
     frame_queue_size: int = 50,
     save_every_n_frames: int = 1,
@@ -275,6 +281,41 @@ def _write_config(
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
+def test_validate_config_accepts_null_max_frames_per_camera(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=4)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=None,
+    )
+
+    validated = _validate_config(_load_raw_config(config_path), config_path)
+
+    assert validated["input"]["max_frames_per_camera"] is None
+
+
+def test_validate_config_rejects_invalid_max_frames_per_camera_values(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    for bad_value in ("all", "", -10):
+        config_path = tmp_path / f"config_{str(bad_value).replace('-', 'neg')}.yaml"
+        _write_config(
+            config_path,
+            cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+            output_root=str(tmp_path / "runs"),
+            model_path=str(model_path),
+            max_frames_per_camera=bad_value,  # type: ignore[arg-type]
+        )
+        with pytest.raises(Exception, match="integer or null|positive integer or null"):
+            _validate_config(_load_raw_config(config_path), config_path)
+
+
 def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
     video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=5)
@@ -299,6 +340,7 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     evidence_metrics = json.loads((run_dir / "evidence_metrics.json").read_text(encoding="utf-8"))
     enrichment_results = json.loads((run_dir / "vehicle_enrichment.json").read_text(encoding="utf-8"))
     enrichment_metrics = json.loads((run_dir / "vehicle_enrichment_metrics.json").read_text(encoding="utf-8"))
+    validation_report = (run_dir / "vehicle_enrichment_validation_report.csv").read_text(encoding="utf-8")
     tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
     observations = (run_dir / "observations.csv").read_text(encoding="utf-8")
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -307,19 +349,25 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert run_id == run_dir.name
     assert summary["processed_frames"] == 3
     assert summary["configured_device"] == "cpu"
+    assert summary["configured_dtype"] == "auto"
     assert summary["resolved_device"] == "cpu"
+    assert summary["resolved_dtype"] == "float32"
     assert summary["cuda_available"] is False
     assert summary["cuda_device_name"] is None
     assert metrics["worker_count"] == 7
     assert metrics["enabled_camera_count"] == 1
     assert metadata["configured_device"] == "cpu"
+    assert metadata["configured_dtype"] == "auto"
     assert metadata["resolved_device"] == "cpu"
+    assert metadata["resolved_dtype"] == "float32"
     assert metadata["cuda_available"] is False
     assert metadata["cuda_device_count"] == 0
     assert metadata["cuda_device_name"] is None
     assert dt_metrics["detections_by_camera"]["CAM_001"] == 3
     assert dt_metrics["configured_device"] == "cpu"
+    assert dt_metrics["configured_dtype"] == "auto"
     assert dt_metrics["resolved_device"] == "cpu"
+    assert dt_metrics["resolved_dtype"] == "float32"
     assert dt_metrics["cuda_device_name"] is None
     assert bbox_metrics["accepted_detections"] == 3
     assert bbox_metrics["rejected_detections"] == 0
@@ -332,8 +380,36 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert enrichment_metrics["completed_tracks_received"] >= 1
     assert enrichment_metrics["florence_loaded"] is False
     assert enrichment_results[0]["vehicle_body_type"]["status"] == "disabled"
+    assert "predicted_colour" in validation_report
     assert tracks[0]["vehicle_enrichment"]["status"] in {"evidence_ready", "disabled", "no_evidence"}
     assert "CAM_001:TRACK_1" in observations
+
+
+def test_pipeline_supports_unlimited_frame_limit_and_logs_it(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=4)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    output_root = tmp_path / "runs"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(output_root),
+        model_path=str(model_path),
+        max_frames_per_camera=None,
+    )
+
+    exit_code, _run_id, run_directory = run_pipeline(str(config_path))
+    run_dir = Path(run_directory)
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    pipeline_log = (run_dir / "pipeline.log").read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert summary["processed_frames"] == 4
+    assert summary["max_frames_per_camera"] is None
+    assert summary["frame_limit_mode"] == "unlimited"
+    assert "Frame limit per camera: unlimited" in pipeline_log
 
 
 def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path: Path) -> None:
@@ -494,3 +570,60 @@ def test_enrichment_enabled_does_not_change_tracking_outputs(monkeypatch, tmp_pa
 
     assert comparable_enabled == comparable_disabled
     assert enabled_observations == disabled_observations
+
+
+def test_pipeline_builds_vehicle_colour_only_artifact_rows() -> None:
+    prediction = AttributePrediction(
+        attribute_name="vehicle_colour",
+        label="BLACK",
+        source_backend="base_florence",
+        source_model="model",
+        source_frame_number=12,
+        source_crop_path="crop.jpg",
+        raw_response="black",
+        confidence=None,
+        quality_weight=0.9,
+        inference_duration_ms=45.0,
+        status="completed",
+        reason="valid",
+    )
+    result = TrackEnrichmentResult(
+        local_track_id="TRACK_1",
+        camera_id="CAM_001",
+        vehicle_class="CAR",
+        vehicle_class_confidence=0.9,
+        vehicle_body_type=VehicleBodyTypeResult(label="UNKNOWN", status="disabled", source="base_florence", reason="disabled"),
+        vehicle_colour=VehicleColourResult(
+            label="BLACK",
+            predictions=[prediction],
+            status="completed",
+            source="base_florence",
+            reason=None,
+            task_prompt="<VQA>",
+            prompt_text="What colour is the vehicle?",
+        ),
+        vehicle_make=None,
+        vehicle_model=None,
+        plate_detected=False,
+        plate_colour=None,
+        registration_category=None,
+        plate_text=None,
+        status="completed",
+        attribute_backend="base_florence",
+        vehicle_attribute_inference_count=1,
+        evidence_used=[],
+        crop_level_captions=[{"crop_path": "crop.jpg", "frame_index": 12, "caption": "black"}],
+        crop_level_colours=[{"crop_path": "crop.jpg", "frame_index": 12, "normalized_colour": "BLACK", "status": "completed", "reason": "valid", "crop_source": "saved_vehicle_crop", "crop_available": True, "crop_skip_reason": None}],
+        crop_level_body_types=[{"crop_path": "crop.jpg", "frame_index": 12, "normalized_body_type": "UNKNOWN"}],
+        final_colour_reason="weighted_agreement",
+    )
+
+    crop_rows = _build_vehicle_colour_result_rows([result])
+    track_rows = _build_vehicle_colour_track_summary_rows([result])
+
+    assert crop_rows[0]["task_token"] == "<VQA>"
+    assert crop_rows[0]["prompt"] == "What colour is the vehicle?"
+    assert crop_rows[0]["parsed_colour"] == "BLACK"
+    assert crop_rows[0]["adapter_loaded"] is False
+    assert track_rows[0]["final_vehicle_colour"] == "BLACK"
+    assert track_rows[0]["colour_inference_count"] == 1

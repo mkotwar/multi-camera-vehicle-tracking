@@ -190,7 +190,8 @@ def run_profile_inference(
             "conf": tracker.confidence_threshold,
             "iou": tracker.iou_threshold,
             "imgsz": tracker.image_size,
-            "device": tracker.device,
+            "device": tracker.runtime_device_info.yolo_device,
+            "half": tracker.runtime_device_info.yolo_half,
             "agnostic_nms": tracker.agnostic_nms,
             "verbose": False,
         }
@@ -202,7 +203,8 @@ def run_profile_inference(
             "conf": tracker.confidence_threshold,
             "iou": tracker.iou_threshold,
             "imgsz": tracker.image_size,
-            "device": tracker.device,
+            "device": tracker.runtime_device_info.yolo_device,
+            "half": tracker.runtime_device_info.yolo_half,
             "verbose": False,
         }
         return tracker._model.predict(**predict_kwargs)[0], predict_kwargs  # noqa: SLF001
@@ -211,6 +213,8 @@ def run_profile_inference(
         call_kwargs = {
             "conf": tracker.confidence_threshold,
             "imgsz": tracker.image_size,
+            "device": tracker.runtime_device_info.yolo_device,
+            "half": tracker.runtime_device_info.yolo_half,
             "verbose": False,
         }
         model = tracker._model  # noqa: SLF001
@@ -220,6 +224,8 @@ def run_profile_inference(
             "source": packet.frame,
             "conf": tracker.confidence_threshold,
             "imgsz": tracker.image_size,
+            "device": tracker.runtime_device_info.yolo_device,
+            "half": tracker.runtime_device_info.yolo_half,
             "verbose": False,
         }
         return model.predict(**predict_kwargs)[0], predict_kwargs
@@ -596,6 +602,8 @@ def run_diagnostic(
                 timestamp_seconds=timestamp_seconds,
                 source_fps=fps,
                 frame=frame,
+                source_frame_width=int(frame.shape[1]),
+                source_frame_height=int(frame.shape[0]),
                 worker_id=0,
                 captured_at="diagnostic",
                 source_type="video",
