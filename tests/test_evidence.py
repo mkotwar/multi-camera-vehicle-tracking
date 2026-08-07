@@ -61,7 +61,10 @@ def _build_config(**evidence_overrides):
         "fail_pipeline_on_error": False,
     }
     evidence.update(evidence_overrides)
-    return {"evidence": evidence}
+    return {
+        "evidence": evidence,
+        "lifecycle": {"minimum_observations": 3},
+    }
 
 
 def _make_frame(width: int = 120, height: int = 80, *, sharp: bool = False, fill: int = 80) -> np.ndarray:
@@ -144,6 +147,7 @@ def _track(
     camera_id: str = "CAM_001",
     tracker_id: int = 1,
     final_class: str = "car",
+    completion_reason: str = "END_OF_STREAM",
 ) -> LocalTrack:
     return LocalTrack(
         local_track_id=local_track_id,
@@ -162,7 +166,7 @@ def _track(
         class_counts={final_class: len(observations)},
         class_confidence_sums={final_class: sum(item.confidence for item in observations)},
         observations=observations,
-        completion_reason="END_OF_STREAM",
+        completion_reason=completion_reason,
     )
 
 
@@ -258,14 +262,303 @@ def test_invalid_bbox_small_crop_and_empty_crop_are_rejected_without_crashing(tm
     )
     frame = _make_frame(width=40, height=40)
     collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(15.0, 15.0, 10.0, 25.0))])
+
+
+def test_capture_zone_captures_when_bottom_center_enters_zone(tmp_path: Path) -> None:
+    collector, output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.50,
+            "bottom_ratio": 0.80,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 3,
+            "minimum_frame_gap": 1,
+            "save_immediately": True,
+            "require_confirmed_track": False,
+            "minimum_bbox_width_pixels": 10,
+            "minimum_bbox_height_pixels": 10,
+        },
+    )
+    frame = _make_frame(width=120, height=100, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 10.0, 60.0, 40.0))])
+    collector.register_frame(_packet(1, frame), [_tracked(1, bbox_xyxy=(20.0, 30.0, 60.0, 65.0))])
+    track = _track([_observation(0, bbox_xyxy=(20.0, 10.0, 60.0, 40.0)), _observation(1, bbox_xyxy=(20.0, 30.0, 60.0, 65.0))])
+
+    evidence = collector.finalize_track(track)
+
+    zone_records = [item for item in evidence if isinstance(item, dict) and item.get("evidence_source") == "capture_zone"]
+    assert len(zone_records) == 1
+    assert Path(zone_records[0]["crop_path"]).is_file()
+    assert zone_records[0]["trigger_y"] == pytest.approx(65.0)
+    assert (output_manager.evidence_capture_zone_directory / "CAM_001" / "CAM_001_TRACK_1" / "frame_000001.jpg").exists()
+
+
+def test_capture_zone_respects_minimum_frame_gap_and_maximum_candidates(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.40,
+            "bottom_ratio": 0.90,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 2,
+            "minimum_frame_gap": 2,
+            "save_immediately": True,
+            "require_confirmed_track": False,
+            "minimum_bbox_width_pixels": 10,
+            "minimum_bbox_height_pixels": 10,
+        },
+    )
+    frame = _make_frame(width=120, height=100, sharp=True)
+    for frame_number in range(5):
+        collector.register_frame(_packet(frame_number, frame), [_tracked(frame_number, bbox_xyxy=(20.0, 30.0, 70.0, 75.0), confidence=0.6 + (frame_number * 0.05))])
+    track = _track([_observation(frame_number, bbox_xyxy=(20.0, 30.0, 70.0, 75.0), confidence=0.6 + (frame_number * 0.05)) for frame_number in range(5)])
+
+    evidence = collector.finalize_track(track)
+
+    zone_records = [item for item in evidence if isinstance(item, dict) and item.get("evidence_source") == "capture_zone"]
+    assert len(zone_records) <= 2
+    assert collector.metrics["capture_zone_duplicate_frame_suppressed"] >= 1
+
+
+def test_capture_zone_saved_crop_survives_without_frame_cache(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.40,
+            "bottom_ratio": 0.90,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 3,
+            "minimum_frame_gap": 1,
+            "save_immediately": True,
+            "require_confirmed_track": False,
+            "minimum_bbox_width_pixels": 10,
+            "minimum_bbox_height_pixels": 10,
+        },
+    )
+    frame = _make_frame(width=120, height=100, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 30.0, 70.0, 75.0))])
+    collector._frame_cache.clear()
+
+    evidence = collector.finalize_track(_track([_observation(0, bbox_xyxy=(20.0, 30.0, 70.0, 75.0))]))
+
+    zone_records = [item for item in evidence if isinstance(item, dict) and item.get("evidence_source") == "capture_zone"]
+    assert zone_records
+    assert Path(zone_records[0]["crop_path"]).is_file()
+
+
+def test_capture_zone_cleanup_removes_track_state(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.40,
+            "bottom_ratio": 0.90,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 3,
+            "minimum_frame_gap": 1,
+            "save_immediately": True,
+            "require_confirmed_track": False,
+            "minimum_bbox_width_pixels": 10,
+            "minimum_bbox_height_pixels": 10,
+        },
+    )
+    frame = _make_frame(width=120, height=100, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 30.0, 70.0, 75.0))])
+
+    collector.finalize_track(_track([_observation(0, bbox_xyxy=(20.0, 30.0, 70.0, 75.0))]))
+
+    assert collector.metrics["capture_zone_active_tracks"] == 0
     collector.register_frame(_packet(1, frame), [_tracked(1, bbox_xyxy=(1.0, 1.0, 8.0, 8.0))])
     collector.register_frame(
         _packet(2, frame),
         [_tracked(2, bbox_xyxy=(0.0, 0.0, 0.0, 0.0), confidence=0.7)],
     )
 
-    assert collector.metrics["invalid_candidates"] == 3
+    assert collector.metrics["invalid_candidates"] == 2
     assert collector.finalize_track(_track([_observation(0)], final_class="car")) == []
+
+
+def test_capture_zone_prefers_later_larger_motorcycle_crop(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.40,
+            "bottom_ratio": 0.90,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 2,
+            "minimum_frame_gap": 1,
+            "save_immediately": True,
+            "require_confirmed_track": False,
+            "minimum_bbox_width_pixels": 10,
+            "minimum_bbox_height_pixels": 10,
+        },
+    )
+    collector._vehicle_enrichment_evidence_config = {
+        "minimum_crop_width": 100,
+        "minimum_crop_height": 70,
+        "class_specific_minimums": {"motorcycle": {"minimum_crop_width": 120, "minimum_crop_height": 120}},
+    }
+    collector._vehicle_enrichment_florence_config = {
+        "default": {"minimum_original_width": 192, "minimum_original_height": 144},
+        "class_specific": {"motorcycle": {"minimum_original_width": 120, "minimum_original_height": 120}},
+    }
+    frame = _make_frame(width=300, height=220, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 70.0, 100.0, 173.0), raw_class_name="motorcycle")])
+    collector.register_frame(_packet(1, frame), [_tracked(1, bbox_xyxy=(20.0, 40.0, 150.0, 185.0), raw_class_name="motorcycle")])
+
+    evidence = collector.finalize_track(
+        _track(
+            [
+                _observation(0, bbox_xyxy=(20.0, 70.0, 100.0, 173.0), raw_class_name="motorcycle"),
+                _observation(1, bbox_xyxy=(20.0, 40.0, 150.0, 185.0), raw_class_name="motorcycle"),
+            ],
+            final_class="motorcycle",
+        )
+    )
+
+    zone_records = [item for item in evidence if isinstance(item, dict) and item.get("evidence_source") == "capture_zone"]
+    assert zone_records
+    assert max(record["original_crop_width"] for record in zone_records) >= 130
+    assert any(record["evidence_eligible"] is True for record in zone_records)
+
+
+def test_motorcycle_geometry_reports_never_reached_zone(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.60,
+            "bottom_ratio": 0.85,
+            "require_confirmed_track": False,
+        },
+    )
+    frame = _make_frame(width=200, height=200, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 20.0, 70.0, 90.0), raw_class_name="motorcycle")])
+    collector.finalize_track(_track([_observation(0, bbox_xyxy=(20.0, 20.0, 70.0, 90.0), raw_class_name="motorcycle")], final_class="motorcycle"))
+
+    row = collector.motorcycle_geometry_records[0]
+    assert row["max_trigger_y"] == pytest.approx(90.0)
+    assert row["zone_top"] == 120
+    assert row["geometry_status"] == "NEVER_REACHED_ZONE"
+    assert row["geometry_reason"] == "max_bottom_center_above_zone"
+
+
+def test_motorcycle_geometry_reports_lost_before_zone(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.70,
+            "bottom_ratio": 0.90,
+            "require_confirmed_track": False,
+        },
+    )
+    frame = _make_frame(width=200, height=200, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 30.0, 70.0, 100.0), raw_class_name="motorcycle")])
+    collector.finalize_track(
+        _track(
+            [_observation(0, bbox_xyxy=(20.0, 30.0, 70.0, 100.0), raw_class_name="motorcycle")],
+            final_class="motorcycle",
+            completion_reason="LOST_TIMEOUT",
+        )
+    )
+
+    row = collector.motorcycle_geometry_records[0]
+    assert row["geometry_status"] == "TRACK_ENDED_BEFORE_ZONE"
+    assert row["geometry_reason"] == "lost_timeout_before_zone"
+
+
+def test_motorcycle_specific_zone_is_used_after_class_becomes_stable(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "default": {"top_ratio": 0.70, "bottom_ratio": 0.90, "require_confirmed_track": False},
+            "class_specific": {
+                "motorcycle": {"top_ratio": 0.50, "bottom_ratio": 0.80, "require_confirmed_track": False},
+            },
+        },
+    )
+    frame = _make_frame(width=200, height=200, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 20.0, 70.0, 110.0), raw_class_name="motorcycle")])
+    collector.register_frame(_packet(1, frame), [_tracked(1, bbox_xyxy=(20.0, 20.0, 70.0, 130.0), raw_class_name="motorcycle")])
+    collector.register_frame(_packet(2, frame), [_tracked(2, bbox_xyxy=(20.0, 20.0, 70.0, 145.0), raw_class_name="motorcycle")])
+    collector.finalize_track(
+        _track(
+            [
+                _observation(0, bbox_xyxy=(20.0, 20.0, 70.0, 110.0), raw_class_name="motorcycle"),
+                _observation(1, bbox_xyxy=(20.0, 20.0, 70.0, 130.0), raw_class_name="motorcycle"),
+                _observation(2, bbox_xyxy=(20.0, 20.0, 70.0, 145.0), raw_class_name="motorcycle"),
+            ],
+            final_class="motorcycle",
+        )
+    )
+
+    row = collector.motorcycle_geometry_records[0]
+    assert row["first_zone_entry_frame"] == 2
+    assert row["zone_top"] == 100
+    assert row["entered_zone"] is True
+
+
+def test_capture_zone_geometry_report_is_saved_by_output_manager(tmp_path: Path) -> None:
+    collector, output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "top_ratio": 0.50,
+            "bottom_ratio": 0.80,
+            "require_confirmed_track": False,
+        },
+    )
+    frame = _make_frame(width=160, height=160, sharp=True)
+    collector.register_frame(_packet(0, frame), [_tracked(0, bbox_xyxy=(20.0, 20.0, 80.0, 120.0), raw_class_name="motorcycle")])
+    collector.finalize_track(_track([_observation(0, bbox_xyxy=(20.0, 20.0, 80.0, 120.0), raw_class_name="motorcycle")], final_class="motorcycle"))
+
+    path = output_manager.save_motorcycle_geometry_report(collector.motorcycle_geometry_records)
+
+    payload = path.read_text(encoding="utf-8")
+    assert path.name == "motorcycle_geometry_report.csv"
+    assert "local_track_id" in payload
+    assert "CAM_001:TRACK_1" in payload
+
+
+def test_track_192_style_case_reports_never_reached_zone(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        capture_zone={
+            "enabled": True,
+            "default": {"top_ratio": 0.68, "bottom_ratio": 0.85, "require_confirmed_track": False},
+            "class_specific": {
+                "motorcycle": {"top_ratio": 0.68, "bottom_ratio": 0.85, "require_confirmed_track": False},
+            },
+        },
+    )
+    frame = _make_frame(width=640, height=720, sharp=True)
+    observations = []
+    for frame_number, y2 in enumerate((420.625, 426.875, 433.125, 443.75, 444.0625), start=1152):
+        bbox = (200.0, float(y2 - 100.0), 280.0, float(y2))
+        collector.register_frame(_packet(frame_number, frame), [_tracked(frame_number, bbox_xyxy=bbox, raw_class_name="motorcycle", tracker_id=192)])
+        observations.append(_observation(frame_number, bbox_xyxy=bbox, raw_class_name="motorcycle", local_track_id="CAM_001:TRACK_192", tracker_id=192))
+    collector.finalize_track(
+        _track(
+            observations,
+            local_track_id="CAM_001:TRACK_192",
+            tracker_id=192,
+            final_class="motorcycle",
+            completion_reason="LOST_TIMEOUT",
+        )
+    )
+
+    row = collector.motorcycle_geometry_records[0]
+    assert row["local_track_id"] == "CAM_001:TRACK_192"
+    assert row["max_trigger_y"] == pytest.approx(444.0625)
+    assert row["zone_top"] == 489
+    assert row["entered_zone"] is False
+    assert row["geometry_status"] == "TRACK_ENDED_BEFORE_ZONE"
 
 
 def test_padding_is_clamped_to_frame_and_paths_are_separated_by_camera_and_track(tmp_path: Path) -> None:

@@ -136,6 +136,7 @@ def _write_config(
     save_every_n_frames: int = 1,
     max_saved_frames_per_camera: int = 5,
     stop_on_camera_error: bool = False,
+    debug_outputs: dict | None = None,
 ) -> None:
     payload = {
         "project": {"name": "test_project", "environment": "test", "log_level": "INFO"},
@@ -234,6 +235,7 @@ def _write_config(
             "tracked_frames": {"enabled": True, "save_every_n_frames": 1, "max_saved_frames_per_camera": 5},
         },
         "output": {"root_directory": output_root, "save_run_config": True},
+        "debug_outputs": debug_outputs or {"enabled": False},
         "vehicle_enrichment": {
             "enabled": True,
             "trigger": "track_completed",
@@ -314,6 +316,31 @@ def test_validate_config_rejects_invalid_max_frames_per_camera_values(tmp_path: 
         )
         with pytest.raises(Exception, match="integer or null|positive integer or null"):
             _validate_config(_load_raw_config(config_path), config_path)
+
+
+def test_validate_config_rejects_invalid_capture_zone_ratios(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config_invalid_capture_zone.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["evidence"]["capture_zone"] = {
+        "enabled": True,
+        "top_ratio": 0.80,
+        "bottom_ratio": 0.55,
+        "trigger_point": "bottom_center",
+    }
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(Exception, match="capture_zone"):
+        _validate_config(_load_raw_config(config_path), config_path)
 
 
 def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Path) -> None:
@@ -410,6 +437,64 @@ def test_pipeline_supports_unlimited_frame_limit_and_logs_it(monkeypatch, tmp_pa
     assert summary["max_frames_per_camera"] is None
     assert summary["frame_limit_mode"] == "unlimited"
     assert "Frame limit per camera: unlimited" in pipeline_log
+
+
+def test_pipeline_writes_motorcycle_geometry_report_summary_entry(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=3)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    output_root = tmp_path / "runs"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(output_root),
+        model_path=str(model_path),
+        max_frames_per_camera=3,
+    )
+
+    exit_code, _run_id, run_directory = run_pipeline(str(config_path))
+    run_dir = Path(run_directory)
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert (run_dir / "motorcycle_geometry_report.csv").exists()
+    assert summary["motorcycle_geometry"]["report_path"].endswith("motorcycle_geometry_report.csv")
+    assert summary["motorcycle_geometry"]["motorcycle_tracks_total"] == 0
+
+
+def test_pipeline_debug_outputs_write_numbered_directories(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=3)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    output_root = tmp_path / "runs"
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(output_root),
+        model_path=str(model_path),
+        max_frames_per_camera=3,
+        debug_outputs={
+            "enabled": True,
+            "extracted_frames": {"enabled": True, "save_every_n_frames": 1, "max_saved_frames_per_camera": 10},
+            "detected_frames": {"enabled": True, "save_every_n_frames": 1, "max_saved_frames_per_camera": 10},
+            "tracked_frames": {"enabled": True, "save_every_n_frames": 1, "max_saved_frames_per_camera": 10},
+            "track_crops": {"enabled": True, "save_every_n_frames": 1, "max_crops_per_track": 10},
+            "florence_selected_crops": {"enabled": True},
+        },
+    )
+
+    exit_code, _run_id, run_directory = run_pipeline(str(config_path))
+    run_dir = Path(run_directory)
+
+    assert exit_code == 0
+    assert (run_dir / "01_extracted_frames" / "CAM_001").exists()
+    assert (run_dir / "02_yolo_detected_frames" / "CAM_001").exists()
+    assert (run_dir / "03_tracked_frames" / "CAM_001").exists()
+    assert (run_dir / "04_track_crops" / "track_crop_manifest.csv").exists()
 
 
 def test_pipeline_succeeds_with_multiple_temporary_videos(monkeypatch, tmp_path: Path) -> None:

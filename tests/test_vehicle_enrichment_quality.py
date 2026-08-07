@@ -81,3 +81,61 @@ def test_border_penalty_clipping_penalty_and_role_bonus_affect_score(tmp_path: P
     assert best.quality_score > weaker.quality_score
     assert weaker.border_penalty == 0.8
     assert weaker.clipping_ratio == 0.5
+
+
+def test_motorcycle_uses_class_specific_thresholds(tmp_path: Path) -> None:
+    config = normalize_quality_config(
+        {
+            "evidence": {
+                "minimum_crop_width": 100,
+                "minimum_crop_height": 70,
+                "class_specific_minimums": {
+                    "motorcycle": {"minimum_crop_width": 120, "minimum_crop_height": 120},
+                },
+            }
+        }
+    )
+    evaluator = EvidenceQualityEvaluator(config)
+    image_path = _write_image(tmp_path / "motorcycle.jpg", np.full((145, 130, 3), 120, dtype=np.uint8))
+    item = _item(image_path)
+    item.vehicle_class = "motorcycle"
+    scored = evaluator.score_item(item)
+
+    assert scored.class_minimum_width == 120
+    assert scored.class_minimum_height == 120
+    assert scored.evidence_eligible is True
+
+
+def test_padded_square_does_not_override_original_size_eligibility(tmp_path: Path) -> None:
+    config = normalize_quality_config(
+        {
+            "evidence": {
+                "minimum_crop_width": 100,
+                "minimum_crop_height": 70,
+                "class_specific_minimums": {
+                    "motorcycle": {"minimum_crop_width": 120, "minimum_crop_height": 120},
+                },
+            },
+            "image_size_policy": {
+                "florence": {
+                    "default": {"minimum_original_width": 192, "minimum_original_height": 144},
+                    "class_specific": {"motorcycle": {"minimum_original_width": 120, "minimum_original_height": 120}},
+                }
+            },
+        }
+    )
+    evaluator = EvidenceQualityEvaluator(config)
+    image_path = _write_image(tmp_path / "padded.jpg", np.full((192, 192, 3), 120, dtype=np.uint8))
+    item = _item(image_path)
+    item.vehicle_class = "motorcycle"
+    item.original_crop_width = 80
+    item.original_crop_height = 103
+    scored = evaluator.score_item(item)
+
+    assert scored.crop_width == 192
+    assert scored.crop_height == 192
+    assert scored.original_crop_width == 80
+    assert scored.original_crop_height == 103
+    assert scored.evidence_eligible is False
+    assert scored.florence_eligible_for_colour is True
+    assert scored.colour_selection_tier == "low_resolution_fallback"

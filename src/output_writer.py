@@ -20,13 +20,26 @@ class RunOutputManager:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.run_id = self._generate_run_id()
         self.run_directory = self._create_run_directory(self.run_id)
+        self.extracted_frames_directory = self.run_directory / "01_extracted_frames"
+        self.yolo_detected_frames_directory = self.run_directory / "02_yolo_detected_frames"
+        self.tracked_debug_frames_directory = self.run_directory / "03_tracked_frames"
+        self.track_crops_directory = self.run_directory / "04_track_crops"
+        self.florence_selected_crops_directory = self.run_directory / "05_florence_selected_crops"
+        self.florence_results_directory = self.run_directory / "06_florence_results"
         self.evidence_directory = self.run_directory / "evidence"
         self.errors_directory = self.run_directory / "errors"
         self.raw_frames_directory = self.run_directory / "raw_frames"
         self.detected_frames_directory = self.run_directory / "detected_frames"
         self.tracked_frames_directory = self.run_directory / "tracked_frames"
         self.vehicle_enrichment_directory = self.run_directory / "vehicle_enrichment"
-        self.vehicle_enrichment_crops_directory = self.vehicle_enrichment_directory / "crops"
+        self.vehicle_enrichment_crops_directory = self.florence_selected_crops_directory
+        self.evidence_capture_zone_directory = self.run_directory / "evidence_capture_zone"
+        self.extracted_frames_directory.mkdir(parents=True, exist_ok=True)
+        self.yolo_detected_frames_directory.mkdir(parents=True, exist_ok=True)
+        self.tracked_debug_frames_directory.mkdir(parents=True, exist_ok=True)
+        self.track_crops_directory.mkdir(parents=True, exist_ok=True)
+        self.florence_selected_crops_directory.mkdir(parents=True, exist_ok=True)
+        self.florence_results_directory.mkdir(parents=True, exist_ok=True)
         self.evidence_directory.mkdir(parents=True, exist_ok=True)
         self.errors_directory.mkdir(parents=True, exist_ok=True)
         self.raw_frames_directory.mkdir(parents=True, exist_ok=True)
@@ -34,7 +47,19 @@ class RunOutputManager:
         self.tracked_frames_directory.mkdir(parents=True, exist_ok=True)
         self.vehicle_enrichment_directory.mkdir(parents=True, exist_ok=True)
         self.vehicle_enrichment_crops_directory.mkdir(parents=True, exist_ok=True)
+        self.evidence_capture_zone_directory.mkdir(parents=True, exist_ok=True)
+        self.debug_outputs_config: dict[str, Any] = {
+            "enabled": False,
+            "extracted_frames": {"enabled": False},
+            "detected_frames": {"enabled": False},
+            "tracked_frames": {"enabled": False},
+            "track_crops": {"enabled": False},
+            "florence_selected_crops": {"enabled": False},
+        }
         self._write_detected_frames_note()
+
+    def configure_debug_outputs(self, config: dict[str, Any]) -> None:
+        self.debug_outputs_config = dict(config or {})
 
     def _generate_run_id(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -55,6 +80,10 @@ class RunOutputManager:
             "raw_frames contains frames directly from ingestion.\n"
             "detected_frames contains YOLO-annotated frames.\n"
             "tracked_frames contains ByteTrack-native tracking annotations.\n",
+            encoding="utf-8",
+        )
+        (self.yolo_detected_frames_directory / "README.txt").write_text(
+            "02_yolo_detected_frames contains YOLO-annotated frames for debugging.\n",
             encoding="utf-8",
         )
 
@@ -130,6 +159,127 @@ class RunOutputManager:
     def save_evidence_metrics(self, metrics: dict[str, Any]) -> Path:
         path = self.run_directory / "evidence_metrics.json"
         path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return path
+
+    def save_capture_zone_index(self, records: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "evidence_capture_zone_index.json"
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        return path
+
+    def save_capture_zone_metrics(self, metrics: dict[str, Any]) -> Path:
+        path = self.run_directory / "evidence_capture_zone_metrics.json"
+        path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        return path
+
+    def save_motorcycle_geometry_report(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "motorcycle_geometry_report.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "source_frame_width",
+            "source_frame_height",
+            "first_frame",
+            "last_frame",
+            "observation_count",
+            "min_trigger_y",
+            "max_trigger_y",
+            "zone_top",
+            "zone_bottom",
+            "entered_zone",
+            "first_zone_entry_frame",
+            "last_zone_frame",
+            "zone_exit_frame",
+            "max_bbox_width",
+            "max_bbox_height",
+            "max_bbox_area",
+            "frame_of_max_trigger_y",
+            "frame_of_max_bbox_width",
+            "frame_of_max_bbox_height",
+            "frame_of_max_bbox_area",
+            "largest_saved_crop_width",
+            "largest_saved_crop_height",
+            "largest_saved_crop_frame",
+            "capture_candidates",
+            "retained_candidates",
+            "geometry_status",
+            "geometry_reason",
+            "final_class",
+            "stable_class_name",
+            "completion_reason",
+            "track_status",
+            "evidence_eligible_zone_crop",
+            "florence_eligible_zone_crop",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        return path
+
+    def save_track_crop_manifest(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.track_crops_directory / "track_crop_manifest.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "frame_number",
+            "timestamp_seconds",
+            "vehicle_class",
+            "confidence",
+            "bbox_x1",
+            "bbox_y1",
+            "bbox_x2",
+            "bbox_y2",
+            "crop_width",
+            "crop_height",
+            "crop_path",
+            "trigger_y",
+            "inside_capture_zone",
+            "capture_zone_top",
+            "capture_zone_bottom",
+            "evidence_eligible",
+            "evidence_rejection_reason",
+            "florence_eligible",
+            "florence_rejection_reason",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        return path
+
+    def save_vehicle_pipeline_trace(self, rows: list[dict[str, Any]]) -> Path:
+        path = self.run_directory / "vehicle_pipeline_trace.csv"
+        fieldnames = [
+            "camera_id",
+            "local_track_id",
+            "vehicle_class",
+            "detection_count",
+            "tracking_observation_count",
+            "raw_track_crop_count",
+            "preferred_crop_count",
+            "fallback_crop_count",
+            "selected_colour_crop_count",
+            "colour_selection_tier",
+            "capture_zone_entered",
+            "capture_zone_candidate_count",
+            "capture_zone_retained_count",
+            "evidence_candidate_count",
+            "evidence_eligible_count",
+            "florence_eligible_count",
+            "florence_selected_count",
+            "florence_call_count",
+            "valid_colour_prediction_count",
+            "final_colour",
+            "failure_stage",
+            "failure_reason",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
         return path
 
     def save_vehicle_enrichment(self, records: list[dict[str, Any]]) -> Path:
@@ -213,6 +363,7 @@ class RunOutputManager:
             "original_crop_width",
             "original_crop_height",
             "resolution_tier",
+            "selection_tier",
             "sharpness",
             "brightness",
             "quality_score",
@@ -273,6 +424,17 @@ class RunOutputManager:
         path.write_text(json.dumps(records, indent=2), encoding="utf-8")
         return path
 
+    def capture_zone_track_directory(self, camera_id: str, safe_local_track_id: str) -> Path:
+        path = self.evidence_capture_zone_directory / camera_id / safe_local_track_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_capture_zone_track_evidence(self, camera_id: str, safe_local_track_id: str, records: list[dict[str, Any]]) -> Path:
+        track_directory = self.capture_zone_track_directory(camera_id, safe_local_track_id)
+        path = track_directory / "evidence.json"
+        path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        return path
+
     def save_error(self, error_name: str, payload: dict[str, Any]) -> Path:
         path = self.errors_directory / f"{error_name}.json"
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -287,25 +449,40 @@ class RunOutputManager:
     ) -> Path:
         camera_directory = self.raw_frames_directory / packet.camera_id
         camera_directory.mkdir(parents=True, exist_ok=True)
+        debug_directory = self.extracted_frames_directory / packet.camera_id
+        debug_directory.mkdir(parents=True, exist_ok=True)
         frame_path = camera_directory / f"frame_{packet.frame_number:06d}.{image_format}"
+        debug_path = debug_directory / f"frame_{packet.frame_number:06d}.{image_format}"
         params: list[int] = []
         if image_format.lower() in {"jpg", "jpeg"}:
             params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
         cv2.imwrite(str(frame_path), packet.frame, params)
+        if bool(self.debug_outputs_config.get("enabled", False)) and bool(dict(self.debug_outputs_config.get("extracted_frames", {}) or {}).get("enabled", False)) and debug_path != frame_path:
+            cv2.imwrite(str(debug_path), packet.frame, params)
         return frame_path
 
     def save_detected_frame(self, camera_id: str, frame_number: int, frame: np.ndarray) -> Path:
         camera_directory = self.detected_frames_directory / camera_id
         camera_directory.mkdir(parents=True, exist_ok=True)
+        debug_directory = self.yolo_detected_frames_directory / camera_id
+        debug_directory.mkdir(parents=True, exist_ok=True)
         frame_path = camera_directory / f"frame_{frame_number:06d}.jpg"
+        debug_path = debug_directory / f"frame_{frame_number:06d}.jpg"
         cv2.imwrite(str(frame_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if bool(self.debug_outputs_config.get("enabled", False)) and bool(dict(self.debug_outputs_config.get("detected_frames", {}) or {}).get("enabled", False)) and debug_path != frame_path:
+            cv2.imwrite(str(debug_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         return frame_path
 
     def save_tracked_frame(self, camera_id: str, frame_number: int, frame: np.ndarray) -> Path:
         camera_directory = self.tracked_frames_directory / camera_id
         camera_directory.mkdir(parents=True, exist_ok=True)
+        debug_directory = self.tracked_debug_frames_directory / camera_id
+        debug_directory.mkdir(parents=True, exist_ok=True)
         frame_path = camera_directory / f"frame_{frame_number:06d}.jpg"
+        debug_path = debug_directory / f"frame_{frame_number:06d}.jpg"
         self._write_image(frame_path, frame, jpeg_quality=90)
+        if bool(self.debug_outputs_config.get("enabled", False)) and bool(dict(self.debug_outputs_config.get("tracked_frames", {}) or {}).get("enabled", False)) and debug_path != frame_path:
+            self._write_image(debug_path, frame, jpeg_quality=90)
         return frame_path
 
     def save_evidence_crop(
@@ -340,9 +517,25 @@ class RunOutputManager:
         self._write_image(path, frame, jpeg_quality=jpeg_quality)
         return path
 
+    def save_capture_zone_crop(
+        self,
+        camera_id: str,
+        safe_local_track_id: str,
+        frame_number: int,
+        crop: np.ndarray,
+        *,
+        jpeg_quality: int,
+    ) -> Path:
+        track_directory = self.capture_zone_track_directory(camera_id, safe_local_track_id)
+        path = track_directory / f"frame_{frame_number:06d}.jpg"
+        self._write_image(path, crop, jpeg_quality=jpeg_quality)
+        return path
+
     def vehicle_enrichment_track_directory(self, safe_local_track_id: str) -> Path:
-        normalized = safe_local_track_id.replace(":", "_")
-        path = self.vehicle_enrichment_crops_directory / normalized
+        parts = safe_local_track_id.split(":")
+        camera_id = parts[0] if parts else "UNKNOWN"
+        track_name = parts[-1] if parts else safe_local_track_id.replace(":", "_")
+        path = self.vehicle_enrichment_crops_directory / camera_id / track_name
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -361,6 +554,28 @@ class RunOutputManager:
         jpeg_quality: int = 90,
     ) -> Path:
         path = self.vehicle_enrichment_track_crop_path(safe_local_track_id, frame_number, suffix=suffix)
+        self._write_image(path, crop, jpeg_quality=jpeg_quality)
+        return path
+
+    def track_crop_track_directory(self, camera_id: str, safe_local_track_id: str) -> Path:
+        track_name = safe_local_track_id
+        if "_TRACK_" in safe_local_track_id:
+            track_name = f"TRACK_{safe_local_track_id.split('_TRACK_')[-1]}"
+        path = self.track_crops_directory / camera_id / track_name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_track_crop(
+        self,
+        camera_id: str,
+        safe_local_track_id: str,
+        frame_number: int,
+        crop: np.ndarray,
+        *,
+        jpeg_quality: int = 90,
+    ) -> Path:
+        track_directory = self.track_crop_track_directory(camera_id, safe_local_track_id)
+        path = track_directory / f"frame_{frame_number:06d}.jpg"
         self._write_image(path, crop, jpeg_quality=jpeg_quality)
         return path
 

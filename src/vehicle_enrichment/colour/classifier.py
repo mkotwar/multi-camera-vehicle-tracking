@@ -230,8 +230,8 @@ class VehicleColourClassifier:
         ]
         if not eligible_evidence:
             self._metrics["colour_tracks_skipped_small_crop"] += 1
-            self.logger.info("Colour skipped: %s -> crop below minimum size", request.local_track_id)
-            skipped = self._skipped_result("no_eligible_crops")
+            self.logger.info("Colour skipped: %s -> no readable crop", request.local_track_id)
+            skipped = self._skipped_result("no_readable_track_crop")
             skipped.aggregation_reason = self._no_evidence_reason(request.evidence_items)
             return skipped
 
@@ -470,14 +470,17 @@ class VehicleColourClassifier:
 
     def _is_evidence_item_eligible(self, evidence_item: Any) -> bool:
         original_width, original_height = self._original_dimensions(evidence_item)
-        tier = self.image_size_policy.florence.resolution_tier(original_width, original_height)
+        vehicle_class = str(getattr(evidence_item, "vehicle_class", "unknown") or "unknown")
+        tier = self.image_size_policy.florence.resolution_tier(original_width, original_height, vehicle_class)
+        crop_path = Path(str(getattr(evidence_item, "vehicle_crop_path", "") or ""))
+        if not str(crop_path):
+            return False
+        if original_width <= 0 or original_height <= 0:
+            return False
+        if any(reason in getattr(evidence_item, "rejection_reasons", []) for reason in ("invalid_bbox", "empty_crop")):
+            return False
         if tier == "below_minimum":
             self._metrics["colour_crops_below_minimum"] += 1
-            return False
-        if getattr(evidence_item, "rejection_reasons", []):
-            if any(reason in evidence_item.rejection_reasons for reason in ("crop_rejected_quality", "brightness_below_minimum", "brightness_above_maximum", "edge_truncation_above_maximum", "sharpness_below_minimum")):
-                self._metrics["colour_crops_rejected_quality"] += 1
-                return False
         if tier == "acceptable":
             self._metrics["colour_crops_acceptable"] += 1
         elif tier == "preferred":
@@ -525,15 +528,29 @@ class VehicleColourClassifier:
     def _no_evidence_reason(self, evidence_items: list[Any]) -> str:
         if not evidence_items:
             return "no_track_evidence"
+        if all(not self._is_readable_crop(item) for item in evidence_items):
+            return "NO_READABLE_TRACK_CROP"
         if all(not self._is_dimension_eligible(item) for item in evidence_items):
-            return "all_crops_below_minimum"
+            return "only_low_resolution_fallback_crops_available"
         if all("crop_rejected_quality" in getattr(item, "rejection_reasons", []) for item in evidence_items):
-            return "all_crops_failed_quality"
-        return "no_eligible_track_evidence"
+            return "only_quality_penalized_crops_available"
+        return "no_readable_track_crop"
 
     def _is_dimension_eligible(self, evidence_item: Any) -> bool:
         original_width, original_height = self._original_dimensions(evidence_item)
-        return self.image_size_policy.florence.is_eligible(original_width, original_height)
+        vehicle_class = str(getattr(evidence_item, "vehicle_class", "unknown") or "unknown")
+        return self.image_size_policy.florence.is_eligible(original_width, original_height, vehicle_class)
+
+    @staticmethod
+    def _is_readable_crop(evidence_item: Any) -> bool:
+        crop_path = Path(str(getattr(evidence_item, "vehicle_crop_path", "") or ""))
+        width = int(getattr(evidence_item, "original_crop_width", 0) or getattr(evidence_item, "crop_width", 0) or 0)
+        height = int(getattr(evidence_item, "original_crop_height", 0) or getattr(evidence_item, "crop_height", 0) or 0)
+        if not str(crop_path) or width <= 0 or height <= 0:
+            return False
+        if any(reason in getattr(evidence_item, "rejection_reasons", []) for reason in ("invalid_bbox", "empty_crop")):
+            return False
+        return True
 
     @staticmethod
     def _original_dimensions(evidence_item: Any) -> tuple[int, int]:

@@ -74,6 +74,7 @@ class EvidenceAdapter:
                 expanded_crop_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
                 evidence_role=str(payload.get("role", "UNKNOWN")),
                 detection_confidence=float(payload.get("confidence", 0.0)),
+                vehicle_class=str(payload.get("final_class", payload.get("raw_class_name", "UNKNOWN")) or "UNKNOWN"),
                 source_frame_width=int(payload.get("source_frame_width", 0)),
                 source_frame_height=int(payload.get("source_frame_height", 0)),
                 context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
@@ -87,6 +88,7 @@ class EvidenceAdapter:
                 border_penalty=1.0,
                 clipping_ratio=1.0,
                 quality_score=0.0,
+                evidence_source=str(payload.get("evidence_source", "existing_track_evidence")),
                 rejection_reasons=rejection_reasons,
             )
 
@@ -109,6 +111,7 @@ class EvidenceAdapter:
                 expanded_crop_bbox_xyxy=(0.0, 0.0, 0.0, 0.0),
                 evidence_role=str(payload.get("role", "UNKNOWN")),
                 detection_confidence=float(payload.get("confidence", 0.0)),
+                vehicle_class=str(payload.get("final_class", payload.get("raw_class_name", "UNKNOWN")) or "UNKNOWN"),
                 source_frame_width=int(payload.get("source_frame_width", 0)),
                 source_frame_height=int(payload.get("source_frame_height", 0)),
                 context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
@@ -122,6 +125,7 @@ class EvidenceAdapter:
                 border_penalty=1.0,
                 clipping_ratio=1.0,
                 quality_score=0.0,
+                evidence_source=str(payload.get("evidence_source", "existing_track_evidence")),
                 rejection_reasons=rejection_reasons,
             )
 
@@ -158,6 +162,7 @@ class EvidenceAdapter:
             expanded_crop_bbox_xyxy=expanded_crop_bbox_xyxy,
             evidence_role=str(payload.get("role", "UNKNOWN")),
             detection_confidence=float(payload.get("confidence", 0.0)),
+            vehicle_class=str(payload.get("final_class", payload.get("raw_class_name", "UNKNOWN")) or "UNKNOWN"),
             source_frame_width=int(payload.get("source_frame_width", source_size[0] if source_size else 0)),
             source_frame_height=int(payload.get("source_frame_height", source_size[1] if source_size else 0)),
             context_padding_ratio=float(payload.get("context_padding_ratio", 0.0)),
@@ -171,6 +176,11 @@ class EvidenceAdapter:
             border_penalty=border_penalty if source_size is not None else 1.0,
             clipping_ratio=clipping_ratio,
             quality_score=0.0,
+            evidence_source=str(payload.get("evidence_source", "existing_track_evidence")),
+            trigger_x=float(payload.get("trigger_x")) if payload.get("trigger_x") is not None else None,
+            trigger_y=float(payload.get("trigger_y")) if payload.get("trigger_y") is not None else None,
+            zone_top=int(payload.get("zone_top")) if payload.get("zone_top") is not None else None,
+            zone_bottom=int(payload.get("zone_bottom")) if payload.get("zone_bottom") is not None else None,
             rejection_reasons=rejection_reasons,
         )
 
@@ -201,6 +211,7 @@ class EvidenceAdapter:
             "original_crop_height": record.original_crop_height,
             "sharpness_score": record.sharpness_score,
             "best_overall_score": record.best_overall_score,
+            "evidence_source": "existing_track_evidence",
         }
 
     def _pick_source_image(self, payload: dict[str, Any]) -> Path | None:

@@ -82,6 +82,8 @@ class BaseFlorenceVehicleAttributesFlow:
             "vehicle_attribute_total_colour_inference_ms": 0.0,
             "vehicle_attribute_average_colour_inference_time_ms": 0.0,
             "vehicle_attribute_skipped_missing_crop": 0,
+            "vehicle_attribute_tracks_with_fallback_selected": 0,
+            "vehicle_attribute_tracks_with_zero_florence_calls": 0,
             "gpu_memory_before_attribute_load_mb": 0.0,
             "gpu_memory_after_attribute_load_mb": 0.0,
         }
@@ -108,15 +110,14 @@ class BaseFlorenceVehicleAttributesFlow:
             raise RuntimeError("Vehicle attribute flow must use base Florence without the OCR_MUKUL adapter.")
 
         selected_items = list(request.evidence_items[: self.maximum_crops_per_track])
+        if any(str(getattr(item, "colour_selection_tier", "") or "") == "low_resolution_fallback" for item in selected_items):
+            self._metrics["vehicle_attribute_tracks_with_fallback_selected"] += 1
         body_predictions: list[AttributePrediction] = []
         colour_predictions: list[AttributePrediction] = []
         crop_rows: list[dict[str, Any]] = []
         raw_responses: list[str] = []
+        local_inference_count = 0
         for item in selected_items:
-            original_width = int(getattr(item, "original_crop_width", 0) or 0)
-            original_height = int(getattr(item, "original_crop_height", 0) or 0)
-            if not self.image_size_policy.florence.is_eligible(original_width, original_height):
-                continue
             try:
                 response_payload = self._infer_single_crop(item)
             except Exception as exc:
@@ -148,6 +149,7 @@ class BaseFlorenceVehicleAttributesFlow:
                         "crop_source": self._resolve_crop_source(item),
                         "crop_available": False,
                         "crop_skip_reason": "missing_crop",
+                        "selection_tier": str(getattr(item, "colour_selection_tier", "") or ""),
                     }
                 )
                 continue
@@ -164,6 +166,7 @@ class BaseFlorenceVehicleAttributesFlow:
             self._metrics["vehicle_attribute_inference_calls"] += 1
             self._metrics["vehicle_attribute_colour_inference_calls"] += 1
             self._metrics["vehicle_attribute_total_colour_inference_ms"] += float(response_payload["inference_time_ms"])
+            local_inference_count += 1
             self._count_response_reason(colour_reason)
             body_prediction: AttributePrediction | None = None
             if self.body_type_enabled:
@@ -194,6 +197,7 @@ class BaseFlorenceVehicleAttributesFlow:
                     "crop_source": self._resolve_crop_source(item),
                     "crop_available": True,
                     "crop_skip_reason": None,
+                    "selection_tier": str(getattr(item, "colour_selection_tier", "") or ""),
                 }
             )
 
@@ -219,6 +223,7 @@ class BaseFlorenceVehicleAttributesFlow:
         self._metrics["vehicle_attribute_unknown_body_type"] += int(self.body_type_enabled and body_label == VEHICLE_BODY_TYPE_UNKNOWN)
         self._metrics["vehicle_attribute_valid_colour"] += int(colour_label != VEHICLE_COLOUR_UNKNOWN)
         self._metrics["vehicle_attribute_unknown_colour"] += int(colour_label == VEHICLE_COLOUR_UNKNOWN)
+        self._metrics["vehicle_attribute_tracks_with_zero_florence_calls"] += int(not colour_predictions)
         return VehicleAttributeFlowResult(
             body_type=(
                 VehicleBodyTypeResult(
@@ -251,7 +256,7 @@ class BaseFlorenceVehicleAttributesFlow:
                 prompt_text=self.colour_prompt,
             ),
             crop_level_rows=crop_rows,
-            inference_count=int(self._metrics["vehicle_attribute_colour_inference_calls"]),
+            inference_count=int(local_inference_count),
             adapter_loaded=False,
             raw_responses=raw_responses,
         )

@@ -166,3 +166,34 @@ def test_vehicle_attribute_flow_skips_missing_crop_safely(tmp_path: Path) -> Non
     assert flow.metrics["vehicle_attribute_skipped_missing_crop"] == 1
     assert result.crop_level_rows[0]["crop_available"] is False
     assert result.crop_level_rows[0]["crop_skip_reason"] == "missing_crop"
+
+
+def test_vehicle_attribute_flow_uses_low_resolution_fallback_crop(tmp_path: Path) -> None:
+    backend = _FakeBackend()
+    request = _request(tmp_path)
+    request.evidence_items[0].original_crop_width = 79
+    request.evidence_items[0].original_crop_height = 101
+    request.evidence_items[0].resolution_tier = "below_minimum"
+    request.evidence_items[0].colour_selection_tier = "low_resolution_fallback"
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {"enabled": True, "task_token": "<VQA>", "prompt": "What colour is the vehicle?"},
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+
+    result = flow.classify(request)
+
+    assert result.colour.label == "BLACK"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 1
+    assert result.crop_level_rows[0]["selection_tier"] == "low_resolution_fallback"

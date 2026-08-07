@@ -261,7 +261,8 @@ class VehicleBodyTypeClassifier:
 
     def _is_evidence_item_eligible(self, evidence_item: Any) -> bool:
         original_width, original_height = self._original_dimensions(evidence_item)
-        tier = self.image_size_policy.florence.resolution_tier(original_width, original_height)
+        vehicle_class = str(getattr(evidence_item, "vehicle_class", "unknown") or "unknown")
+        tier = self.image_size_policy.florence.resolution_tier(original_width, original_height, vehicle_class)
         if tier == "below_minimum":
             self._metrics["body_type_crops_below_minimum"] += 1
             return False
@@ -319,7 +320,8 @@ class VehicleBodyTypeClassifier:
 
     def _is_dimension_eligible(self, evidence_item: Any) -> bool:
         original_width, original_height = self._original_dimensions(evidence_item)
-        return self.image_size_policy.florence.is_eligible(original_width, original_height)
+        vehicle_class = str(getattr(evidence_item, "vehicle_class", "unknown") or "unknown")
+        return self.image_size_policy.florence.is_eligible(original_width, original_height, vehicle_class)
 
     @staticmethod
     def _original_dimensions(evidence_item: Any) -> tuple[int, int]:

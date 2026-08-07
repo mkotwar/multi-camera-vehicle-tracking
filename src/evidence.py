@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+import os
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +49,116 @@ class _StoredCandidate:
     crop_bbox_xyxy: tuple[int, int, int, int]
 
 
+@dataclass(slots=True)
+class _CaptureZoneStoredCandidate:
+    candidate: EvidenceCandidate
+    crop_bbox_xyxy: tuple[int, int, int, int]
+    crop_path: str
+    trigger_x: float
+    trigger_y: float
+    zone_top: int
+    zone_bottom: int
+
+
+@dataclass(slots=True)
+class _CaptureZoneTrackState:
+    entered_zone: bool = False
+    exited_zone: bool = False
+    observation_count: int = 0
+    last_position: str = "unknown"
+    last_capture_frame: int | None = None
+    retained_candidates: list[_CaptureZoneStoredCandidate] = field(default_factory=list)
+    first_frame: int | None = None
+    last_frame: int | None = None
+    minimum_trigger_y: float | None = None
+    maximum_trigger_y: float | None = None
+    frame_of_max_trigger_y: int | None = None
+    maximum_bbox_width: int = 0
+    frame_of_max_bbox_width: int | None = None
+    maximum_bbox_height: int = 0
+    frame_of_max_bbox_height: int | None = None
+    maximum_bbox_area: int = 0
+    frame_of_max_bbox_area: int | None = None
+    first_zone_entry_frame: int | None = None
+    last_zone_frame: int | None = None
+    zone_exit_frame: int | None = None
+    zone_top_pixels: int | None = None
+    zone_bottom_pixels: int | None = None
+    capture_zone_candidate_count: int = 0
+    capture_zone_retained_count: int = 0
+    largest_saved_crop_width: int = 0
+    largest_saved_crop_height: int = 0
+    largest_saved_crop_frame: int | None = None
+    class_counts: dict[str, int] = field(default_factory=dict)
+    class_confidence_sums: dict[str, float] = field(default_factory=dict)
+    stable_class_name: str = "unknown"
+    source_frame_width: int = 0
+    source_frame_height: int = 0
+
+
+@dataclass(slots=True)
+class _CaptureZoneGeometryRecord:
+    camera_id: str
+    local_track_id: str
+    source_frame_width: int
+    source_frame_height: int
+    first_frame: int
+    last_frame: int
+    observation_count: int
+    min_trigger_y: float
+    max_trigger_y: float
+    zone_top: int
+    zone_bottom: int
+    entered_zone: bool
+    first_zone_entry_frame: int | None
+    last_zone_frame: int | None
+    zone_exit_frame: int | None
+    max_bbox_width: int
+    max_bbox_height: int
+    max_bbox_area: int
+    frame_of_max_trigger_y: int | None
+    frame_of_max_bbox_width: int | None
+    frame_of_max_bbox_height: int | None
+    frame_of_max_bbox_area: int | None
+    largest_saved_crop_width: int
+    largest_saved_crop_height: int
+    largest_saved_crop_frame: int | None
+    capture_candidates: int
+    retained_candidates: int
+    geometry_status: str
+    geometry_reason: str
+    final_class: str
+    stable_class_name: str
+    completion_reason: str | None
+    track_status: str
+    evidence_eligible_zone_crop: bool
+    florence_eligible_zone_crop: bool
+
+
 class EvidenceCollector:
     def __init__(self, config: dict[str, Any], logger: Any, output_manager: RunOutputManager) -> None:
         self.logger = logger
         self.output_manager = output_manager
         self.config = self._validate_config(config.get("evidence", {}))
+        self._confirmed_track_minimum_observations = int(dict(config.get("lifecycle", {}) or {}).get("minimum_observations", 3))
+        track_class_config = dict(config.get("track_class", {}) or {})
+        self._track_class_minimum_observations = int(track_class_config.get("minimum_observations", 3))
+        self._track_class_minimum_winner_ratio = float(track_class_config.get("minimum_winner_ratio", 0.60))
+        self._vehicle_enrichment_evidence_config = dict(dict(config.get("vehicle_enrichment", {}) or {}).get("evidence", {}) or {})
+        self._vehicle_enrichment_florence_config = dict(dict(dict(config.get("vehicle_enrichment", {}) or {}).get("image_size_policy", {}) or {}).get("florence", {}) or {})
+        debug_outputs = dict(config.get("debug_outputs", {}) or {})
+        track_crops_debug = dict(debug_outputs.get("track_crops", {}) or {})
+        self._debug_track_crops_enabled = bool(debug_outputs.get("enabled", False) and track_crops_debug.get("enabled", False))
+        self._debug_track_crops_save_every_n_frames = max(1, int(track_crops_debug.get("save_every_n_frames", 3)))
+        self._debug_track_crops_max_per_track = max(1, int(track_crops_debug.get("max_crops_per_track", 100)))
         self.enabled = bool(self.config["enabled"])
         self._track_candidates: dict[str, list[_StoredCandidate]] = {}
+        self._capture_zone_candidates: dict[str, list[_CaptureZoneStoredCandidate]] = {}
+        self._capture_zone_state: dict[str, _CaptureZoneTrackState] = {}
+        self._capture_zone_index: list[dict[str, Any]] = []
+        self._motorcycle_geometry_records: list[_CaptureZoneGeometryRecord] = []
+        self._debug_track_crop_rows: list[dict[str, Any]] = []
+        self._debug_track_crop_counts: dict[str, int] = {}
         self._frame_cache: dict[tuple[str, int], np.ndarray] = {}
         self._frame_ref_counts: dict[tuple[str, int], int] = {}
         self._evidence_index: list[dict[str, Any]] = []
@@ -98,6 +202,27 @@ class EvidenceCollector:
             "evidence_crop_height_max": 0,
             "evidence_crop_height_average": 0.0,
             "errors": [],
+            "capture_zone_tracks_entered": 0,
+            "capture_zone_candidate_attempts": 0,
+            "capture_zone_candidates_saved": 0,
+            "capture_zone_candidates_replaced": 0,
+            "capture_zone_candidates_replaced_by_larger_crop": 0,
+            "capture_zone_candidates_replaced_by_better_quality": 0,
+            "capture_zone_tracks_with_saved_evidence": 0,
+            "capture_zone_tracks_without_saved_evidence": 0,
+            "capture_zone_invalid_bbox_count": 0,
+            "capture_zone_too_small_count": 0,
+            "capture_zone_candidates_too_small": 0,
+            "capture_zone_candidates_rejected_by_class_threshold": 0,
+            "capture_zone_duplicate_frame_suppressed": 0,
+            "capture_zone_crops_used_by_enrichment": 0,
+            "capture_zone_fallback_to_existing_evidence": 0,
+            "capture_zone_missing_saved_crop": 0,
+            "capture_zone_motorcycle_candidates": 0,
+            "capture_zone_motorcycle_eligible_candidates": 0,
+            "capture_zone_motorcycle_tracks_with_evidence": 0,
+            "capture_zone_motorcycle_florence_calls": 0,
+            "capture_zone_motorcycle_valid_colours": 0,
         }
         self._unique_crop_paths: set[str] = set()
         self._unique_annotated_paths: set[str] = set()
@@ -107,10 +232,22 @@ class EvidenceCollector:
             self.config["include_discarded_tracks"],
             self.config["fail_pipeline_on_error"],
         )
+        capture_zone = self.config["capture_zone"]
+        self.logger.info(
+            "Evidence capture zone initialized enabled=%s top_ratio=%.2f bottom_ratio=%.2f trigger_point=%s",
+            capture_zone["enabled"],
+            capture_zone["top_ratio"],
+            capture_zone["bottom_ratio"],
+            capture_zone["trigger_point"],
+        )
 
     @property
     def evidence_index(self) -> list[dict[str, Any]]:
         return [dict(item) for item in self._evidence_index]
+
+    @property
+    def capture_zone_index(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._capture_zone_index]
 
     @property
     def metrics(self) -> dict[str, Any]:
@@ -122,7 +259,16 @@ class EvidenceCollector:
         metrics["errors"] = list(self._metrics["errors"])
         metrics["pending_evidence_tracks_at_shutdown"] = len(self._track_candidates)
         metrics["pending_frame_reference_count"] = int(sum(self._frame_ref_counts.values()))
+        metrics["capture_zone_active_tracks"] = len(self._capture_zone_state)
         return metrics
+
+    @property
+    def motorcycle_geometry_records(self) -> list[dict[str, Any]]:
+        return [asdict(item) for item in self._motorcycle_geometry_records]
+
+    @property
+    def debug_track_crop_rows(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._debug_track_crop_rows]
 
     def register_frame(self, frame_packet: FramePacket, tracked_detections: list[TrackedDetection]) -> None:
         if not self.enabled or not tracked_detections:
@@ -162,6 +308,7 @@ class EvidenceCollector:
                 self._metrics["candidate_crops_rejected"] += 1
                 if frame_cached and self._frame_ref_counts.get(frame_key, 0) <= 0:
                     self._frame_cache.pop(frame_key, None)
+        self._register_capture_zone_frame(frame_packet, tracked_detections)
 
     def _retain_candidate(self, local_track_id: str, candidate_entry: _StoredCandidate) -> bool:
         existing_candidates = self._track_candidates.setdefault(local_track_id, [])
@@ -243,7 +390,9 @@ class EvidenceCollector:
 
     def finalize_track(self, track: LocalTrack) -> list[TrackEvidence]:
         candidates = self._track_candidates.pop(track.local_track_id, [])
-        return self._finalize_track_with_candidates(track, candidates, release_candidates_immediately=True)
+        zone_records = self._finalize_capture_zone_track(track)
+        finalized = self._finalize_track_with_candidates(track, candidates, release_candidates_immediately=True)
+        return finalized + zone_records
 
     def finalize_tracks(self, tracks: list[LocalTrack]) -> list[TrackEvidence]:
         evidence: list[TrackEvidence] = []
@@ -253,6 +402,7 @@ class EvidenceCollector:
                 candidates = self._track_candidates.pop(track.local_track_id, [])
                 candidates_to_release.extend(candidates)
                 evidence.extend(self._finalize_track_with_candidates(track, candidates, release_candidates_immediately=False))
+                evidence.extend(self._finalize_capture_zone_track(track))
             return evidence
         finally:
             self._release_candidates(candidates_to_release)
@@ -331,6 +481,7 @@ class EvidenceCollector:
     def _validate_config(self, evidence: Any) -> dict[str, Any]:
         payload = dict(evidence or {})
         weights = dict(payload.get("best_overall_weights", {}) or {})
+        capture_zone_payload = dict(payload.get("capture_zone", {}) or {})
         normalized = {
             "enabled": bool(payload.get("enabled", True)),
             "collect_first": bool(payload.get("collect_first", True)),
@@ -385,8 +536,547 @@ class EvidenceCollector:
         if weight_sum <= 0.0:
             raise ConfigurationError("evidence.best_overall_weights sum must be greater than zero.")
         normalized["best_overall_weights"] = {name: value / weight_sum for name, value in raw_weights.items()}
+        normalized["capture_zone"] = self._normalize_capture_zone_config(
+            capture_zone_payload,
+            default_minimum_width=normalized["minimum_crop_width_pixels"],
+            default_minimum_height=normalized["minimum_crop_height_pixels"],
+        )
+        capture_zone = normalized["capture_zone"]
         self.logger.info("EvidenceCollector normalized best-overall weights=%s", normalized["best_overall_weights"])
         return normalized
+
+    def _normalize_capture_zone_config(
+        self,
+        payload: dict[str, Any],
+        *,
+        default_minimum_width: int,
+        default_minimum_height: int,
+    ) -> dict[str, Any]:
+        def _normalize_profile(profile_payload: dict[str, Any], fallback: dict[str, Any], context: str) -> dict[str, Any]:
+            profile = {
+                "top_ratio": float(profile_payload.get("top_ratio", fallback["top_ratio"])),
+                "bottom_ratio": float(profile_payload.get("bottom_ratio", fallback["bottom_ratio"])),
+                "trigger_point": str(profile_payload.get("trigger_point", fallback["trigger_point"])).strip() or "bottom_center",
+                "maximum_saved_candidates_per_track": int(profile_payload.get("maximum_saved_candidates_per_track", fallback["maximum_saved_candidates_per_track"])),
+                "minimum_frame_gap": max(0, int(profile_payload.get("minimum_frame_gap", fallback["minimum_frame_gap"]))),
+                "capture_policy": str(profile_payload.get("capture_policy", fallback["capture_policy"])).strip() or "best_quality",
+                "save_immediately": bool(profile_payload.get("save_immediately", fallback["save_immediately"])),
+                "require_confirmed_track": bool(profile_payload.get("require_confirmed_track", fallback["require_confirmed_track"])),
+                "minimum_bbox_width_pixels": int(profile_payload.get("minimum_bbox_width_pixels", fallback["minimum_bbox_width_pixels"])),
+                "minimum_bbox_height_pixels": int(profile_payload.get("minimum_bbox_height_pixels", fallback["minimum_bbox_height_pixels"])),
+                "direction_mode": str(profile_payload.get("direction_mode", fallback["direction_mode"])).strip() or "any",
+            }
+            self._validate_capture_zone_profile(profile, context)
+            return profile
+
+        base_defaults = {
+            "top_ratio": 0.55,
+            "bottom_ratio": 0.72,
+            "trigger_point": "bottom_center",
+            "maximum_saved_candidates_per_track": 3,
+            "minimum_frame_gap": 2,
+            "capture_policy": "best_quality",
+            "save_immediately": True,
+            "require_confirmed_track": True,
+            "minimum_bbox_width_pixels": int(default_minimum_width),
+            "minimum_bbox_height_pixels": int(default_minimum_height),
+            "direction_mode": "any",
+        }
+        default_source = {
+            **dict(payload.get("default", {}) or {}),
+            "trigger_point": payload.get("trigger_point", dict(payload.get("default", {}) or {}).get("trigger_point", base_defaults["trigger_point"])),
+            "maximum_saved_candidates_per_track": payload.get("maximum_saved_candidates_per_track", dict(payload.get("default", {}) or {}).get("maximum_saved_candidates_per_track", base_defaults["maximum_saved_candidates_per_track"])),
+            "minimum_frame_gap": payload.get("minimum_frame_gap", dict(payload.get("default", {}) or {}).get("minimum_frame_gap", base_defaults["minimum_frame_gap"])),
+            "capture_policy": payload.get("capture_policy", dict(payload.get("default", {}) or {}).get("capture_policy", base_defaults["capture_policy"])),
+            "save_immediately": payload.get("save_immediately", dict(payload.get("default", {}) or {}).get("save_immediately", base_defaults["save_immediately"])),
+            "require_confirmed_track": payload.get("require_confirmed_track", dict(payload.get("default", {}) or {}).get("require_confirmed_track", base_defaults["require_confirmed_track"])),
+            "minimum_bbox_width_pixels": payload.get("minimum_bbox_width_pixels", dict(payload.get("default", {}) or {}).get("minimum_bbox_width_pixels", base_defaults["minimum_bbox_width_pixels"])),
+            "minimum_bbox_height_pixels": payload.get("minimum_bbox_height_pixels", dict(payload.get("default", {}) or {}).get("minimum_bbox_height_pixels", base_defaults["minimum_bbox_height_pixels"])),
+            "direction_mode": payload.get("direction_mode", dict(payload.get("default", {}) or {}).get("direction_mode", base_defaults["direction_mode"])),
+        }
+        legacy_ratio_keys_present = "top_ratio" in payload or "bottom_ratio" in payload
+        if legacy_ratio_keys_present or not default_source:
+            default_source = {
+                **default_source,
+                "top_ratio": payload.get("top_ratio", default_source.get("top_ratio", base_defaults["top_ratio"])),
+                "bottom_ratio": payload.get("bottom_ratio", default_source.get("bottom_ratio", base_defaults["bottom_ratio"])),
+            }
+        default_profile = _normalize_profile(default_source, base_defaults, "evidence.capture_zone.default")
+
+        class_specific_profiles: dict[str, dict[str, Any]] = {}
+        for class_name, class_payload in dict(payload.get("class_specific", {}) or {}).items():
+            if not isinstance(class_payload, dict):
+                raise ConfigurationError(f"evidence.capture_zone.class_specific.{class_name} must be a mapping.")
+            class_specific_profiles[self._normalize_vehicle_class(str(class_name))] = _normalize_profile(
+                dict(class_payload),
+                default_profile,
+                f"evidence.capture_zone.class_specific.{class_name}",
+            )
+
+        camera_profiles: dict[str, dict[str, Any]] = {}
+        for camera_id, camera_payload in dict(payload.get("cameras", {}) or {}).items():
+            if not isinstance(camera_payload, dict):
+                raise ConfigurationError(f"evidence.capture_zone.cameras.{camera_id} must be a mapping.")
+            camera_payload = dict(camera_payload)
+            camera_default_source = {
+                **dict(camera_payload.get("default", {}) or {}),
+                "trigger_point": camera_payload.get("trigger_point", dict(camera_payload.get("default", {}) or {}).get("trigger_point", default_profile["trigger_point"])),
+                "maximum_saved_candidates_per_track": camera_payload.get("maximum_saved_candidates_per_track", dict(camera_payload.get("default", {}) or {}).get("maximum_saved_candidates_per_track", default_profile["maximum_saved_candidates_per_track"])),
+                "minimum_frame_gap": camera_payload.get("minimum_frame_gap", dict(camera_payload.get("default", {}) or {}).get("minimum_frame_gap", default_profile["minimum_frame_gap"])),
+                "capture_policy": camera_payload.get("capture_policy", dict(camera_payload.get("default", {}) or {}).get("capture_policy", default_profile["capture_policy"])),
+                "save_immediately": camera_payload.get("save_immediately", dict(camera_payload.get("default", {}) or {}).get("save_immediately", default_profile["save_immediately"])),
+                "require_confirmed_track": camera_payload.get("require_confirmed_track", dict(camera_payload.get("default", {}) or {}).get("require_confirmed_track", default_profile["require_confirmed_track"])),
+                "minimum_bbox_width_pixels": camera_payload.get("minimum_bbox_width_pixels", dict(camera_payload.get("default", {}) or {}).get("minimum_bbox_width_pixels", default_profile["minimum_bbox_width_pixels"])),
+                "minimum_bbox_height_pixels": camera_payload.get("minimum_bbox_height_pixels", dict(camera_payload.get("default", {}) or {}).get("minimum_bbox_height_pixels", default_profile["minimum_bbox_height_pixels"])),
+                "direction_mode": camera_payload.get("direction_mode", dict(camera_payload.get("default", {}) or {}).get("direction_mode", default_profile["direction_mode"])),
+            }
+            if "top_ratio" in camera_payload or "bottom_ratio" in camera_payload:
+                camera_default_source = {
+                    **camera_default_source,
+                    "top_ratio": camera_payload.get("top_ratio", camera_default_source.get("top_ratio", default_profile["top_ratio"])),
+                    "bottom_ratio": camera_payload.get("bottom_ratio", camera_default_source.get("bottom_ratio", default_profile["bottom_ratio"])),
+                }
+            camera_profile = {
+                "enabled": bool(camera_payload.get("enabled", payload.get("enabled", False))),
+                "default": _normalize_profile(
+                    camera_default_source,
+                    default_profile,
+                    f"evidence.capture_zone.cameras.{camera_id}.default",
+                ),
+                "class_specific": {},
+            }
+            for class_name, class_payload in dict(camera_payload.get("class_specific", {}) or {}).items():
+                if not isinstance(class_payload, dict):
+                    raise ConfigurationError(f"evidence.capture_zone.cameras.{camera_id}.class_specific.{class_name} must be a mapping.")
+                normalized_class = self._normalize_vehicle_class(str(class_name))
+                fallback_profile = class_specific_profiles.get(normalized_class, camera_profile["default"])
+                camera_profile["class_specific"][normalized_class] = _normalize_profile(
+                    dict(class_payload),
+                    fallback_profile,
+                    f"evidence.capture_zone.cameras.{camera_id}.class_specific.{class_name}",
+                )
+            camera_profiles[str(camera_id).strip()] = camera_profile
+
+        normalized_capture_zone = {
+            "enabled": bool(payload.get("enabled", False)),
+            "default": default_profile,
+            "class_specific": class_specific_profiles,
+            "cameras": camera_profiles,
+            "top_ratio": default_profile["top_ratio"],
+            "bottom_ratio": default_profile["bottom_ratio"],
+            "trigger_point": default_profile["trigger_point"],
+            "maximum_saved_candidates_per_track": default_profile["maximum_saved_candidates_per_track"],
+            "minimum_frame_gap": default_profile["minimum_frame_gap"],
+            "capture_policy": default_profile["capture_policy"],
+            "save_immediately": default_profile["save_immediately"],
+            "require_confirmed_track": default_profile["require_confirmed_track"],
+            "minimum_bbox_width_pixels": default_profile["minimum_bbox_width_pixels"],
+            "minimum_bbox_height_pixels": default_profile["minimum_bbox_height_pixels"],
+            "direction_mode": default_profile["direction_mode"],
+        }
+        return normalized_capture_zone
+
+    def _validate_capture_zone_profile(self, profile: dict[str, Any], context: str) -> None:
+        if profile["trigger_point"] != "bottom_center":
+            raise ConfigurationError(f"{context}.trigger_point must be bottom_center.")
+        if not 0.0 <= profile["top_ratio"] < profile["bottom_ratio"] <= 1.0:
+            raise ConfigurationError(f"{context} ratios must satisfy 0.0 <= top_ratio < bottom_ratio <= 1.0.")
+        if profile["maximum_saved_candidates_per_track"] < 1:
+            raise ConfigurationError(f"{context}.maximum_saved_candidates_per_track must be at least 1.")
+        if profile["minimum_bbox_width_pixels"] < 1 or profile["minimum_bbox_height_pixels"] < 1:
+            raise ConfigurationError(f"{context} minimum bbox dimensions must be at least 1.")
+
+    def _capture_zone_config_for_camera(self, camera_id: str) -> dict[str, Any]:
+        capture_zone = dict(self.config.get("capture_zone", {}) or {})
+        camera_overrides = dict(capture_zone.get("cameras", {}) or {}).get(camera_id)
+        if isinstance(camera_overrides, dict):
+            return {
+                "enabled": bool(camera_overrides.get("enabled", capture_zone.get("enabled", False))),
+                "default": dict(camera_overrides.get("default", capture_zone.get("default", {})) or {}),
+                "class_specific": dict(camera_overrides.get("class_specific", {}) or {}),
+            }
+        return {
+            "enabled": bool(capture_zone.get("enabled", False)),
+            "default": dict(capture_zone.get("default", {}) or {}),
+            "class_specific": dict(capture_zone.get("class_specific", {}) or {}),
+        }
+
+    def _resolve_capture_zone_profile(self, camera_id: str, vehicle_class: str) -> dict[str, Any]:
+        camera_capture_zone = self._capture_zone_config_for_camera(camera_id)
+        normalized_class = self._normalize_vehicle_class(vehicle_class)
+        return dict(
+            dict(camera_capture_zone.get("class_specific", {}) or {}).get(
+                normalized_class,
+                camera_capture_zone.get("default", {}),
+            )
+            or {}
+        )
+
+    def _maybe_save_debug_track_crop(
+        self,
+        frame_packet: FramePacket,
+        tracked_detection: TrackedDetection,
+        *,
+        zone_top: int,
+        zone_bottom: int,
+        inside_capture_zone: bool,
+        vehicle_class: str,
+    ) -> None:
+        if not self._debug_track_crops_enabled:
+            return
+        local_track_id = self._build_local_track_id(frame_packet.camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
+        saved_count = int(self._debug_track_crop_counts.get(local_track_id, 0))
+        if saved_count >= self._debug_track_crops_max_per_track:
+            return
+        if frame_packet.frame_number % self._debug_track_crops_save_every_n_frames != 0:
+            return
+        crop_bbox = self._apply_padding(
+            tuple(float(item) for item in tracked_detection.bbox_xyxy),
+            int(frame_packet.frame.shape[1]),
+            int(frame_packet.frame.shape[0]),
+        )
+        x1, y1, x2, y2 = crop_bbox
+        crop = frame_packet.frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+        safe_track_id = self._sanitize_track_id(local_track_id)
+        crop_path = self.output_manager.save_track_crop(
+            frame_packet.camera_id,
+            safe_track_id,
+            frame_packet.frame_number,
+            crop,
+            jpeg_quality=int(self.config["jpeg_quality"]),
+        )
+        class_min_width, class_min_height = self._class_specific_evidence_thresholds(vehicle_class)
+        florence_min_width, florence_min_height = self._class_specific_florence_thresholds(vehicle_class)
+        crop_width = int(crop.shape[1])
+        crop_height = int(crop.shape[0])
+        evidence_eligible = crop_width >= class_min_width and crop_height >= class_min_height
+        if evidence_eligible:
+            evidence_rejection_reason = None
+        elif crop_width < class_min_width:
+            evidence_rejection_reason = self._class_reason("width_below", vehicle_class, "minimum")
+        else:
+            evidence_rejection_reason = self._class_reason("height_below", vehicle_class, "minimum")
+        florence_eligible = crop_width >= florence_min_width and crop_height >= florence_min_height
+        if florence_eligible:
+            florence_rejection_reason = None
+        elif crop_width < florence_min_width:
+            florence_rejection_reason = self._class_reason("width_below", vehicle_class, "florence_minimum")
+        else:
+            florence_rejection_reason = self._class_reason("height_below", vehicle_class, "florence_minimum")
+        self._debug_track_crop_rows.append(
+            {
+                "camera_id": frame_packet.camera_id,
+                "local_track_id": local_track_id,
+                "frame_number": int(frame_packet.frame_number),
+                "timestamp_seconds": float(frame_packet.timestamp_seconds),
+                "vehicle_class": vehicle_class,
+                "confidence": float(tracked_detection.confidence),
+                "bbox_x1": float(tracked_detection.bbox_xyxy[0]),
+                "bbox_y1": float(tracked_detection.bbox_xyxy[1]),
+                "bbox_x2": float(tracked_detection.bbox_xyxy[2]),
+                "bbox_y2": float(tracked_detection.bbox_xyxy[3]),
+                "crop_width": crop_width,
+                "crop_height": crop_height,
+                "crop_path": str(crop_path),
+                "trigger_y": float(tracked_detection.bbox_xyxy[3]),
+                "inside_capture_zone": bool(inside_capture_zone),
+                "capture_zone_top": int(zone_top),
+                "capture_zone_bottom": int(zone_bottom),
+                "evidence_eligible": evidence_eligible,
+                "evidence_rejection_reason": evidence_rejection_reason,
+                "florence_eligible": florence_eligible,
+                "florence_rejection_reason": florence_rejection_reason,
+            }
+        )
+        self._debug_track_crop_counts[local_track_id] = saved_count + 1
+
+    @staticmethod
+    def _class_reason(prefix: str, vehicle_class: str, suffix: str) -> str:
+        normalized = " ".join(str(vehicle_class or "").strip().lower().replace("_", " ").replace("-", " ").split())
+        if normalized and normalized != "unknown":
+            return f"{prefix}_{normalized}_{suffix}"
+        return f"{prefix}_{suffix}"
+
+    def _update_track_geometry(
+        self,
+        state: _CaptureZoneTrackState,
+        *,
+        frame_number: int,
+        tracked_detection: TrackedDetection,
+        trigger_y: float,
+        source_frame_width: int,
+        source_frame_height: int,
+    ) -> None:
+        bbox_width = max(0, int(round(tracked_detection.bbox_xyxy[2] - tracked_detection.bbox_xyxy[0])))
+        bbox_height = max(0, int(round(tracked_detection.bbox_xyxy[3] - tracked_detection.bbox_xyxy[1])))
+        bbox_area = bbox_width * bbox_height
+        class_name = self._normalize_vehicle_class(tracked_detection.raw_class_name)
+        state.first_frame = frame_number if state.first_frame is None else state.first_frame
+        state.last_frame = frame_number
+        state.minimum_trigger_y = trigger_y if state.minimum_trigger_y is None else min(state.minimum_trigger_y, trigger_y)
+        if state.maximum_trigger_y is None or trigger_y >= state.maximum_trigger_y:
+            state.maximum_trigger_y = trigger_y
+            state.frame_of_max_trigger_y = frame_number
+        if bbox_width >= state.maximum_bbox_width:
+            state.maximum_bbox_width = bbox_width
+            state.frame_of_max_bbox_width = frame_number
+        if bbox_height >= state.maximum_bbox_height:
+            state.maximum_bbox_height = bbox_height
+            state.frame_of_max_bbox_height = frame_number
+        if bbox_area >= state.maximum_bbox_area:
+            state.maximum_bbox_area = bbox_area
+            state.frame_of_max_bbox_area = frame_number
+        state.class_counts[class_name] = state.class_counts.get(class_name, 0) + 1
+        state.class_confidence_sums[class_name] = state.class_confidence_sums.get(class_name, 0.0) + float(tracked_detection.confidence)
+        state.stable_class_name = self._stable_track_class_estimate(state)
+        state.source_frame_width = int(source_frame_width)
+        state.source_frame_height = int(source_frame_height)
+
+    def _stable_track_class_estimate(self, state: _CaptureZoneTrackState) -> str:
+        if not state.class_counts or state.observation_count < self._track_class_minimum_observations:
+            return "unknown"
+        winner_class, winner_confidence = max(
+            state.class_confidence_sums.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        winner_count = int(state.class_counts.get(winner_class, 0))
+        winner_ratio = float(winner_count / max(1, sum(state.class_counts.values())))
+        sorted_confidence = sorted(state.class_confidence_sums.items(), key=lambda item: (item[1], item[0]), reverse=True)
+        runner_up_confidence = sorted_confidence[1][1] if len(sorted_confidence) > 1 else float("-inf")
+        if winner_ratio < self._track_class_minimum_winner_ratio:
+            return "unknown"
+        if winner_confidence <= runner_up_confidence:
+            return "unknown"
+        return self._normalize_vehicle_class(winner_class)
+
+    def _register_capture_zone_frame(self, frame_packet: FramePacket, tracked_detections: list[TrackedDetection]) -> None:
+        if not tracked_detections:
+            return
+        camera_capture_zone = self._capture_zone_config_for_camera(frame_packet.camera_id)
+        if not bool(camera_capture_zone.get("enabled", False)):
+            return
+        for tracked_detection in tracked_detections:
+            local_track_id = self._build_local_track_id(frame_packet.camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
+            state = self._capture_zone_state.setdefault(local_track_id, _CaptureZoneTrackState())
+            state.observation_count += 1
+            trigger_x = float((tracked_detection.bbox_xyxy[0] + tracked_detection.bbox_xyxy[2]) / 2.0)
+            trigger_y = float(tracked_detection.bbox_xyxy[3])
+            self._update_track_geometry(
+                state,
+                frame_number=frame_packet.frame_number,
+                tracked_detection=tracked_detection,
+                trigger_y=trigger_y,
+                source_frame_width=frame_packet.source_frame_width,
+                source_frame_height=frame_packet.source_frame_height,
+            )
+            zone_profile = self._resolve_capture_zone_profile(frame_packet.camera_id, state.stable_class_name)
+            zone_top = int(frame_packet.source_frame_height * float(zone_profile["top_ratio"]))
+            zone_bottom = int(frame_packet.source_frame_height * float(zone_profile["bottom_ratio"]))
+            state.zone_top_pixels = zone_top
+            state.zone_bottom_pixels = zone_bottom
+            position = self._zone_position(trigger_y, zone_top, zone_bottom)
+            vehicle_class = self._normalize_vehicle_class(tracked_detection.raw_class_name)
+            self._maybe_save_debug_track_crop(
+                frame_packet,
+                tracked_detection,
+                zone_top=zone_top,
+                zone_bottom=zone_bottom,
+                inside_capture_zone=position == "inside",
+                vehicle_class=vehicle_class,
+            )
+            self.logger.debug(
+                "Motorcycle geometry track=%s frame=%s trigger_y=%.2f zone_top=%s zone_bottom=%s bbox=%sx%s state=%s stable_class=%s",
+                local_track_id,
+                frame_packet.frame_number,
+                trigger_y,
+                zone_top,
+                zone_bottom,
+                max(0, int(round(tracked_detection.bbox_xyxy[2] - tracked_detection.bbox_xyxy[0]))),
+                max(0, int(round(tracked_detection.bbox_xyxy[3] - tracked_detection.bbox_xyxy[1]))),
+                position.upper(),
+                state.stable_class_name,
+            )
+            if position == "inside" and state.last_position != "inside":
+                state.entered_zone = True
+                state.first_zone_entry_frame = frame_packet.frame_number if state.first_zone_entry_frame is None else state.first_zone_entry_frame
+                self._metrics["capture_zone_tracks_entered"] += 1
+                self.logger.info(
+                    "Evidence zone entered camera=%s track=%s frame=%s",
+                    frame_packet.camera_id,
+                    local_track_id,
+                    frame_packet.frame_number,
+                )
+            if position == "inside":
+                state.last_zone_frame = frame_packet.frame_number
+            if position == "below" and state.last_position == "inside":
+                state.exited_zone = True
+                state.zone_exit_frame = frame_packet.frame_number
+                self.logger.info(
+                    "Evidence zone exited camera=%s track=%s frame=%s",
+                    frame_packet.camera_id,
+                    local_track_id,
+                    frame_packet.frame_number,
+                )
+            should_consider = position == "inside"
+            state.last_position = position
+            if not should_consider:
+                continue
+            if bool(zone_profile.get("require_confirmed_track", True)) and state.observation_count < self._confirmed_track_minimum_observations:
+                continue
+            if state.last_capture_frame is not None and (frame_packet.frame_number - state.last_capture_frame) < int(zone_profile["minimum_frame_gap"]):
+                self._metrics["capture_zone_duplicate_frame_suppressed"] += 1
+                continue
+            self._metrics["capture_zone_candidate_attempts"] += 1
+            state.capture_zone_candidate_count += 1
+            candidate_entry = self._build_candidate(frame_packet, tracked_detection)
+            if candidate_entry is None:
+                self._metrics["capture_zone_invalid_bbox_count"] += 1
+                continue
+            bbox_width = candidate_entry.crop_bbox_xyxy[2] - candidate_entry.crop_bbox_xyxy[0]
+            bbox_height = candidate_entry.crop_bbox_xyxy[3] - candidate_entry.crop_bbox_xyxy[1]
+            if bbox_width < int(zone_profile["minimum_bbox_width_pixels"]) or bbox_height < int(zone_profile["minimum_bbox_height_pixels"]):
+                self._metrics["capture_zone_too_small_count"] += 1
+                self._metrics["capture_zone_candidates_too_small"] += 1
+                continue
+            if vehicle_class == "motorcycle":
+                self._metrics["capture_zone_motorcycle_candidates"] += 1
+            crop = frame_packet.frame[candidate_entry.crop_bbox_xyxy[1]:candidate_entry.crop_bbox_xyxy[3], candidate_entry.crop_bbox_xyxy[0]:candidate_entry.crop_bbox_xyxy[2]]
+            if crop.size == 0:
+                self._metrics["capture_zone_invalid_bbox_count"] += 1
+                continue
+            class_min_width, class_min_height = self._class_specific_evidence_thresholds(vehicle_class)
+            if candidate_entry.candidate.original_crop_width < class_min_width or candidate_entry.candidate.original_crop_height < class_min_height:
+                self._metrics["capture_zone_candidates_rejected_by_class_threshold"] += 1
+            elif vehicle_class == "motorcycle":
+                self._metrics["capture_zone_motorcycle_eligible_candidates"] += 1
+            safe_track_id = self._sanitize_track_id(local_track_id)
+            crop_path = str(
+                self.output_manager.save_capture_zone_crop(
+                    frame_packet.camera_id,
+                    safe_track_id,
+                    frame_packet.frame_number,
+                    crop,
+                    jpeg_quality=int(self.config["jpeg_quality"]),
+                )
+            )
+            stored = _CaptureZoneStoredCandidate(
+                candidate=candidate_entry.candidate,
+                crop_bbox_xyxy=candidate_entry.crop_bbox_xyxy,
+                crop_path=crop_path,
+                trigger_x=trigger_x,
+                trigger_y=trigger_y,
+                zone_top=zone_top,
+                zone_bottom=zone_bottom,
+            )
+            kept = self._retain_capture_zone_candidate(local_track_id, stored, int(zone_profile["maximum_saved_candidates_per_track"]))
+            if kept:
+                state.last_capture_frame = frame_packet.frame_number
+                state.capture_zone_retained_count += 1
+                crop_width = int(candidate_entry.candidate.original_crop_width)
+                crop_height = int(candidate_entry.candidate.original_crop_height)
+                if (crop_width * crop_height) >= (state.largest_saved_crop_width * state.largest_saved_crop_height):
+                    state.largest_saved_crop_width = crop_width
+                    state.largest_saved_crop_height = crop_height
+                    state.largest_saved_crop_frame = frame_packet.frame_number
+                self._metrics["capture_zone_candidates_saved"] += 1
+                self.logger.info(
+                    "Evidence zone candidate captured camera=%s track=%s frame=%s quality=%.3f path=%s",
+                    frame_packet.camera_id,
+                    local_track_id,
+                    frame_packet.frame_number,
+                    candidate_entry.candidate.best_overall_score,
+                    crop_path,
+                )
+            else:
+                self._remove_file_if_exists(crop_path)
+
+    def _retain_capture_zone_candidate(self, local_track_id: str, candidate_entry: _CaptureZoneStoredCandidate, maximum_candidates: int) -> bool:
+        retained = self._capture_zone_candidates.setdefault(local_track_id, [])
+        candidate_entry.candidate.best_overall_score = self._capture_zone_candidate_score(candidate_entry.candidate)
+        same_frame = next((item for item in retained if item.candidate.frame_number == candidate_entry.candidate.frame_number), None)
+        if same_frame is not None:
+            self._metrics["capture_zone_duplicate_frame_suppressed"] += 1
+            return False
+        retained.append(candidate_entry)
+        retained.sort(key=lambda item: (item.candidate.best_overall_score, item.candidate.frame_number), reverse=True)
+        if len(retained) > maximum_candidates:
+            removed = retained.pop()
+            self._remove_file_if_exists(removed.crop_path)
+            self._metrics["capture_zone_candidates_replaced"] += 1
+            if (candidate_entry.candidate.original_crop_width * candidate_entry.candidate.original_crop_height) > (
+                removed.candidate.original_crop_width * removed.candidate.original_crop_height
+            ):
+                self._metrics["capture_zone_candidates_replaced_by_larger_crop"] = self._metrics.get("capture_zone_candidates_replaced_by_larger_crop", 0) + 1
+            else:
+                self._metrics["capture_zone_candidates_replaced_by_better_quality"] = self._metrics.get("capture_zone_candidates_replaced_by_better_quality", 0) + 1
+            self.logger.info(
+                "Evidence zone candidate replaced camera=%s track=%s old_quality=%.3f new_quality=%.3f",
+                candidate_entry.candidate.camera_id,
+                local_track_id,
+                removed.candidate.best_overall_score,
+                candidate_entry.candidate.best_overall_score,
+            )
+        return candidate_entry in retained
+
+    def _capture_zone_candidate_score(self, candidate: EvidenceCandidate) -> float:
+        generic_score = self._instantaneous_candidate_score(candidate)
+        vehicle_class = self._normalize_vehicle_class(candidate.raw_class_name)
+        class_min_width, class_min_height = self._class_specific_evidence_thresholds(vehicle_class)
+        florence_min_width, florence_min_height = self._class_specific_florence_thresholds(vehicle_class)
+        width = max(1, int(candidate.original_crop_width))
+        height = max(1, int(candidate.original_crop_height))
+        evidence_width_ratio = min(2.0, width / max(1, class_min_width))
+        evidence_height_ratio = min(2.0, height / max(1, class_min_height))
+        florence_width_ratio = min(2.0, width / max(1, florence_min_width))
+        florence_height_ratio = min(2.0, height / max(1, florence_min_height))
+        evidence_bonus = 0.0
+        if width >= class_min_width and height >= class_min_height:
+            evidence_bonus += 350.0
+        else:
+            evidence_bonus -= 180.0
+        if width >= florence_min_width and height >= florence_min_height:
+            evidence_bonus += 500.0
+        else:
+            evidence_bonus -= 120.0
+        size_bonus = ((evidence_width_ratio + evidence_height_ratio) * 90.0) + ((florence_width_ratio + florence_height_ratio) * 120.0)
+        return generic_score + evidence_bonus + size_bonus
+
+    @staticmethod
+    def _normalize_vehicle_class(value: str | None) -> str:
+        return " ".join(str(value or "").strip().lower().replace("_", " ").replace("-", " ").split()) or "unknown"
+
+    def _class_specific_evidence_thresholds(self, vehicle_class: str) -> tuple[int, int]:
+        defaults = (
+            int(self._vehicle_enrichment_evidence_config.get("minimum_crop_width", 100)),
+            int(self._vehicle_enrichment_evidence_config.get("minimum_crop_height", 70)),
+        )
+        payload = dict(dict(self._vehicle_enrichment_evidence_config.get("class_specific_minimums", {}) or {}).get(vehicle_class, {}) or {})
+        return (
+            int(payload.get("minimum_crop_width", defaults[0])),
+            int(payload.get("minimum_crop_height", defaults[1])),
+        )
+
+    def _class_specific_florence_thresholds(self, vehicle_class: str) -> tuple[int, int]:
+        florence = self._vehicle_enrichment_florence_config
+        default_payload = dict(florence.get("default", {}) or {})
+        class_specific = dict(florence.get("class_specific", {}) or {})
+        payload = dict(class_specific.get(vehicle_class, {}) or {})
+        default_width = int(florence.get("minimum_original_width", default_payload.get("minimum_original_width", 192)))
+        default_height = int(florence.get("minimum_original_height", default_payload.get("minimum_original_height", 144)))
+        return (
+            int(payload.get("minimum_original_width", default_width)),
+            int(payload.get("minimum_original_height", default_height)),
+        )
+
+    @staticmethod
+    def _zone_position(trigger_y: float, zone_top: int, zone_bottom: int) -> str:
+        if trigger_y < zone_top:
+            return "above"
+        if trigger_y > zone_bottom:
+            return "below"
+        return "inside"
 
     def _build_candidate(self, frame_packet: FramePacket, tracked_detection: TrackedDetection) -> _StoredCandidate | None:
         frame_height, frame_width = frame_packet.frame.shape[:2]
@@ -676,6 +1366,183 @@ class EvidenceCollector:
             self._update_crop_metrics(candidate.original_crop_width, candidate.original_crop_height)
         return records
 
+    def _finalize_capture_zone_track(self, track: LocalTrack) -> list[dict[str, Any]]:
+        state = self._capture_zone_state.pop(track.local_track_id, None)
+        candidates = self._capture_zone_candidates.pop(track.local_track_id, [])
+        safe_track_id = self._sanitize_track_id(track.local_track_id)
+        records: list[dict[str, Any]] = []
+        motorcycle_track_with_evidence = False
+        for candidate_entry in sorted(candidates, key=lambda item: item.candidate.best_overall_score, reverse=True):
+            crop_path = candidate_entry.crop_path
+            if not Path(crop_path).exists():
+                self._metrics["capture_zone_missing_saved_crop"] += 1
+                continue
+            vehicle_class = self._normalize_vehicle_class(candidate_entry.candidate.raw_class_name)
+            class_minimum_width, class_minimum_height = self._class_specific_evidence_thresholds(vehicle_class)
+            florence_minimum_width, florence_minimum_height = self._class_specific_florence_thresholds(vehicle_class)
+            evidence_eligible = (
+                candidate_entry.candidate.original_crop_width >= class_minimum_width
+                and candidate_entry.candidate.original_crop_height >= class_minimum_height
+            )
+            florence_eligible = (
+                candidate_entry.candidate.original_crop_width >= florence_minimum_width
+                and candidate_entry.candidate.original_crop_height >= florence_minimum_height
+            )
+            rejection_reason = None
+            if not evidence_eligible:
+                if candidate_entry.candidate.original_crop_width < class_minimum_width:
+                    rejection_reason = f"crop_width_below_{vehicle_class}_minimum" if vehicle_class != "unknown" else "crop_width_below_minimum"
+                elif candidate_entry.candidate.original_crop_height < class_minimum_height:
+                    rejection_reason = f"crop_height_below_{vehicle_class}_minimum" if vehicle_class != "unknown" else "crop_height_below_minimum"
+            elif not florence_eligible:
+                if candidate_entry.candidate.original_crop_width < florence_minimum_width:
+                    rejection_reason = f"crop_width_below_{vehicle_class}_florence_minimum" if vehicle_class != "unknown" else "crop_width_below_florence_minimum"
+                elif candidate_entry.candidate.original_crop_height < florence_minimum_height:
+                    rejection_reason = f"crop_height_below_{vehicle_class}_florence_minimum" if vehicle_class != "unknown" else "crop_height_below_florence_minimum"
+            record = {
+                "local_track_id": track.local_track_id,
+                "camera_id": track.camera_id,
+                "native_tracker_id": track.native_tracker_id,
+                "tracker_namespace": track.tracker_namespace,
+                "track_status": track.status,
+                "final_class": track.final_class or "UNKNOWN",
+                "role": "CAPTURE_ZONE",
+                "frame_number": candidate_entry.candidate.frame_number,
+                "timestamp_seconds": candidate_entry.candidate.timestamp_seconds,
+                "raw_class_name": candidate_entry.candidate.raw_class_name,
+                "confidence": candidate_entry.candidate.confidence,
+                "bbox_xyxy": list(candidate_entry.candidate.bbox_xyxy),
+                "original_bbox": list(candidate_entry.candidate.original_bbox_xyxy),
+                "expanded_crop_bbox": list(candidate_entry.candidate.expanded_crop_bbox_xyxy),
+                "context_padding_ratio": candidate_entry.candidate.context_padding_ratio,
+                "source_frame_width": candidate_entry.candidate.source_frame_width,
+                "source_frame_height": candidate_entry.candidate.source_frame_height,
+                "original_crop_width": candidate_entry.candidate.original_crop_width,
+                "original_crop_height": candidate_entry.candidate.original_crop_height,
+                "crop_path": crop_path,
+                "annotated_frame_path": None,
+                "sharpness_score": candidate_entry.candidate.sharpness_score,
+                "centeredness_score": candidate_entry.candidate.centeredness_score,
+                "edge_visibility_score": candidate_entry.candidate.edge_visibility_score,
+                "best_overall_score": candidate_entry.candidate.best_overall_score,
+                "evidence_source": "capture_zone",
+                "vehicle_class": vehicle_class,
+                "trigger_x": candidate_entry.trigger_x,
+                "trigger_y": candidate_entry.trigger_y,
+                "zone_top": candidate_entry.zone_top,
+                "zone_bottom": candidate_entry.zone_bottom,
+                "class_minimum_width": class_minimum_width,
+                "class_minimum_height": class_minimum_height,
+                "florence_minimum_width": florence_minimum_width,
+                "florence_minimum_height": florence_minimum_height,
+                "evidence_eligible": evidence_eligible,
+                "florence_eligible": florence_eligible,
+                "rejection_reason": rejection_reason,
+            }
+            records.append(record)
+            self._update_crop_metrics(candidate_entry.candidate.original_crop_width, candidate_entry.candidate.original_crop_height)
+            if vehicle_class == "motorcycle":
+                motorcycle_track_with_evidence = True
+        if records:
+            self.output_manager.save_capture_zone_track_evidence(track.camera_id, safe_track_id, records)
+            self._capture_zone_index.extend(records)
+            self._metrics["capture_zone_tracks_with_saved_evidence"] += 1
+            if motorcycle_track_with_evidence:
+                self._metrics["capture_zone_motorcycle_tracks_with_evidence"] += 1
+        else:
+            self._metrics["capture_zone_tracks_without_saved_evidence"] += 1
+        self._record_motorcycle_geometry(track, state, records)
+        if state is not None:
+            state.retained_candidates.clear()
+        return records
+
+    def _record_motorcycle_geometry(
+        self,
+        track: LocalTrack,
+        state: _CaptureZoneTrackState | None,
+        records: list[dict[str, Any]],
+    ) -> None:
+        normalized_final_class = self._normalize_vehicle_class(track.final_class)
+        observed_motorcycle = state is not None and state.class_counts.get("motorcycle", 0) > 0
+        if normalized_final_class != "motorcycle" and not observed_motorcycle:
+            return
+        class_for_zone = normalized_final_class if normalized_final_class != "unknown" else (state.stable_class_name if state is not None else "unknown")
+        zone_profile = self._resolve_capture_zone_profile(track.camera_id, class_for_zone)
+        zone_top = int(state.zone_top_pixels if state is not None and state.zone_top_pixels is not None else 0)
+        zone_bottom = int(state.zone_bottom_pixels if state is not None and state.zone_bottom_pixels is not None else 0)
+        evidence_eligible_zone_crop = any(bool(item.get("evidence_eligible")) for item in records)
+        florence_eligible_zone_crop = any(bool(item.get("florence_eligible")) for item in records)
+        geometry_status, geometry_reason = self._geometry_status_for_track(
+            track=track,
+            state=state,
+            has_records=bool(records),
+            evidence_eligible_zone_crop=evidence_eligible_zone_crop,
+            florence_eligible_zone_crop=florence_eligible_zone_crop,
+        )
+        record = _CaptureZoneGeometryRecord(
+            camera_id=track.camera_id,
+            local_track_id=track.local_track_id,
+            source_frame_width=int(state.source_frame_width) if state is not None else 0,
+            source_frame_height=int(state.source_frame_height) if state is not None else 0,
+            first_frame=int(state.first_frame if state is not None and state.first_frame is not None else track.first_frame),
+            last_frame=int(state.last_frame if state is not None and state.last_frame is not None else track.last_frame),
+            observation_count=int(state.observation_count if state is not None else track.observation_count),
+            min_trigger_y=float(state.minimum_trigger_y if state is not None and state.minimum_trigger_y is not None else 0.0),
+            max_trigger_y=float(state.maximum_trigger_y if state is not None and state.maximum_trigger_y is not None else 0.0),
+            zone_top=zone_top if zone_top > 0 else int(zone_profile["top_ratio"] * max(1, records[0]["source_frame_height"] if records else 1)),
+            zone_bottom=zone_bottom if zone_bottom > 0 else int(zone_profile["bottom_ratio"] * max(1, records[0]["source_frame_height"] if records else 1)),
+            entered_zone=bool(state.entered_zone) if state is not None else False,
+            first_zone_entry_frame=state.first_zone_entry_frame if state is not None else None,
+            last_zone_frame=state.last_zone_frame if state is not None else None,
+            zone_exit_frame=state.zone_exit_frame if state is not None else None,
+            max_bbox_width=int(state.maximum_bbox_width) if state is not None else 0,
+            max_bbox_height=int(state.maximum_bbox_height) if state is not None else 0,
+            max_bbox_area=int(state.maximum_bbox_area) if state is not None else 0,
+            frame_of_max_trigger_y=state.frame_of_max_trigger_y if state is not None else None,
+            frame_of_max_bbox_width=state.frame_of_max_bbox_width if state is not None else None,
+            frame_of_max_bbox_height=state.frame_of_max_bbox_height if state is not None else None,
+            frame_of_max_bbox_area=state.frame_of_max_bbox_area if state is not None else None,
+            largest_saved_crop_width=int(state.largest_saved_crop_width) if state is not None else 0,
+            largest_saved_crop_height=int(state.largest_saved_crop_height) if state is not None else 0,
+            largest_saved_crop_frame=state.largest_saved_crop_frame if state is not None else None,
+            capture_candidates=int(state.capture_zone_candidate_count) if state is not None else 0,
+            retained_candidates=int(state.capture_zone_retained_count) if state is not None else 0,
+            geometry_status=geometry_status,
+            geometry_reason=geometry_reason,
+            final_class=str(track.final_class or "UNKNOWN"),
+            stable_class_name=state.stable_class_name if state is not None else "unknown",
+            completion_reason=track.completion_reason,
+            track_status=track.status,
+            evidence_eligible_zone_crop=evidence_eligible_zone_crop,
+            florence_eligible_zone_crop=florence_eligible_zone_crop,
+        )
+        self._motorcycle_geometry_records.append(record)
+
+    def _geometry_status_for_track(
+        self,
+        *,
+        track: LocalTrack,
+        state: _CaptureZoneTrackState | None,
+        has_records: bool,
+        evidence_eligible_zone_crop: bool,
+        florence_eligible_zone_crop: bool,
+    ) -> tuple[str, str]:
+        if state is None:
+            return "REACHED_ZONE_NO_CAPTURE", "missing_capture_zone_state"
+        max_trigger_y = float(state.maximum_trigger_y if state.maximum_trigger_y is not None else 0.0)
+        zone_top = float(state.zone_top_pixels if state.zone_top_pixels is not None else 0.0)
+        if max_trigger_y < zone_top:
+            if str(track.completion_reason or "").upper() == "LOST_TIMEOUT":
+                return "TRACK_ENDED_BEFORE_ZONE", "lost_timeout_before_zone"
+            return "NEVER_REACHED_ZONE", "max_bottom_center_above_zone"
+        if state.capture_zone_candidate_count == 0:
+            return "REACHED_ZONE_NO_CAPTURE", "zone_reached_but_no_candidate_created"
+        if not has_records:
+            return "REACHED_ZONE_NO_CAPTURE", "candidate_not_retained"
+        if florence_eligible_zone_crop or evidence_eligible_zone_crop:
+            return "CAPTURED_ELIGIBLE", "eligible_zone_crop_retained"
+        return "CAPTURED_TOO_SMALL", "captured_zone_crop_below_threshold"
+
     def _update_crop_metrics(self, width: int, height: int) -> None:
         self._metrics["evidence_crop_count"] += 1
         count = int(self._metrics["evidence_crop_count"])
@@ -753,6 +1620,16 @@ class EvidenceCollector:
                     frame_key[1],
                     remaining,
                 )
+
+    @staticmethod
+    def _remove_file_if_exists(path: str | None) -> None:
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            return
 
     def _handle_error(
         self,

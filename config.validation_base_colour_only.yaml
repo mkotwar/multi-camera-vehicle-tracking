@@ -21,8 +21,8 @@ ingestion:
   round_robin: true
   raw_frames:
     enabled: true
-    save_every_n_frames: 2
-    max_saved_frames_per_camera: 2
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
     image_format: jpg
     jpeg_quality: 90
 
@@ -96,17 +96,89 @@ evidence:
   save_all_candidates: false
   include_discarded_tracks: false
   fail_pipeline_on_error: false
+  capture_zone:
+    enabled: false
+    default:
+      top_ratio: 0.68
+      bottom_ratio: 0.85
+      trigger_point: bottom_center
+      maximum_saved_candidates_per_track: 3
+      minimum_frame_gap: 2
+      capture_policy: best_quality
+      save_immediately: true
+      require_confirmed_track: true
+      minimum_bbox_width_pixels: 80
+      minimum_bbox_height_pixels: 60
+      direction_mode: any
+    class_specific:
+      motorcycle:
+        top_ratio: 0.60
+        bottom_ratio: 0.82
+      3wheeler:
+        top_ratio: 0.64
+        bottom_ratio: 0.84
+      car:
+        top_ratio: 0.68
+        bottom_ratio: 0.85
+      truck:
+        top_ratio: 0.68
+        bottom_ratio: 0.85
+      bus:
+        top_ratio: 0.68
+        bottom_ratio: 0.85
+    cameras:
+      CAM_001:
+        enabled: true
+        default:
+          top_ratio: 0.68
+          bottom_ratio: 0.85
+          trigger_point: bottom_center
+          maximum_saved_candidates_per_track: 3
+          minimum_frame_gap: 2
+          capture_policy: best_quality
+          save_immediately: true
+          require_confirmed_track: true
+          minimum_bbox_width_pixels: 80
+          minimum_bbox_height_pixels: 60
+          direction_mode: any
+        class_specific:
+          motorcycle:
+            top_ratio: 0.60
+            bottom_ratio: 0.82
 
 visualization:
   show_rejected_boxes: false
   detected_frames:
     enabled: true
-    save_every_n_frames: 2
-    max_saved_frames_per_camera: 2
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
   tracked_frames:
     enabled: true
-    save_every_n_frames: 2
-    max_saved_frames_per_camera: 2
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
+  capture_zone:
+    enabled: true
+
+debug_outputs:
+  enabled: true
+  extracted_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
+  detected_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
+  tracked_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 5000
+  track_crops:
+    enabled: true
+    save_every_n_frames: 3
+    max_crops_per_track: 100
+  florence_selected_crops:
+    enabled: true
 
 output:
   root_directory: outputs/runs
@@ -121,20 +193,47 @@ vehicle_enrichment:
   extend_tracks_json: true
   image_size_policy:
     florence:
-      minimum_original_width: 192
-      minimum_original_height: 144
-      preferred_original_width: 320
-      preferred_original_height: 240
+      default:
+        minimum_original_width: 192
+        minimum_original_height: 144
+        preferred_original_width: 320
+        preferred_original_height: 240
+      class_specific:
+        motorcycle:
+          minimum_original_width: 120
+          minimum_original_height: 120
+        3wheeler:
+          minimum_original_width: 140
+          minimum_original_height: 120
+        car:
+          minimum_original_width: 160
+          minimum_original_height: 120
       eligibility_dimensions_source: original_crop
       preserve_aspect_ratio: true
       pad_to_square: true
       square_padding_value: 114
       reject_upscaled_eligibility: true
   evidence:
-    source: existing_track_evidence
+    source: capture_zone_with_existing_fallback
     save_vehicle_crops: true
     minimum_crop_width: 100
     minimum_crop_height: 70
+    class_specific_minimums:
+      motorcycle:
+        minimum_crop_width: 120
+        minimum_crop_height: 120
+      car:
+        minimum_crop_width: 160
+        minimum_crop_height: 120
+      3wheeler:
+        minimum_crop_width: 140
+        minimum_crop_height: 120
+      truck:
+        minimum_crop_width: 160
+        minimum_crop_height: 120
+      bus:
+        minimum_crop_width: 160
+        minimum_crop_height: 120
     minimum_sharpness: 10.0
     minimum_quality_score: 0.20
     border_margin_ratio: 0.02

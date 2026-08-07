@@ -1,29 +1,46 @@
+# Python environments
 .venv/
 .venv_florence_test/
 
-__pycache__/
+# Python cache
+**/__pycache__/
 *.pyc
 .pytest_cache/
+
+# Pytest generated temporary files
+pytest_tmp/
+
+# Environment
 .env
 
+# Runtime outputs
 logs/
 outputs/
 
+# Models
 *.pt
 *.pth
 *.onnx
 *.safetensors
 
+# Test videos
 data/test_videos/*
 !data/test_videos/README.md
 
+# IDE
 .vscode/
 .idea/
 
+# Archives
 *.zip
 
-# Local test videos
+# Videos
 *.mp4
 *.avi
 *.mov
 *.mkv
+
+# Generated images
+*.jpg
+*.jpeg
+*.png

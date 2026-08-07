@@ -84,6 +84,14 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "save_vehicle_crops": bool(evidence.get("save_vehicle_crops", True)),
             "minimum_crop_width": max(1, int(evidence.get("minimum_crop_width", 100))),
             "minimum_crop_height": max(1, int(evidence.get("minimum_crop_height", 70))),
+            "class_specific_minimums": {
+                str(class_name).strip().lower(): {
+                    "minimum_crop_width": max(1, int(dict(payload or {}).get("minimum_crop_width", evidence.get("minimum_crop_width", 100)))),
+                    "minimum_crop_height": max(1, int(dict(payload or {}).get("minimum_crop_height", evidence.get("minimum_crop_height", 70)))),
+                }
+                for class_name, payload in dict(evidence.get("class_specific_minimums", {}) or {}).items()
+                if str(class_name).strip()
+            },
             "minimum_sharpness": float(evidence.get("minimum_sharpness", 10.0)),
             "minimum_quality_score": float(evidence.get("minimum_quality_score", 0.20)),
             "border_margin_ratio": float(evidence.get("border_margin_ratio", 0.02)),
@@ -303,6 +311,15 @@ class VehicleEnrichmentManager:
         self._results_by_track: dict[str, TrackEnrichmentResult] = {}
         self._metrics: dict[str, Any] = {
             "completed_tracks_received": 0,
+            "vehicle_tracks_finalized": 0,
+            "vehicle_tracks_with_raw_crop": 0,
+            "vehicle_tracks_with_preferred_crop": 0,
+            "vehicle_tracks_using_low_resolution_fallback": 0,
+            "vehicle_tracks_sent_to_florence": 0,
+            "vehicle_tracks_with_zero_florence_calls": 0,
+            "vehicle_tracks_with_raw_crop_but_zero_florence_calls": 0,
+            "vehicle_tracks_with_valid_colour": 0,
+            "vehicle_tracks_colour_unknown": 0,
             "tracks_with_existing_evidence": 0,
             "tracks_without_evidence": 0,
             "tracks_with_candidate_evidence": 0,
@@ -311,6 +328,11 @@ class VehicleEnrichmentManager:
             "tracks_with_preferred_crop": 0,
             "tracks_with_no_florence_eligible_crop": 0,
             "evidence_items_received": 0,
+            "capture_zone_crops_used_by_enrichment": 0,
+            "capture_zone_fallback_to_existing_evidence": 0,
+            "capture_zone_tracks_without_saved_evidence": 0,
+            "capture_zone_motorcycle_florence_calls": 0,
+            "capture_zone_motorcycle_valid_colours": 0,
             "crop_candidates_evaluated": 0,
             "crop_candidates_rejected": 0,
             "crops_retained": 0,
@@ -342,6 +364,7 @@ class VehicleEnrichmentManager:
             "plate_ocr_attempts": 0,
             "gpu_memory_before_ocr_load_mb": 0.0,
             "gpu_memory_after_ocr_load_mb": 0.0,
+            "vehicle_class_metrics": {},
         }
 
     @property
@@ -349,6 +372,7 @@ class VehicleEnrichmentManager:
         payload = dict(self._metrics)
         payload["crops_rejected_by_reason"] = dict(self._metrics["crops_rejected_by_reason"])
         payload["florence_original_size_distribution"] = dict(self._metrics["florence_original_size_distribution"])
+        payload["vehicle_class_metrics"] = dict(self._metrics["vehicle_class_metrics"])
         payload.update(self.florence_backend.metrics)
         payload.update({f"ocr_backend_{key}": value for key, value in self.ocr_mukul_backend.metrics.items()})
         payload.update(self.body_type_classifier.metrics)
@@ -380,6 +404,7 @@ class VehicleEnrichmentManager:
         results: list[TrackEnrichmentResult] = []
         for track in tracks:
             self._metrics["completed_tracks_received"] += 1
+            self._metrics["vehicle_tracks_finalized"] += 1
             self._metrics["current_in_memory_tracks"] += 1
             started_monotonic = time.perf_counter()
             started_iso = datetime.now(timezone.utc).isoformat()
@@ -420,12 +445,18 @@ class VehicleEnrichmentManager:
                 errors=[],
             )
 
-        adapted = self.adapter.adapt_track(track, evidence_records)
+        evidence_source_name, adapted = self._select_adapted_evidence(track, evidence_records)
+        raw_track_fallback_items = self._load_raw_track_crop_fallback_items(track)
+        adapted = self._merge_with_raw_track_crop_fallbacks(adapted, raw_track_fallback_items)
         self._metrics["evidence_items_received"] += len(adapted)
         if adapted:
             self._metrics["tracks_with_existing_evidence"] += 1
+            if evidence_source_name == "capture_zone":
+                self._metrics["capture_zone_crops_used_by_enrichment"] += len(adapted)
         else:
             self._metrics["tracks_without_evidence"] += 1
+            if evidence_source_name == "capture_zone":
+                self._metrics["capture_zone_tracks_without_saved_evidence"] += 1
             return self._build_base_result(
                 track=track,
                 vehicle_class_confidence=vehicle_class_confidence,
@@ -435,6 +466,13 @@ class VehicleEnrichmentManager:
                 started_monotonic=started_monotonic,
                 errors=[],
             )
+        self.logger.info(
+            "Evidence zone enrichment source camera=%s track=%s source=%s selected=%s",
+            track.camera_id,
+            track.local_track_id,
+            evidence_source_name,
+            len(adapted),
+        )
 
         scored = [self.quality_evaluator.score_item(item) for item in adapted]
         self._metrics["crop_candidates_evaluated"] += len(scored)
@@ -456,6 +494,7 @@ class VehicleEnrichmentManager:
         self._metrics["crops_retained"] += len(selected)
         selected = [self._materialize_selected_crop(track, item) for item in selected]
         self._record_selected_crop_metrics(selected)
+        readable_crop_count = len([item for item in selected if getattr(item, "readable_crop", False)])
         eligible_crop_count = len(
             [
                 item
@@ -464,12 +503,18 @@ class VehicleEnrichmentManager:
             ]
         )
         preferred_crop_count = len([item for item in selected if getattr(item, "resolution_tier", "") == "preferred"])
+        fallback_crop_count = len([item for item in selected if str(getattr(item, "colour_selection_tier", "") or "") == "low_resolution_fallback"])
         if eligible_crop_count > 0:
             self._metrics["tracks_with_acceptable_crop"] += 1
         else:
             self._metrics["tracks_with_no_florence_eligible_crop"] += 1
         if preferred_crop_count > 0:
             self._metrics["tracks_with_preferred_crop"] += 1
+            self._metrics["vehicle_tracks_with_preferred_crop"] += 1
+        if scored:
+            self._metrics["vehicle_tracks_with_raw_crop"] += 1
+        if fallback_crop_count > 0:
+            self._metrics["vehicle_tracks_using_low_resolution_fallback"] += 1
         self._metrics["track_evidence_pending_count"] = max(0, self._metrics["current_in_memory_tracks"])
 
         request = TrackEnrichmentRequest(
@@ -530,6 +575,7 @@ class VehicleEnrichmentManager:
                     "crop_source": row.get("crop_source"),
                     "crop_available": row.get("crop_available"),
                     "crop_skip_reason": row.get("crop_skip_reason"),
+                    "selection_tier": row.get("selection_tier"),
                 }
                 for row in attribute_result.crop_level_rows
             ]
@@ -594,10 +640,33 @@ class VehicleEnrichmentManager:
             adapter_loaded = self.florence_backend.adapter_active
         self._apply_prediction_selection_metadata(selected, body_type_result.predictions, "body_type")
         self._apply_prediction_selection_metadata(selected, colour_result.predictions, "colour")
+        if evidence_source_name == "capture_zone" and str(track.final_class or "").upper() == "MOTORCYCLE":
+            if colour_result.predictions:
+                self._metrics["capture_zone_motorcycle_florence_calls"] += 1
+            if str(colour_result.label or "").upper() not in {"", "UNKNOWN"}:
+                self._metrics["capture_zone_motorcycle_valid_colours"] += 1
         self._metrics["body_type_selected_crop_count"] += len(body_type_result.predictions)
         self._metrics["colour_selected_crop_count"] += len(colour_result.predictions)
         self._metrics["body_type_tracks_waited_for_completion"] += 1
         self._metrics["colour_tracks_waited_for_completion"] += 1
+        colour_selection_tier = self._resolve_colour_selection_tier(colour_result.predictions, selected)
+        if colour_result.predictions:
+            self._metrics["vehicle_tracks_sent_to_florence"] += 1
+        else:
+            self._metrics["vehicle_tracks_with_zero_florence_calls"] += 1
+            if scored and readable_crop_count > 0:
+                self._metrics["vehicle_tracks_with_raw_crop_but_zero_florence_calls"] += 1
+        if str(colour_result.label or "").upper() not in {"", "UNKNOWN"}:
+            self._metrics["vehicle_tracks_with_valid_colour"] += 1
+        else:
+            self._metrics["vehicle_tracks_colour_unknown"] += 1
+        self._record_vehicle_class_metrics(
+            vehicle_class=str(track.final_class or "UNKNOWN").upper(),
+            has_raw_crop=bool(scored),
+            sent_to_florence=bool(colour_result.predictions),
+            used_fallback=fallback_crop_count > 0 or colour_selection_tier == "low_resolution_fallback",
+            valid_colour=str(colour_result.label or "").upper() not in {"", "UNKNOWN"},
+        )
         make_model_result = self.make_model_classifier.classify(request)
         plate_detection_result = self.plate_detector.detect(selected[0]) if selected else PlateDetectionResult(detected=False, predictions=[], status="skipped", source="plate.detector", reason="no_selected_vehicle_crop")
         plate_quality_result = self.plate_quality_validator.validate(None)
@@ -635,6 +704,10 @@ class VehicleEnrichmentManager:
             candidate_crop_count=len(scored),
             eligible_crop_count=eligible_crop_count,
             preferred_crop_count=preferred_crop_count,
+            readable_crop_count=readable_crop_count,
+            fallback_crop_count=fallback_crop_count,
+            selected_colour_crop_count=len(colour_result.predictions),
+            colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
             selected_colour_crop_paths=[str(item.source_crop_path) for item in colour_result.predictions if item.source_crop_path],
             florence_mode=florence_mode,
@@ -659,6 +732,94 @@ class VehicleEnrichmentManager:
             classification_trigger="track_completion",
             final_reason=body_type_result.aggregation_reason or body_type_result.reason or colour_result.aggregation_reason or colour_result.reason,
         )
+
+    def _select_adapted_evidence(
+        self,
+        track: LocalTrack,
+        evidence_records: list[TrackEvidence | dict[str, Any]],
+    ) -> tuple[str, list[Any]]:
+        configured_source = str(self.config["evidence"].get("source", "existing_track_evidence")).strip() or "existing_track_evidence"
+        grouped: dict[str, list[TrackEvidence | dict[str, Any]]] = defaultdict(list)
+        for record in evidence_records:
+            if isinstance(record, dict):
+                source_name = str(record.get("evidence_source", "existing_track_evidence")).strip() or "existing_track_evidence"
+            else:
+                source_name = "existing_track_evidence"
+            grouped[source_name].append(record)
+
+        if configured_source == "capture_zone":
+            return "capture_zone", self.adapter.adapt_track(track, grouped.get("capture_zone", []))
+        if configured_source == "capture_zone_with_existing_fallback":
+            capture_zone_items = self.adapter.adapt_track(track, grouped.get("capture_zone", []))
+            if capture_zone_items:
+                return "capture_zone", capture_zone_items
+            self._metrics["capture_zone_fallback_to_existing_evidence"] += 1
+            return "existing_track_evidence", self.adapter.adapt_track(track, grouped.get("existing_track_evidence", []))
+        return "existing_track_evidence", self.adapter.adapt_track(track, grouped.get("existing_track_evidence", []))
+
+    def _load_raw_track_crop_fallback_items(self, track: LocalTrack) -> list[Any]:
+        track_name = str(track.local_track_id).split(":")[-1]
+        track_directory = self.output_manager.track_crops_directory / track.camera_id / track_name
+        if not track_directory.exists():
+            return []
+        items: list[Any] = []
+        for crop_path in sorted(track_directory.glob("frame_*.jpg")):
+            image = cv2.imread(str(crop_path))
+            if image is None or image.size == 0:
+                continue
+            height, width = image.shape[:2]
+            try:
+                frame_number = int(crop_path.stem.split("_")[-1])
+            except ValueError:
+                frame_number = 0
+            items.append(
+                self.adapter._normalize_record(
+                    track,
+                    {
+                        "local_track_id": track.local_track_id,
+                        "camera_id": track.camera_id,
+                        "native_tracker_id": track.native_tracker_id,
+                        "tracker_namespace": track.tracker_namespace,
+                        "role": "RAW_TRACK_CROP",
+                        "frame_number": frame_number,
+                        "timestamp_seconds": float(getattr(track, "first_timestamp_seconds", 0.0)),
+                        "raw_class_name": track.final_class,
+                        "final_class": track.final_class,
+                        "confidence": 0.0,
+                        "crop_path": str(crop_path),
+                        "annotated_frame_path": str(crop_path),
+                        "bbox_xyxy": [0.0, 0.0, float(width), float(height)],
+                        "original_bbox": [0.0, 0.0, float(width), float(height)],
+                        "expanded_crop_bbox": [0.0, 0.0, float(width), float(height)],
+                        "context_padding_ratio": 0.0,
+                        "source_frame_width": width,
+                        "source_frame_height": height,
+                        "original_crop_width": width,
+                        "original_crop_height": height,
+                        "sharpness_score": 0.0,
+                        "best_overall_score": 0.0,
+                        "evidence_source": "raw_track_crop_fallback",
+                    },
+                )
+            )
+        return [item for item in items if item is not None]
+
+    @staticmethod
+    def _merge_with_raw_track_crop_fallbacks(adapted: list[Any], raw_items: list[Any]) -> list[Any]:
+        if not raw_items:
+            return adapted
+        seen = {
+            (int(getattr(item, "frame_number", -1)), str(getattr(item, "vehicle_crop_path", "") or ""))
+            for item in adapted
+        }
+        merged = list(adapted)
+        for item in raw_items:
+            key = (int(getattr(item, "frame_number", -1)), str(getattr(item, "vehicle_crop_path", "") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
 
     def _build_base_result(
         self,
@@ -692,6 +853,10 @@ class VehicleEnrichmentManager:
         candidate_crop_count: int = 0,
         eligible_crop_count: int = 0,
         preferred_crop_count: int = 0,
+        readable_crop_count: int = 0,
+        fallback_crop_count: int = 0,
+        selected_colour_crop_count: int = 0,
+        colour_selection_tier: str | None = None,
         selected_body_type_crop_paths: list[str] | None = None,
         selected_colour_crop_paths: list[str] | None = None,
         florence_mode: str | None = None,
@@ -739,6 +904,10 @@ class VehicleEnrichmentManager:
             candidate_crop_count=candidate_crop_count,
             eligible_crop_count=eligible_crop_count,
             preferred_crop_count=preferred_crop_count,
+            readable_crop_count=readable_crop_count,
+            fallback_crop_count=fallback_crop_count,
+            selected_colour_crop_count=selected_colour_crop_count,
+            colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=list(selected_body_type_crop_paths or []),
             selected_colour_crop_paths=list(selected_colour_crop_paths or []),
             florence_mode=florence_mode,
@@ -814,14 +983,72 @@ class VehicleEnrichmentManager:
 
     def _select_best_evidence(self, items: list[Any]) -> tuple[list[Any], list[Any]]:
         best_count = int(self.config["best_crops_per_track"])
-        accepted = [item for item in items if not item.rejection_reasons]
-        rejected = [item for item in items if item.rejection_reasons]
-        accepted.sort(key=lambda item: (item.ranking_score, item.quality_score, item.detection_confidence, item.frame_number), reverse=True)
-        selected = accepted[:best_count]
-        rejected.extend(accepted[best_count:])
-        for item in accepted[best_count:]:
+        preferred_candidates = [item for item in items if self._is_preferred_colour_candidate(item)]
+        fallback_candidates = [item for item in items if self._is_readable_colour_candidate(item)]
+        rejected = [item for item in items if not self._is_readable_colour_candidate(item)]
+        ordered_preferred = self._rank_evidence_items(preferred_candidates)
+        ordered_fallback = self._rank_evidence_items(fallback_candidates)
+
+        if ordered_preferred:
+            selected = ordered_preferred[:best_count]
+            for item in selected:
+                if not getattr(item, "colour_selection_tier", None):
+                    item.colour_selection_tier = str(getattr(item, "resolution_tier", "") or "acceptable")
+            rejected.extend(ordered_preferred[best_count:])
+            for item in ordered_preferred[best_count:]:
+                item.rejection_reasons.append("best_crop_limit_exceeded")
+            rejected.extend([item for item in ordered_fallback if item not in selected and item not in ordered_preferred])
+            return selected, rejected
+
+        selected = ordered_fallback[:best_count]
+        for item in selected:
+            if str(getattr(item, "colour_selection_tier", "") or "") != "preferred":
+                item.colour_selection_tier = "low_resolution_fallback"
+        rejected.extend(ordered_fallback[best_count:])
+        for item in ordered_fallback[best_count:]:
             item.rejection_reasons.append("best_crop_limit_exceeded")
         return selected, rejected
+
+    @staticmethod
+    def _rank_evidence_items(items: list[Any]) -> list[Any]:
+        return sorted(
+            items,
+            key=lambda item: (
+                1 if getattr(item, "evidence_source", "") == "capture_zone" else 0,
+                1 if getattr(item, "resolution_tier", "") == "preferred" else 0,
+                float(getattr(item, "ranking_score", 0.0)),
+                float(getattr(item, "quality_score", 0.0)),
+                float(getattr(item, "sharpness_score", 0.0)),
+                float(getattr(item, "detection_confidence", 0.0)),
+                -float(getattr(item, "clipping_ratio", 0.0)),
+                float(getattr(item, "original_crop_area", 0.0) or (getattr(item, "original_crop_width", 0) or 0) * (getattr(item, "original_crop_height", 0) or 0)),
+                float(getattr(item, "original_crop_height", 0)),
+                float(getattr(item, "original_crop_width", 0)),
+                -abs(float(getattr(item, "brightness_score", 0.0)) - 140.0),
+                float(getattr(item, "frame_number", 0)),
+            ),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _is_readable_colour_candidate(item: Any) -> bool:
+        crop_path = Path(str(getattr(item, "vehicle_crop_path", "") or ""))
+        width = int(getattr(item, "original_crop_width", 0) or getattr(item, "crop_width", 0) or 0)
+        height = int(getattr(item, "original_crop_height", 0) or getattr(item, "crop_height", 0) or 0)
+        if not str(crop_path) or not crop_path.exists():
+            return False
+        if width <= 0 or height <= 0:
+            return False
+        if "invalid_bbox" in getattr(item, "rejection_reasons", []):
+            return False
+        if "missing_crop_image" in getattr(item, "rejection_reasons", []):
+            return False
+        if "empty_crop" in getattr(item, "rejection_reasons", []):
+            return False
+        return bool(getattr(item, "readable_crop", True))
+
+    def _is_preferred_colour_candidate(self, item: Any) -> bool:
+        return self._is_readable_colour_candidate(item) and str(getattr(item, "resolution_tier", "") or "") in {"acceptable", "preferred"}
 
     def _record_selected_crop_metrics(self, items: list[Any]) -> None:
         for item in items:
@@ -834,6 +1061,35 @@ class VehicleEnrichmentManager:
                 self._metrics["florence_crops_preferred"] += 1
             key = f"{int(item.original_crop_width)}x{int(item.original_crop_height)}"
             self._metrics["florence_original_size_distribution"][key] = self._metrics["florence_original_size_distribution"].get(key, 0) + 1
+
+    @staticmethod
+    def _resolve_colour_selection_tier(predictions: list[Any], selected_items: list[Any]) -> str | None:
+        by_path = {
+            str(getattr(item, "vehicle_crop_path", "") or ""): str(getattr(item, "colour_selection_tier", "") or "")
+            for item in selected_items
+        }
+        tiers = [by_path.get(str(getattr(prediction, "source_crop_path", "") or ""), "") for prediction in predictions]
+        tiers = [tier for tier in tiers if tier]
+        if not tiers:
+            return None
+        if "low_resolution_fallback" in tiers:
+            return "low_resolution_fallback"
+        if "acceptable" in tiers:
+            return "acceptable"
+        if "preferred" in tiers:
+            return "preferred"
+        return tiers[0]
+
+    def _record_vehicle_class_metrics(self, *, vehicle_class: str, has_raw_crop: bool, sent_to_florence: bool, used_fallback: bool, valid_colour: bool) -> None:
+        key = str(vehicle_class or "UNKNOWN").strip().lower()
+        payload = dict(self._metrics["vehicle_class_metrics"].get(key, {}))
+        payload["tracks_with_raw_crop"] = int(payload.get("tracks_with_raw_crop", 0)) + int(has_raw_crop)
+        payload["tracks_sent_to_florence"] = int(payload.get("tracks_sent_to_florence", 0)) + int(sent_to_florence)
+        payload["tracks_with_zero_florence_calls"] = int(payload.get("tracks_with_zero_florence_calls", 0)) + int(not sent_to_florence and has_raw_crop)
+        payload["tracks_using_fallback"] = int(payload.get("tracks_using_fallback", 0)) + int(used_fallback)
+        payload["tracks_with_valid_colour"] = int(payload.get("tracks_with_valid_colour", 0)) + int(valid_colour)
+        payload["tracks_unknown"] = int(payload.get("tracks_unknown", 0)) + int(not valid_colour)
+        self._metrics["vehicle_class_metrics"][key] = payload
 
     def _materialize_selected_crop(self, track: LocalTrack, item: Any) -> Any:
         current_path = Path(str(item.vehicle_crop_path)) if item.vehicle_crop_path else None

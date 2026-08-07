@@ -282,3 +282,121 @@ def test_normalize_vehicle_enrichment_config_supports_colour_only_vehicle_attrib
     assert normalized["vehicle_attributes"]["colour"]["enabled"] is True
     assert normalized["vehicle_attributes"]["colour"]["prompt"] == "What colour is the vehicle?"
     assert normalized["vehicle_attributes"]["body_type"]["enabled"] is False
+
+
+def test_manager_prefers_capture_zone_with_existing_fallback(tmp_path: Path) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    manager.config["evidence"]["source"] = "capture_zone_with_existing_fallback"
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    image[:, ::2] = 255
+    crop_path = tmp_path / "capture_zone_crop.jpg"
+    cv2.imwrite(str(crop_path), image)
+    record = {
+        "local_track_id": "CAM_001:TRACK_1",
+        "camera_id": "CAM_001",
+        "native_tracker_id": 1,
+        "tracker_namespace": "camera",
+        "role": "CAPTURE_ZONE",
+        "frame_number": 3,
+        "timestamp_seconds": 0.3,
+        "raw_class_name": "car",
+        "final_class": "car",
+        "confidence": 0.9,
+        "crop_path": str(crop_path),
+        "annotated_frame_path": None,
+        "bbox_xyxy": [1.0, 1.0, 20.0, 20.0],
+        "original_bbox": [1.0, 1.0, 20.0, 20.0],
+        "expanded_crop_bbox": [1, 1, 20, 20],
+        "context_padding_ratio": 0.0,
+        "source_frame_width": 30,
+        "source_frame_height": 30,
+        "original_crop_width": 19,
+        "original_crop_height": 19,
+        "sharpness_score": 10.0,
+        "best_overall_score": 0.9,
+        "evidence_source": "capture_zone",
+    }
+
+    result = manager.enrich_completed_tracks([_track()], [record, _record(str(crop_path))])[0]
+
+    assert result.status == "evidence_ready"
+    assert manager.metrics["capture_zone_crops_used_by_enrichment"] >= 1
+    assert result.evidence_used[0].evidence_source == "capture_zone"
+
+
+def test_manager_falls_back_to_existing_evidence_when_capture_zone_missing(tmp_path: Path) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    manager.config["evidence"]["source"] = "capture_zone_with_existing_fallback"
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    image[:, ::2] = 255
+    crop_path = tmp_path / "fallback_crop.jpg"
+    cv2.imwrite(str(crop_path), image)
+
+    result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+
+    assert result.status == "evidence_ready"
+    assert manager.metrics["capture_zone_fallback_to_existing_evidence"] == 1
+    assert result.evidence_used[0].evidence_source == "existing_track_evidence"
+
+
+def test_manager_uses_raw_track_crop_fallback_when_finalized_evidence_missing(tmp_path: Path, monkeypatch) -> None:
+    output_manager = RunOutputManager(tmp_path)
+    logger = setup_logging(output_manager.run_directory, log_level="INFO")
+    config = {
+        "vehicle_enrichment": {
+            "enabled": True,
+            "fail_open": True,
+            "best_crops_per_track": 3,
+            "extend_tracks_json": True,
+            "write_separate_output": True,
+            "evidence": {
+                "source": "existing_track_evidence",
+                "save_vehicle_crops": True,
+                "minimum_crop_width": 10,
+                "minimum_crop_height": 10,
+                "minimum_sharpness": 1.0,
+                "minimum_quality_score": 0.0,
+                "border_margin_ratio": 0.02,
+                "scoring": {
+                    "area_weight": 0.25,
+                    "sharpness_weight": 0.25,
+                    "confidence_weight": 0.20,
+                    "role_weight": 0.15,
+                    "border_weight": 0.05,
+                    "clipping_weight": 0.05,
+                    "brightness_weight": 0.05,
+                },
+            },
+            "shared_florence": {"enabled": False},
+            "body_type": {"enabled": False},
+            "colour": {"enabled": True},
+            "make_model": {"enabled": False},
+            "plate": {"detection_enabled": False, "colour_enabled": False},
+            "ocr": {"enabled": False, "run_only_when_plate_detected": True},
+        }
+    }
+    manager = VehicleEnrichmentManager(config, logger, output_manager)
+    image = np.full((101, 79, 3), 130, dtype=np.uint8)
+    image[:, ::2] = 255
+    raw_track_dir = output_manager.track_crops_directory / "CAM_001" / "TRACK_1"
+    raw_track_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(raw_track_dir / "frame_001152.jpg"), image)
+    monkeypatch.setattr(
+        manager.colour_classifier,
+        "classify",
+        lambda request: VehicleColourResult(
+            label="BLACK",
+            predictions=[],
+            status="completed",
+            source="florence2",
+            aggregation_reason="weighted_agreement",
+        ),
+    )
+
+    result = manager.enrich_completed_tracks([_track()], [])[0]
+
+    assert result.status == "completed"
+    assert result.candidate_crop_count >= 1
+    assert result.readable_crop_count >= 1
+    assert result.fallback_crop_count >= 1
+    assert result.evidence_used[0].evidence_source == "raw_track_crop_fallback"

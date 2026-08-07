@@ -115,6 +115,33 @@ def _load_raw_config(config_path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def _validate_capture_zone_profile(profile: dict[str, Any], context: str) -> dict[str, Any]:
+    normalized = {
+        "top_ratio": float(profile.get("top_ratio", 0.55)),
+        "bottom_ratio": float(profile.get("bottom_ratio", 0.72)),
+        "trigger_point": str(profile.get("trigger_point", "bottom_center")).strip() or "bottom_center",
+        "maximum_saved_candidates_per_track": int(profile.get("maximum_saved_candidates_per_track", 3)),
+        "minimum_frame_gap": int(profile.get("minimum_frame_gap", 2)),
+        "capture_policy": str(profile.get("capture_policy", "best_quality")).strip() or "best_quality",
+        "save_immediately": bool(profile.get("save_immediately", True)),
+        "require_confirmed_track": bool(profile.get("require_confirmed_track", True)),
+        "minimum_bbox_width_pixels": int(profile.get("minimum_bbox_width_pixels", 40)),
+        "minimum_bbox_height_pixels": int(profile.get("minimum_bbox_height_pixels", 40)),
+        "direction_mode": str(profile.get("direction_mode", "any")).strip() or "any",
+    }
+    if normalized["trigger_point"] != "bottom_center":
+        raise ConfigurationError(f"{context}.trigger_point must be bottom_center.")
+    if not 0.0 <= normalized["top_ratio"] < normalized["bottom_ratio"] <= 1.0:
+        raise ConfigurationError(f"{context} ratios must satisfy 0.0 <= top_ratio < bottom_ratio <= 1.0.")
+    if normalized["maximum_saved_candidates_per_track"] < 1:
+        raise ConfigurationError(f"{context}.maximum_saved_candidates_per_track must be at least 1.")
+    if normalized["minimum_frame_gap"] < 0:
+        raise ConfigurationError(f"{context}.minimum_frame_gap must be at least 0.")
+    if normalized["minimum_bbox_width_pixels"] < 1 or normalized["minimum_bbox_height_pixels"] < 1:
+        raise ConfigurationError(f"{context} minimum bbox dimensions must be at least 1.")
+    return normalized
+
+
 def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     project = raw_config.get("project")
     input_section = raw_config.get("input")
@@ -124,6 +151,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
+    debug_outputs = raw_config.get("debug_outputs")
     vehicle_enrichment = raw_config.get("vehicle_enrichment")
     if not isinstance(project, dict):
         raise ConfigurationError("Missing or invalid 'project' section.")
@@ -141,6 +169,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Missing or invalid 'visualization' section.")
     if not isinstance(output_section, dict):
         raise ConfigurationError("Missing or invalid 'output' section.")
+    if debug_outputs is not None and not isinstance(debug_outputs, dict):
+        raise ConfigurationError("Invalid 'debug_outputs' section.")
     if vehicle_enrichment is not None and not isinstance(vehicle_enrichment, dict):
         raise ConfigurationError("Invalid 'vehicle_enrichment' section.")
 
@@ -281,6 +311,116 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         output_root = output_root.resolve()
     evidence_section = dict(evidence or {})
     evidence_weights = dict(evidence_section.get("best_overall_weights", {}) or {})
+    capture_zone_section = dict(evidence_section.get("capture_zone", {}) or {})
+    capture_zone_cameras = dict(capture_zone_section.get("cameras", {}) or {})
+    capture_zone_enabled = bool(capture_zone_section.get("enabled", False))
+    capture_zone_default = {
+        **dict(capture_zone_section.get("default", {}) or {}),
+        "trigger_point": capture_zone_section.get("trigger_point", dict(capture_zone_section.get("default", {}) or {}).get("trigger_point", "bottom_center")),
+        "maximum_saved_candidates_per_track": capture_zone_section.get("maximum_saved_candidates_per_track", dict(capture_zone_section.get("default", {}) or {}).get("maximum_saved_candidates_per_track", 3)),
+        "minimum_frame_gap": capture_zone_section.get("minimum_frame_gap", dict(capture_zone_section.get("default", {}) or {}).get("minimum_frame_gap", 2)),
+        "capture_policy": capture_zone_section.get("capture_policy", dict(capture_zone_section.get("default", {}) or {}).get("capture_policy", "best_quality")),
+        "save_immediately": capture_zone_section.get("save_immediately", dict(capture_zone_section.get("default", {}) or {}).get("save_immediately", True)),
+        "require_confirmed_track": capture_zone_section.get("require_confirmed_track", dict(capture_zone_section.get("default", {}) or {}).get("require_confirmed_track", True)),
+        "minimum_bbox_width_pixels": capture_zone_section.get("minimum_bbox_width_pixels", dict(capture_zone_section.get("default", {}) or {}).get("minimum_bbox_width_pixels", evidence_section.get("minimum_crop_width_pixels", 40))),
+        "minimum_bbox_height_pixels": capture_zone_section.get("minimum_bbox_height_pixels", dict(capture_zone_section.get("default", {}) or {}).get("minimum_bbox_height_pixels", evidence_section.get("minimum_crop_height_pixels", 40))),
+        "direction_mode": capture_zone_section.get("direction_mode", dict(capture_zone_section.get("default", {}) or {}).get("direction_mode", "any")),
+    }
+    if "top_ratio" in capture_zone_section or "bottom_ratio" in capture_zone_section:
+        capture_zone_default = {
+            **capture_zone_default,
+            "top_ratio": capture_zone_section.get("top_ratio", capture_zone_default.get("top_ratio", 0.55)),
+            "bottom_ratio": capture_zone_section.get("bottom_ratio", capture_zone_default.get("bottom_ratio", 0.72)),
+        }
+    capture_zone_default.setdefault("trigger_point", capture_zone_section.get("trigger_point", "bottom_center"))
+    capture_zone_default.setdefault("maximum_saved_candidates_per_track", capture_zone_section.get("maximum_saved_candidates_per_track", 3))
+    capture_zone_default.setdefault("minimum_frame_gap", capture_zone_section.get("minimum_frame_gap", 2))
+    capture_zone_default.setdefault("capture_policy", capture_zone_section.get("capture_policy", "best_quality"))
+    capture_zone_default.setdefault("save_immediately", capture_zone_section.get("save_immediately", True))
+    capture_zone_default.setdefault("require_confirmed_track", capture_zone_section.get("require_confirmed_track", True))
+    capture_zone_default.setdefault("minimum_bbox_width_pixels", capture_zone_section.get("minimum_bbox_width_pixels", evidence_section.get("minimum_crop_width_pixels", 40)))
+    capture_zone_default.setdefault("minimum_bbox_height_pixels", capture_zone_section.get("minimum_bbox_height_pixels", evidence_section.get("minimum_crop_height_pixels", 40)))
+    capture_zone_default.setdefault("direction_mode", capture_zone_section.get("direction_mode", "any"))
+    normalized_capture_zone_default = _validate_capture_zone_profile(capture_zone_default, "evidence.capture_zone.default")
+    normalized_capture_zone_class_specific: dict[str, dict[str, Any]] = {}
+    for class_name, payload in dict(capture_zone_section.get("class_specific", {}) or {}).items():
+        if not isinstance(payload, dict):
+            raise ConfigurationError(f"evidence.capture_zone.class_specific.{class_name} must be a mapping.")
+        normalized_capture_zone_class_specific[str(class_name).strip().lower()] = _validate_capture_zone_profile(
+            {**normalized_capture_zone_default, **dict(payload)},
+            f"evidence.capture_zone.class_specific.{class_name}",
+        )
+    normalized_capture_zone_cameras: dict[str, dict[str, Any]] = {}
+    for camera_id, payload in capture_zone_cameras.items():
+        if not isinstance(payload, dict):
+            raise ConfigurationError(f"evidence.capture_zone.cameras.{camera_id} must be a mapping.")
+        payload = dict(payload)
+        camera_default = {
+            **dict(payload.get("default", {}) or {}),
+            "trigger_point": payload.get("trigger_point", dict(payload.get("default", {}) or {}).get("trigger_point", normalized_capture_zone_default["trigger_point"])),
+            "maximum_saved_candidates_per_track": payload.get("maximum_saved_candidates_per_track", dict(payload.get("default", {}) or {}).get("maximum_saved_candidates_per_track", normalized_capture_zone_default["maximum_saved_candidates_per_track"])),
+            "minimum_frame_gap": payload.get("minimum_frame_gap", dict(payload.get("default", {}) or {}).get("minimum_frame_gap", normalized_capture_zone_default["minimum_frame_gap"])),
+            "capture_policy": payload.get("capture_policy", dict(payload.get("default", {}) or {}).get("capture_policy", normalized_capture_zone_default["capture_policy"])),
+            "save_immediately": payload.get("save_immediately", dict(payload.get("default", {}) or {}).get("save_immediately", normalized_capture_zone_default["save_immediately"])),
+            "require_confirmed_track": payload.get("require_confirmed_track", dict(payload.get("default", {}) or {}).get("require_confirmed_track", normalized_capture_zone_default["require_confirmed_track"])),
+            "minimum_bbox_width_pixels": payload.get("minimum_bbox_width_pixels", dict(payload.get("default", {}) or {}).get("minimum_bbox_width_pixels", normalized_capture_zone_default["minimum_bbox_width_pixels"])),
+            "minimum_bbox_height_pixels": payload.get("minimum_bbox_height_pixels", dict(payload.get("default", {}) or {}).get("minimum_bbox_height_pixels", normalized_capture_zone_default["minimum_bbox_height_pixels"])),
+            "direction_mode": payload.get("direction_mode", dict(payload.get("default", {}) or {}).get("direction_mode", normalized_capture_zone_default["direction_mode"])),
+        }
+        if "top_ratio" in payload or "bottom_ratio" in payload:
+            camera_default = {
+                **camera_default,
+                "top_ratio": payload.get("top_ratio", camera_default.get("top_ratio", normalized_capture_zone_default["top_ratio"])),
+                "bottom_ratio": payload.get("bottom_ratio", camera_default.get("bottom_ratio", normalized_capture_zone_default["bottom_ratio"])),
+            }
+        normalized_camera_default = _validate_capture_zone_profile(
+            {**normalized_capture_zone_default, **camera_default},
+            f"evidence.capture_zone.cameras.{camera_id}.default",
+        )
+        normalized_camera_class_specific: dict[str, dict[str, Any]] = {}
+        for class_name, class_payload in dict(payload.get("class_specific", {}) or {}).items():
+            if not isinstance(class_payload, dict):
+                raise ConfigurationError(f"evidence.capture_zone.cameras.{camera_id}.class_specific.{class_name} must be a mapping.")
+            class_key = str(class_name).strip().lower()
+            fallback_profile = normalized_capture_zone_class_specific.get(class_key, normalized_camera_default)
+            normalized_camera_class_specific[class_key] = _validate_capture_zone_profile(
+                {**fallback_profile, **dict(class_payload)},
+                f"evidence.capture_zone.cameras.{camera_id}.class_specific.{class_name}",
+            )
+        normalized_capture_zone_cameras[str(camera_id).strip()] = {
+            "enabled": bool(payload.get("enabled", capture_zone_enabled)),
+            "default": normalized_camera_default,
+            "class_specific": normalized_camera_class_specific,
+        }
+    visualization_capture_zone = dict(visualization.get("capture_zone", {}) or {})
+    debug_outputs_section = dict(debug_outputs or {})
+    def _normalize_debug_output_item(name: str, *, default_enabled: bool = False, default_every_n: int = 1, default_max_frames: int = 0, default_max_crops: int = 0) -> dict[str, Any]:
+        payload = dict(debug_outputs_section.get(name, {}) or {})
+        save_every_n_frames = int(payload.get("save_every_n_frames", default_every_n))
+        max_saved_frames_per_camera = int(payload.get("max_saved_frames_per_camera", default_max_frames))
+        max_crops_per_track = int(payload.get("max_crops_per_track", default_max_crops))
+        if save_every_n_frames < 1:
+            raise ConfigurationError(f"debug_outputs.{name}.save_every_n_frames must be at least 1.")
+        if max_saved_frames_per_camera < 0:
+            raise ConfigurationError(f"debug_outputs.{name}.max_saved_frames_per_camera must be at least 0.")
+        if max_crops_per_track < 0:
+            raise ConfigurationError(f"debug_outputs.{name}.max_crops_per_track must be at least 0.")
+        return {
+            "enabled": bool(payload.get("enabled", default_enabled)),
+            "save_every_n_frames": save_every_n_frames,
+            "max_saved_frames_per_camera": max_saved_frames_per_camera,
+            "max_crops_per_track": max_crops_per_track,
+        }
+    normalized_debug_outputs = {
+        "enabled": bool(debug_outputs_section.get("enabled", False)),
+        "extracted_frames": _normalize_debug_output_item("extracted_frames"),
+        "detected_frames": _normalize_debug_output_item("detected_frames"),
+        "tracked_frames": _normalize_debug_output_item("tracked_frames"),
+        "track_crops": _normalize_debug_output_item("track_crops", default_every_n=3, default_max_crops=100),
+        "florence_selected_crops": {
+            "enabled": bool(dict(debug_outputs_section.get("florence_selected_crops", {}) or {}).get("enabled", False)),
+        },
+    }
     normalized_vehicle_enrichment = normalize_vehicle_enrichment_config(vehicle_enrichment or {})
 
     return {
@@ -377,6 +517,23 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
                 "centeredness": float(evidence_weights.get("centeredness", 0.10)),
                 "edge_visibility": float(evidence_weights.get("edge_visibility", 0.10)),
             },
+            "capture_zone": {
+                "enabled": capture_zone_enabled,
+                "default": normalized_capture_zone_default,
+                "class_specific": normalized_capture_zone_class_specific,
+                "top_ratio": normalized_capture_zone_default["top_ratio"],
+                "bottom_ratio": normalized_capture_zone_default["bottom_ratio"],
+                "trigger_point": normalized_capture_zone_default["trigger_point"],
+                "maximum_saved_candidates_per_track": normalized_capture_zone_default["maximum_saved_candidates_per_track"],
+                "minimum_frame_gap": normalized_capture_zone_default["minimum_frame_gap"],
+                "capture_policy": normalized_capture_zone_default["capture_policy"],
+                "save_immediately": normalized_capture_zone_default["save_immediately"],
+                "require_confirmed_track": normalized_capture_zone_default["require_confirmed_track"],
+                "minimum_bbox_width_pixels": normalized_capture_zone_default["minimum_bbox_width_pixels"],
+                "minimum_bbox_height_pixels": normalized_capture_zone_default["minimum_bbox_height_pixels"],
+                "direction_mode": normalized_capture_zone_default["direction_mode"],
+                "cameras": normalized_capture_zone_cameras,
+            },
         },
         "visualization": {
             "show_rejected_boxes": bool(visualization.get("show_rejected_boxes", False)),
@@ -390,11 +547,15 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
                 "save_every_n_frames": int(tracked_frames.get("save_every_n_frames", 10)),
                 "max_saved_frames_per_camera": int(tracked_frames.get("max_saved_frames_per_camera", 20)),
             },
+            "capture_zone": {
+                "enabled": bool(visualization_capture_zone.get("enabled", False)),
+            },
         },
         "output": {
             "root_directory": str(output_root),
             "save_run_config": bool(output_section.get("save_run_config", True)),
         },
+        "debug_outputs": normalized_debug_outputs,
         "vehicle_enrichment": normalized_vehicle_enrichment,
     }
 
@@ -415,6 +576,15 @@ def _should_save_visualization_frame(frame_number: int, saved_so_far: int, visua
         return False
     every_n = int(visualization_config.get("save_every_n_frames", 1))
     return frame_number % every_n == 0
+
+
+def _capture_zone_enabled_for_camera(config: dict[str, Any], camera_id: str) -> bool:
+    capture_zone = dict(dict(config.get("evidence", {}) or {}).get("capture_zone", {}) or {})
+    enabled = bool(capture_zone.get("enabled", False))
+    overrides = dict(capture_zone.get("cameras", {}) or {}).get(camera_id)
+    if isinstance(overrides, dict) and "enabled" in overrides:
+        enabled = bool(overrides.get("enabled"))
+    return enabled
 
 
 def run_pipeline(config_path: str) -> tuple[int, str, str]:
@@ -463,6 +633,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         if deferred_setup_error is not None:
             raise deferred_setup_error
         validated_config = _validate_config(raw_config or _load_raw_config(config_file), config_file)
+        output_manager.configure_debug_outputs(validated_config.get("debug_outputs", {}))
         for camera in validated_config["input"]["cameras"]:
             if camera["enabled"]:
                 logger.info(
@@ -471,6 +642,18 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                     camera["source_type"],
                     camera["source"],
                 )
+                if _capture_zone_enabled_for_camera(validated_config, camera["camera_id"]):
+                    camera_capture_zone = dict(validated_config["evidence"]["capture_zone"])
+                    overrides = dict(camera_capture_zone.get("cameras", {}) or {}).get(camera["camera_id"])
+                    camera_default_zone = dict(camera_capture_zone.get("default", {}) or {})
+                    if isinstance(overrides, dict):
+                        camera_default_zone = dict(overrides.get("default", camera_default_zone) or camera_default_zone)
+                    logger.info(
+                        "Evidence zone configured camera=%s top_ratio=%.2f bottom_ratio=%.2f",
+                        camera["camera_id"],
+                        float(camera_default_zone.get("top_ratio", camera_capture_zone.get("top_ratio", 0.0))),
+                        float(camera_default_zone.get("bottom_ratio", camera_capture_zone.get("bottom_ratio", 0.0))),
+                    )
         metadata.project_name = validated_config["project"]["name"]
         metadata.camera_count = len([camera for camera in validated_config["input"]["cameras"] if camera["enabled"]])
         if bool(validated_config["output"]["save_run_config"]):
@@ -682,6 +865,10 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             )
         evidence_summary_by_track = _build_evidence_summary_by_track(evidence_index_records)
         enrichment_by_track = {item.local_track_id: item.to_dict() for item in enrichment_results}
+        track_crop_manifest_rows = _merge_track_crop_manifest_rows(
+            evidence_collector.debug_track_crop_rows,
+            enrichment_results,
+        )
         tracks_path = output_manager.save_tracks(
             [
                 _serialize_track(
@@ -696,6 +883,15 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         lifecycle_metrics_path = output_manager.save_track_lifecycle_metrics(lifecycle_metrics)
         evidence_index_path = output_manager.save_evidence_index(evidence_index_records)
         evidence_metrics_path = output_manager.save_evidence_metrics(evidence_metrics)
+        track_crop_manifest_path = output_manager.save_track_crop_manifest(track_crop_manifest_rows)
+        capture_zone_index_path = output_manager.save_capture_zone_index(evidence_collector.capture_zone_index)
+        capture_zone_metrics_path = output_manager.save_capture_zone_metrics(
+            {
+                key: value
+                for key, value in evidence_metrics.items()
+                if str(key).startswith("capture_zone_")
+            }
+        )
         vehicle_enrichment_path = output_manager.save_vehicle_enrichment([item.to_dict() for item in enrichment_results])
         vehicle_enrichment_metrics_path = output_manager.save_vehicle_enrichment_metrics(vehicle_enrichment_manager.metrics)
         vehicle_enrichment_validation_report_path = output_manager.save_vehicle_enrichment_validation_report(
@@ -707,6 +903,70 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         vehicle_enrichment_track_evidence_summary_path = output_manager.save_vehicle_enrichment_track_evidence_summary(
             _build_vehicle_enrichment_track_evidence_summary_rows(enrichment_results, track_manager.get_all_output_tracks())
         )
+        enrichment_by_local_track_id = {item.local_track_id: item for item in enrichment_results}
+        motorcycle_geometry_rows: list[dict[str, Any]] = []
+        for row in evidence_collector.motorcycle_geometry_records:
+            merged = dict(row)
+            enrichment = enrichment_by_local_track_id.get(str(row.get("local_track_id", "")))
+            evidence_sources = [getattr(item, "evidence_source", None) for item in getattr(enrichment, "evidence_used", [])] if enrichment is not None else []
+            used_capture_zone = "capture_zone" in {str(item or "") for item in evidence_sources}
+            florence_called = bool(getattr(enrichment, "vehicle_attribute_inference_count", 0)) if enrichment is not None else False
+            final_colour = str(getattr(getattr(enrichment, "vehicle_colour", None), "label", "UNKNOWN") or "UNKNOWN") if enrichment is not None else "UNKNOWN"
+            final_colour_status = str(getattr(getattr(enrichment, "vehicle_colour", None), "status", "") or "") if enrichment is not None else ""
+            if merged.get("geometry_status") == "CAPTURED_ELIGIBLE" and used_capture_zone and florence_called and final_colour.upper() == "UNKNOWN":
+                merged["geometry_status"] = "CAPTURED_BUT_ENRICHMENT_FAILED"
+                merged["geometry_reason"] = "capture_zone_crop_reached_enrichment_but_colour_unknown"
+            merged["enrichment_source"] = "capture_zone" if used_capture_zone else ("existing_track_evidence" if enrichment is not None else None)
+            merged["eligible_crop_count"] = int(getattr(enrichment, "eligible_crop_count", 0)) if enrichment is not None else 0
+            merged["florence_called"] = florence_called
+            merged["final_colour"] = final_colour
+            merged["final_colour_status"] = final_colour_status
+            motorcycle_geometry_rows.append(merged)
+        motorcycle_geometry_report_path = output_manager.save_motorcycle_geometry_report(motorcycle_geometry_rows)
+        status_counts: dict[str, int] = {}
+        for row in motorcycle_geometry_rows:
+            status = str(row.get("geometry_status", "UNKNOWN"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+        trigger_buckets = {"<0.50": 0, "0.50-0.60": 0, "0.60-0.70": 0, "0.70-0.80": 0, ">0.80": 0}
+        for row in motorcycle_geometry_rows:
+            frame_height = float(row.get("source_frame_height", 0) or 0)
+            max_trigger_y = float(row.get("max_trigger_y", 0.0) or 0.0)
+            ratio = (max_trigger_y / frame_height) if frame_height > 0 else 0.0
+            if ratio < 0.50:
+                trigger_buckets["<0.50"] += 1
+            elif ratio < 0.60:
+                trigger_buckets["0.50-0.60"] += 1
+            elif ratio < 0.70:
+                trigger_buckets["0.60-0.70"] += 1
+            elif ratio < 0.80:
+                trigger_buckets["0.70-0.80"] += 1
+            else:
+                trigger_buckets[">0.80"] += 1
+        motorcycle_metrics_summary = {
+            "motorcycle_tracks_total": len(motorcycle_geometry_rows),
+            "motorcycle_tracks_reached_zone": sum(1 for row in motorcycle_geometry_rows if bool(row.get("entered_zone"))),
+            "motorcycle_tracks_never_reached_zone": status_counts.get("NEVER_REACHED_ZONE", 0),
+            "motorcycle_tracks_lost_before_zone": status_counts.get("TRACK_ENDED_BEFORE_ZONE", 0),
+            "motorcycle_tracks_reached_zone_no_capture": status_counts.get("REACHED_ZONE_NO_CAPTURE", 0),
+            "motorcycle_tracks_captured": sum(1 for row in motorcycle_geometry_rows if int(row.get("retained_candidates", 0) or 0) > 0),
+            "motorcycle_tracks_captured_too_small": status_counts.get("CAPTURED_TOO_SMALL", 0),
+            "motorcycle_tracks_with_eligible_zone_crop": sum(1 for row in motorcycle_geometry_rows if bool(row.get("evidence_eligible_zone_crop")) or bool(row.get("florence_eligible_zone_crop"))),
+            "motorcycle_tracks_sent_to_florence": sum(1 for row in motorcycle_geometry_rows if bool(row.get("florence_called")) and row.get("enrichment_source") == "capture_zone"),
+            "motorcycle_tracks_with_valid_colour": sum(
+                1
+                for row in motorcycle_geometry_rows
+                if row.get("enrichment_source") == "capture_zone" and str(row.get("final_colour", "UNKNOWN")).upper() != "UNKNOWN"
+            ),
+            "motorcycle_max_trigger_y_distribution": trigger_buckets,
+            "motorcycle_geometry_status_counts": status_counts,
+        }
+        vehicle_pipeline_trace_rows = _build_vehicle_pipeline_trace_rows(
+            track_manager.get_all_output_tracks(),
+            track_crop_manifest_rows,
+            motorcycle_geometry_rows,
+            enrichment_results,
+        )
+        vehicle_pipeline_trace_path = output_manager.save_vehicle_pipeline_trace(vehicle_pipeline_trace_rows)
         ocr_mukul_result_rows = _build_ocr_mukul_result_rows(enrichment_results)
         if ocr_mukul_result_rows:
             with (output_manager.run_directory / "ocr_mukul_florence_results.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -736,6 +996,14 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 writer.writeheader()
                 writer.writerows(vehicle_colour_result_rows)
             (output_manager.run_directory / "vehicle_colour_results.json").write_text(
+                json.dumps(vehicle_colour_result_rows, indent=2),
+                encoding="utf-8",
+            )
+            with (output_manager.florence_results_directory / "vehicle_colour_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_colour_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_colour_result_rows)
+            (output_manager.florence_results_directory / "vehicle_colour_results.json").write_text(
                 json.dumps(vehicle_colour_result_rows, indent=2),
                 encoding="utf-8",
             )
@@ -805,18 +1073,40 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "tracks_discarded_by_camera": lifecycle_metrics["tracks_discarded_by_camera"],
                 "observations_by_camera": lifecycle_metrics["observations_by_camera"],
                 "selected_evidence_records": len(evidence_index_records),
+                "evidence_capture_zone": {
+                    "enabled": any(_capture_zone_enabled_for_camera(validated_config, camera["camera_id"]) for camera in validated_config["input"]["cameras"] if camera["enabled"]),
+                    "top_ratio": float(validated_config["evidence"].get("capture_zone", {}).get("top_ratio", 0.0)),
+                    "bottom_ratio": float(validated_config["evidence"].get("capture_zone", {}).get("bottom_ratio", 0.0)),
+                    "trigger_point": str(validated_config["evidence"].get("capture_zone", {}).get("trigger_point", "bottom_center")),
+                    "tracks_entered": int(evidence_metrics.get("capture_zone_tracks_entered", 0)),
+                    "tracks_with_saved_evidence": int(evidence_metrics.get("capture_zone_tracks_with_saved_evidence", 0)),
+                    "candidates_saved": int(evidence_metrics.get("capture_zone_candidates_saved", 0)),
+                    "crops_used_by_enrichment": int(vehicle_enrichment_manager.metrics.get("capture_zone_crops_used_by_enrichment", 0)),
+                    "fallback_count": int(vehicle_enrichment_manager.metrics.get("capture_zone_fallback_to_existing_evidence", 0)),
+                },
+                "motorcycle_geometry": {
+                    **motorcycle_metrics_summary,
+                    "report_path": str(motorcycle_geometry_report_path),
+                },
+                "track_crop_manifest_path": str(track_crop_manifest_path),
+                "vehicle_pipeline_trace_path": str(vehicle_pipeline_trace_path),
                 "vehicle_enrichment_enabled": validated_config["vehicle_enrichment"]["enabled"],
                 "vehicle_enrichment_result_count": len(enrichment_results),
                 "run_directory": str(output_manager.run_directory),
             }
         )
         logger.info(
-            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
+            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s track_crop_manifest=%s capture_zone_index=%s capture_zone_metrics=%s motorcycle_geometry_report=%s vehicle_pipeline_trace=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
             tracks_path,
             observations_path,
             lifecycle_metrics_path,
             evidence_index_path,
             evidence_metrics_path,
+            track_crop_manifest_path,
+            capture_zone_index_path,
+            capture_zone_metrics_path,
+            motorcycle_geometry_report_path,
+            vehicle_pipeline_trace_path,
             vehicle_enrichment_path,
             vehicle_enrichment_metrics_path,
             vehicle_enrichment_validation_report_path,
@@ -1041,8 +1331,9 @@ def _build_vehicle_enrichment_crop_diagnostics_rows(enrichment_results: list[Any
                     "source_frame_height": getattr(item, "source_frame_height", None),
                     "original_crop_width": getattr(item, "original_crop_width", None),
                     "original_crop_height": getattr(item, "original_crop_height", None),
-                    "resolution_tier": getattr(item, "resolution_tier", None),
-                    "sharpness": getattr(item, "sharpness_score", None),
+                "resolution_tier": getattr(item, "resolution_tier", None),
+                "selection_tier": getattr(item, "colour_selection_tier", None),
+                "sharpness": getattr(item, "sharpness_score", None),
                     "brightness": getattr(item, "brightness_score", None),
                     "quality_score": getattr(item, "quality_score", None),
                     "eligible_for_body_type": getattr(item, "florence_eligible_for_body_type", None),
@@ -1193,17 +1484,23 @@ def _build_vehicle_colour_result_rows(enrichment_results: list[Any]) -> list[dic
                     "frame_index": frame_index,
                     "vehicle_class": result.vehicle_class,
                     "vehicle_crop_path": crop_path,
+                    "source_crop_path": crop_path,
+                    "florence_selected_copy_path": crop_path,
                     "crop_quality_score": getattr(evidence, "quality_score", None),
+                    "original_crop_width": getattr(evidence, "original_crop_width", None),
+                    "original_crop_height": getattr(evidence, "original_crop_height", None),
                     "task_token": getattr(result.vehicle_colour, "task_prompt", None),
                     "prompt": getattr(result.vehicle_colour, "prompt_text", None),
                     "effective_processor_text": f"{getattr(result.vehicle_colour, 'task_prompt', '') or ''}{getattr(result.vehicle_colour, 'prompt_text', '') or ''}",
                     "raw_response": "" if prediction is None or prediction.raw_response in (None, "") else str(prediction.raw_response),
                     "post_processed_response": caption_row.get("caption"),
                     "parsed_colour": colour_item.get("normalized_colour"),
+                    "selection_tier": colour_item.get("selection_tier") or getattr(evidence, "colour_selection_tier", None),
                     "colour_status": "completed" if prediction is not None else "skipped",
                     "colour_reason": colour_item.get("reason") or getattr(result, "final_colour_reason", None),
                     "inference_time_ms": None if prediction is None else prediction.inference_duration_ms,
-                    "adapter_loaded": False,
+                    "model": None if prediction is None else prediction.source_model,
+                    "adapter_loaded": False if prediction is None or prediction.adapter_active is None else prediction.adapter_active,
                     "crop_source": colour_item.get("crop_source"),
                     "crop_available": colour_item.get("crop_available"),
                     "crop_skip_reason": colour_item.get("crop_skip_reason"),
@@ -1235,12 +1532,124 @@ def _build_vehicle_colour_track_summary_rows(enrichment_results: list[Any]) -> l
                 "vehicle_class": result.vehicle_class,
                 "selected_crop_count": len(list(getattr(result, "evidence_used", []) or [])),
                 "colour_inference_count": int(getattr(result, "vehicle_attribute_inference_count", 0) or len(colour_predictions)),
+                "colour_selection_tier": getattr(result, "colour_selection_tier", None),
                 "crop_colour_predictions": crop_colour_predictions,
                 "final_vehicle_colour": result.vehicle_colour.label,
                 "colour_consensus_status": result.vehicle_colour.status,
                 "colour_consensus_reason": getattr(result, "final_colour_reason", None),
                 "valid_prediction_count": valid_prediction_count,
                 "unknown_prediction_count": unknown_prediction_count,
+            }
+        )
+    return rows
+
+
+def _merge_track_crop_manifest_rows(raw_rows: list[dict[str, Any]], enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    merged = [dict(row) for row in raw_rows]
+    by_track_frame: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in merged:
+        by_track_frame.setdefault((str(row.get("local_track_id", "")), int(row.get("frame_number", -1))), []).append(row)
+    for result in enrichment_results:
+        for item in list(getattr(result, "evidence_used", []) or []):
+            key = (str(getattr(item, "local_track_id", "")), int(getattr(item, "frame_number", -1)))
+            for row in by_track_frame.get(key, []):
+                row["evidence_eligible"] = bool(getattr(item, "evidence_eligible", row.get("evidence_eligible", False)))
+                evidence_reasons = list(getattr(item, "rejection_reasons", []) or [])
+                row["evidence_rejection_reason"] = " | ".join(evidence_reasons) if evidence_reasons else row.get("evidence_rejection_reason")
+                row["florence_eligible"] = bool(getattr(item, "florence_eligible_for_colour", row.get("florence_eligible", False)))
+                row["florence_rejection_reason"] = getattr(item, "florence_colour_skip_reason", None) or row.get("florence_rejection_reason")
+                row["selection_tier"] = getattr(item, "colour_selection_tier", row.get("selection_tier"))
+    return merged
+
+
+def _build_vehicle_pipeline_trace_rows(
+    tracks: list[Any],
+    track_crop_manifest_rows: list[dict[str, Any]],
+    motorcycle_geometry_rows: list[dict[str, Any]],
+    enrichment_results: list[Any],
+) -> list[dict[str, Any]]:
+    raw_crop_counts: dict[str, int] = {}
+    evidence_eligible_counts: dict[str, int] = {}
+    florence_eligible_counts: dict[str, int] = {}
+    preferred_crop_counts: dict[str, int] = {}
+    fallback_crop_counts: dict[str, int] = {}
+    for row in track_crop_manifest_rows:
+        local_track_id = str(row.get("local_track_id", ""))
+        raw_crop_counts[local_track_id] = raw_crop_counts.get(local_track_id, 0) + 1
+        if bool(row.get("evidence_eligible")):
+            evidence_eligible_counts[local_track_id] = evidence_eligible_counts.get(local_track_id, 0) + 1
+        if bool(row.get("florence_eligible")):
+            florence_eligible_counts[local_track_id] = florence_eligible_counts.get(local_track_id, 0) + 1
+        if str(row.get("selection_tier", "") or "") == "preferred":
+            preferred_crop_counts[local_track_id] = preferred_crop_counts.get(local_track_id, 0) + 1
+        if str(row.get("selection_tier", "") or "") == "low_resolution_fallback":
+            fallback_crop_counts[local_track_id] = fallback_crop_counts.get(local_track_id, 0) + 1
+    geometry_by_track = {str(row.get("local_track_id", "")): dict(row) for row in motorcycle_geometry_rows}
+    enrichment_by_track = {str(result.local_track_id): result for result in enrichment_results}
+    rows: list[dict[str, Any]] = []
+    for track in tracks:
+        local_track_id = str(track.local_track_id)
+        enrichment = enrichment_by_track.get(local_track_id)
+        geometry = geometry_by_track.get(local_track_id, {})
+        colour_predictions = list(getattr(getattr(enrichment, "vehicle_colour", None), "predictions", []) or []) if enrichment is not None else []
+        valid_colour_prediction_count = sum(1 for prediction in colour_predictions if str(getattr(prediction, "label", "UNKNOWN")).upper() not in {"", "UNKNOWN", "NONE"})
+        selected_crop_paths = list(getattr(enrichment, "selected_crop_paths", []) or []) if enrichment is not None else []
+        florence_call_count = int(getattr(enrichment, "vehicle_attribute_inference_count", 0) or len(colour_predictions)) if enrichment is not None else 0
+        failure_stage = "SUCCESS"
+        failure_reason = ""
+        if raw_crop_counts.get(local_track_id, 0) == 0:
+            failure_stage = "NO_TRACK_CROP"
+            failure_reason = "no_saved_debug_track_crop"
+        if geometry:
+            status = str(geometry.get("geometry_status", ""))
+            if status == "NEVER_REACHED_ZONE":
+                failure_stage = "NEVER_REACHED_CAPTURE_ZONE"
+                failure_reason = str(geometry.get("geometry_reason", ""))
+            elif status == "TRACK_ENDED_BEFORE_ZONE":
+                failure_stage = "TRACKING_FAILED"
+                failure_reason = str(geometry.get("geometry_reason", ""))
+            elif status == "REACHED_ZONE_NO_CAPTURE":
+                failure_stage = "CAPTURE_RETENTION_FAILED"
+                failure_reason = str(geometry.get("geometry_reason", ""))
+            elif status == "CAPTURED_TOO_SMALL":
+                failure_stage = "EVIDENCE_ELIGIBILITY_FAILED"
+                failure_reason = str(geometry.get("geometry_reason", ""))
+            elif status == "CAPTURED_ELIGIBLE" and not selected_crop_paths:
+                failure_stage = "FLORENCE_HANDOFF_FAILED"
+                failure_reason = "eligible_crop_not_selected_for_florence"
+        if selected_crop_paths and florence_call_count == 0:
+            failure_stage = "FLORENCE_HANDOFF_FAILED"
+            failure_reason = "selected_crop_not_sent_to_florence"
+        if florence_call_count > 0 and valid_colour_prediction_count == 0 and enrichment is not None:
+            failure_stage = "AGGREGATION_FAILED" if str(getattr(enrichment.vehicle_colour, "status", "")).lower() == "completed" else "FLORENCE_INFERENCE_FAILED"
+            failure_reason = str(getattr(enrichment, "final_colour_reason", "") or getattr(getattr(enrichment, "vehicle_colour", None), "reason", "") or "")
+        if valid_colour_prediction_count > 0 and str(getattr(getattr(enrichment, "vehicle_colour", None), "label", "UNKNOWN")).upper() not in {"", "UNKNOWN"}:
+            failure_stage = "SUCCESS"
+            failure_reason = ""
+        rows.append(
+            {
+                "camera_id": track.camera_id,
+                "local_track_id": local_track_id,
+                "vehicle_class": str(track.final_class or "UNKNOWN"),
+                "detection_count": int(track.observation_count),
+                "tracking_observation_count": int(track.observation_count),
+                "raw_track_crop_count": int(raw_crop_counts.get(local_track_id, 0)),
+                "preferred_crop_count": int(getattr(enrichment, "preferred_crop_count", preferred_crop_counts.get(local_track_id, 0)) if enrichment is not None else preferred_crop_counts.get(local_track_id, 0)),
+                "fallback_crop_count": int(getattr(enrichment, "fallback_crop_count", fallback_crop_counts.get(local_track_id, 0)) if enrichment is not None else fallback_crop_counts.get(local_track_id, 0)),
+                "selected_colour_crop_count": int(getattr(enrichment, "selected_colour_crop_count", len(selected_crop_paths)) if enrichment is not None else len(selected_crop_paths)),
+                "colour_selection_tier": getattr(enrichment, "colour_selection_tier", None) if enrichment is not None else None,
+                "capture_zone_entered": bool(geometry.get("entered_zone", False)),
+                "capture_zone_candidate_count": int(geometry.get("capture_candidates", 0) or 0),
+                "capture_zone_retained_count": int(geometry.get("retained_candidates", 0) or 0),
+                "evidence_candidate_count": int(raw_crop_counts.get(local_track_id, 0)),
+                "evidence_eligible_count": int(evidence_eligible_counts.get(local_track_id, 0)),
+                "florence_eligible_count": int(florence_eligible_counts.get(local_track_id, 0)),
+                "florence_selected_count": int(len(selected_crop_paths)),
+                "florence_call_count": florence_call_count,
+                "valid_colour_prediction_count": int(valid_colour_prediction_count),
+                "final_colour": str(getattr(getattr(enrichment, "vehicle_colour", None), "label", "UNKNOWN") if enrichment is not None else "UNKNOWN"),
+                "failure_stage": failure_stage,
+                "failure_reason": failure_reason,
             }
         )
     return rows

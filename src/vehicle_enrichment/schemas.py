@@ -49,6 +49,8 @@ class EnrichmentEvidenceItem:
     border_penalty: float
     clipping_ratio: float
     quality_score: float
+    vehicle_class: str = "UNKNOWN"
+    evidence_source: str = "existing_track_evidence"
     original_bbox_xyxy: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     expanded_crop_bbox_xyxy: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     source_frame_width: int = 0
@@ -72,6 +74,17 @@ class EnrichmentEvidenceItem:
     selected_for_colour: bool = False
     body_type_crop_result: str | None = None
     colour_crop_result: str | None = None
+    readable_crop: bool = False
+    colour_selection_tier: str | None = None
+    trigger_x: float | None = None
+    trigger_y: float | None = None
+    zone_top: int | None = None
+    zone_bottom: int | None = None
+    class_minimum_width: int | None = None
+    class_minimum_height: int | None = None
+    florence_minimum_width: int | None = None
+    florence_minimum_height: int | None = None
+    evidence_eligible: bool | None = None
     rejection_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -256,6 +269,10 @@ class TrackEnrichmentResult:
     candidate_crop_count: int = 0
     eligible_crop_count: int = 0
     preferred_crop_count: int = 0
+    readable_crop_count: int = 0
+    fallback_crop_count: int = 0
+    selected_colour_crop_count: int = 0
+    colour_selection_tier: str | None = None
     selected_body_type_crop_paths: list[str] = field(default_factory=list)
     selected_colour_crop_paths: list[str] = field(default_factory=list)
     florence_mode: str | None = None

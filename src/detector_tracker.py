@@ -156,6 +156,8 @@ class VehicleDetectorTracker:
             raise ConfigurationError("ocr_mukul_supervision_bytetrack only supports tracking.isolation_mode=per_camera.")
         visualization_config = dict(self.config.get("visualization", {}) or {})
         self.show_rejected_boxes = bool(visualization_config.get("show_rejected_boxes", False))
+        self.capture_zone_visualization_enabled = bool(dict(visualization_config.get("capture_zone", {}) or {}).get("enabled", False))
+        self.capture_zone_config = dict(dict(self.config.get("evidence", {}) or {}).get("capture_zone", {}) or {})
         self._model_loader = model_loader or YOLO
         self._tracker_factory = tracker_factory or self._create_tracker
         self._model: Any | None = None
@@ -354,12 +356,36 @@ class VehicleDetectorTracker:
 
     def annotate_tracked_frame(self, frame: np.ndarray, camera_id: str, tracked_detections: list[TrackedDetection]) -> np.ndarray:
         annotated = frame.copy()
+        self._draw_capture_zone_overlay(annotated, camera_id, tracked_detections)
         for tracked in tracked_detections:
             x1, y1, x2, y2 = [int(round(value)) for value in tracked.bbox_xyxy]
             label = self.build_tracked_label(camera_id, tracked)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (80, 220, 80), 2)
             cv2.putText(annotated, label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 220, 80), 2)
         return annotated
+
+    def _draw_capture_zone_overlay(self, frame: np.ndarray, camera_id: str, tracked_detections: list[TrackedDetection]) -> None:
+        if not self.capture_zone_visualization_enabled:
+            return
+        resolved = {key: value for key, value in self.capture_zone_config.items() if key != "cameras"}
+        camera_overrides = dict(self.capture_zone_config.get("cameras", {}) or {}).get(camera_id)
+        if isinstance(camera_overrides, dict):
+            resolved.update(dict(camera_overrides))
+        if not bool(resolved.get("enabled", False)):
+            return
+        height, width = frame.shape[:2]
+        zone_top = int(height * float(resolved.get("top_ratio", 0.55)))
+        zone_bottom = int(height * float(resolved.get("bottom_ratio", 0.72)))
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, zone_top), (width - 1, zone_bottom), (255, 180, 0), -1)
+        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0.0, frame)
+        cv2.line(frame, (0, zone_top), (width - 1, zone_top), (255, 180, 0), 2)
+        cv2.line(frame, (0, zone_bottom), (width - 1, zone_bottom), (255, 180, 0), 2)
+        cv2.putText(frame, "EVIDENCE CAPTURE ZONE", (12, max(24, zone_top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 180, 0), 2)
+        for tracked in tracked_detections:
+            trigger_x = int(round((tracked.bbox_xyxy[0] + tracked.bbox_xyxy[2]) / 2.0))
+            trigger_y = int(round(tracked.bbox_xyxy[3]))
+            cv2.circle(frame, (trigger_x, trigger_y), 4, (0, 90, 255), -1)
 
     def build_detected_label(self, detection: Detection) -> str:
         return f"{self._normalize_class_name(detection.class_name).upper()} {detection.confidence:.2f}"

@@ -251,11 +251,11 @@ def test_multiple_colour_labels_and_uncertain_responses_return_unknown() -> None
     assert classifier.normalize_label("maybe red") == ("UNKNOWN", "uncertain_response")
 
 
-def test_small_crops_are_skipped(tmp_path: Path) -> None:
-    classifier = _classifier(FakeBackend())
+def test_small_readable_crops_are_sent_to_florence_as_fallback(tmp_path: Path) -> None:
+    classifier = _classifier(FakeBackend(["white"]))
     result = classifier.classify(_request(tmp_path, items=[_item(tmp_path, "small", width=60, height=50)]))
-    assert result.status == "skipped"
-    assert result.reason == "no_eligible_crops"
+    assert result.status == "completed"
+    assert result.label == "WHITE"
 
 
 def test_exact_minimum_florence_size_is_accepted(tmp_path: Path) -> None:
@@ -265,11 +265,22 @@ def test_exact_minimum_florence_size_is_accepted(tmp_path: Path) -> None:
     assert result.label == "WHITE"
 
 
-def test_below_minimum_florence_size_is_rejected(tmp_path: Path) -> None:
-    classifier = _classifier(FakeBackend())
+def test_below_minimum_florence_size_is_used_as_fallback(tmp_path: Path) -> None:
+    classifier = _classifier(FakeBackend(["white"]))
     result = classifier.classify(_request(tmp_path, items=[_item(tmp_path, "too_short", width=256, height=191)]))
-    assert result.status == "skipped"
-    assert result.reason == "no_eligible_crops"
+    assert result.status == "completed"
+    assert result.label == "WHITE"
+
+
+def test_only_readable_fallback_crops_selects_best_available(tmp_path: Path) -> None:
+    backend = FakeBackend(["white", "white"])
+    classifier = _classifier(backend, maximum_crops_per_track=2)
+    low = _item(tmp_path, "low", width=56, height=123, quality=0.35)
+    better = _item(tmp_path, "better", width=79, height=101, quality=0.85)
+    result = classifier.classify(_request(tmp_path, items=[low, better]))
+    assert result.status == "completed"
+    assert result.label == "WHITE"
+    assert len(result.predictions) == 2
 
 
 def test_missing_crops_are_handled_safely(tmp_path: Path) -> None:
