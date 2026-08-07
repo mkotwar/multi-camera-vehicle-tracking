@@ -202,7 +202,7 @@ def run_benchmark(
     classifier = VehicleColourClassifier(
         {
             "enabled": True,
-            "allowed_labels": ["BLACK", "WHITE", "GREY", "SILVER", "RED", "BLUE", "GREEN", "YELLOW", "ORANGE", "BROWN", "BEIGE", "PURPLE", "OTHER", "UNKNOWN"],
+            "allowed_labels": ["BLACK", "WHITE", "GREY", "SILVER", "RED", "PINK", "BLUE", "GREEN", "YELLOW", "ORANGE", "BROWN", "BEIGE", "PURPLE", "OTHER", "UNKNOWN"],
             "retry_on_invalid_response": True,
             "maximum_prompt_attempts": 2,
         },

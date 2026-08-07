@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+import time
 
 import cv2
 import numpy as np
@@ -61,6 +63,14 @@ def _record(path: str) -> TrackEvidence:
     )
 
 
+def _record_for_track(path: str, *, local_track_id: str, camera_id: str, native_tracker_id: int) -> TrackEvidence:
+    record = _record(path)
+    record.local_track_id = local_track_id
+    record.camera_id = camera_id
+    record.native_tracker_id = native_tracker_id
+    return record
+
+
 def _manager(tmp_path: Path, *, enabled: bool = True) -> tuple[VehicleEnrichmentManager, RunOutputManager]:
     output_manager = RunOutputManager(tmp_path)
     logger = setup_logging(output_manager.run_directory, log_level="INFO")
@@ -98,6 +108,110 @@ def _manager(tmp_path: Path, *, enabled: bool = True) -> tuple[VehicleEnrichment
         }
     }
     return VehicleEnrichmentManager(config, logger, output_manager), output_manager
+
+
+def _async_manager(tmp_path: Path) -> tuple[VehicleEnrichmentManager, RunOutputManager]:
+    output_manager = RunOutputManager(tmp_path)
+    logger = setup_logging(output_manager.run_directory, log_level="INFO")
+    config = {
+        "vehicle_enrichment": {
+            "enabled": True,
+            "fail_open": True,
+            "best_crops_per_track": 3,
+            "extend_tracks_json": True,
+            "write_separate_output": True,
+            "async_colour": {
+                "enabled": True,
+                "queue_size": 2,
+                "worker_count": 1,
+                "queue_put_timeout_seconds": 0.01,
+            },
+            "evidence": {
+                "source": "existing_track_evidence",
+                "save_vehicle_crops": True,
+                "minimum_crop_width": 10,
+                "minimum_crop_height": 10,
+                "minimum_sharpness": 1.0,
+                "minimum_quality_score": 0.0,
+                "border_margin_ratio": 0.02,
+                "scoring": {
+                    "area_weight": 0.25,
+                    "sharpness_weight": 0.25,
+                    "confidence_weight": 0.20,
+                    "role_weight": 0.15,
+                    "border_weight": 0.05,
+                    "clipping_weight": 0.05,
+                    "brightness_weight": 0.05,
+                },
+            },
+            "shared_florence": {"enabled": True},
+            "vehicle_attributes": {
+                "enabled": True,
+                "backend": "base_florence",
+                "maximum_crops_per_track": 3,
+                "reuse_single_response_for_attributes": False,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "colour": {
+                    "enabled": True,
+                    "backend": "base_florence",
+                    "task_token": "<VQA>",
+                    "prompt": "What colour is the vehicle?",
+                    "generation": {"max_new_tokens": 16, "num_beams": 1, "use_cache": True, "early_stopping": False},
+                },
+                "body_type": {"enabled": False},
+            },
+            "body_type": {"enabled": False},
+            "colour": {"enabled": False},
+            "make_model": {"enabled": False},
+            "plate": {"detection_enabled": False, "colour_enabled": False},
+            "ocr": {"enabled": False, "run_only_when_plate_detected": True},
+        }
+    }
+    return VehicleEnrichmentManager(config, logger, output_manager), output_manager
+
+
+def _attribute_result(*, colour_label: str = "WHITE", body_type_label: str = "UNKNOWN", crop_path: str = "crop.jpg"):
+    return SimpleNamespace(
+        body_type=VehicleBodyTypeResult(label=body_type_label, predictions=[], status="disabled", source="base_florence"),
+        colour=VehicleColourResult(label=colour_label, predictions=[], status="completed", source="base_florence", aggregation_reason="weighted_agreement"),
+        crop_level_rows=[
+            {
+                "vehicle_crop_path": crop_path,
+                "frame_index": 3,
+                "parsed_body_type": body_type_label,
+                "body_type_status": "disabled",
+                "body_type_reason": "disabled",
+                "body_type_raw_response": "",
+                "body_type_task_token": "<VQA>",
+                "body_type_prompt": "",
+                "body_type_effective_processor_text": "",
+                "body_type_inference_time_ms": 0.0,
+                "parsed_colour": colour_label,
+                "colour_status": "completed",
+                "colour_reason": "weighted_agreement",
+                "crop_source": "saved_vehicle_crop",
+                "crop_available": True,
+                "crop_skip_reason": None,
+                "selection_tier": "acceptable",
+                "colour_raw_response": colour_label.lower(),
+                "colour_task_token": "<VQA>",
+                "colour_prompt": "What colour is the vehicle?",
+                "colour_effective_processor_text": "<VQA>What colour is the vehicle?",
+                "colour_inference_time_ms": 12.0,
+                "colour_post_processed_response": colour_label,
+            }
+        ],
+        inference_count=1,
+        adapter_loaded=False,
+        raw_responses=[colour_label.lower()],
+        body_type_eligible=False,
+        body_type_candidate_crop_count=0,
+        body_type_selected_crop_count=0,
+        body_type_florence_call_count=0,
+        body_type_valid_prediction_count=0,
+        body_type_failure_reason="disabled",
+    )
 
 
 def test_manager_returns_disabled_result_when_enrichment_disabled(tmp_path: Path) -> None:
@@ -257,6 +371,53 @@ def test_manager_uses_shared_backend_and_writes_body_type_and_colour(tmp_path: P
     assert result.plate_detected is False
 
 
+def test_manager_skips_frozen_make_model_and_plate_runtime_paths(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "crop_frozen.jpg"
+    cv2.imwrite(str(crop_path), image)
+
+    make_model_calls = 0
+    plate_detect_calls = 0
+    plate_validate_calls = 0
+    plate_ocr_calls = 0
+
+    def _make_model_probe(*args, **kwargs):
+        nonlocal make_model_calls
+        make_model_calls += 1
+        raise AssertionError("make/model should stay frozen")
+
+    def _plate_detect_probe(*args, **kwargs):
+        nonlocal plate_detect_calls
+        plate_detect_calls += 1
+        raise AssertionError("plate detector should stay frozen")
+
+    def _plate_validate_probe(*args, **kwargs):
+        nonlocal plate_validate_calls
+        plate_validate_calls += 1
+        raise AssertionError("plate validator should stay frozen")
+
+    def _plate_ocr_probe(*args, **kwargs):
+        nonlocal plate_ocr_calls
+        plate_ocr_calls += 1
+        raise AssertionError("plate OCR should stay frozen")
+
+    monkeypatch.setattr(manager.make_model_classifier, "classify", _make_model_probe)
+    monkeypatch.setattr(manager.plate_detector, "detect", _plate_detect_probe)
+    monkeypatch.setattr(manager.plate_quality_validator, "validate", _plate_validate_probe)
+    monkeypatch.setattr(manager.plate_ocr_engine, "recognize", _plate_ocr_probe)
+
+    result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+
+    assert result.status == "evidence_ready"
+    assert make_model_calls == 0
+    assert plate_detect_calls == 0
+    assert plate_validate_calls == 0
+    assert plate_ocr_calls == 0
+    assert result.plate_detected is False
+    assert result.plate_text is None
+
+
 def test_normalize_vehicle_enrichment_config_supports_colour_only_vehicle_attributes() -> None:
     normalized = normalize_vehicle_enrichment_config(
         {
@@ -400,3 +561,156 @@ def test_manager_uses_raw_track_crop_fallback_when_finalized_evidence_missing(tm
     assert result.readable_crop_count >= 1
     assert result.fallback_crop_count >= 1
     assert result.evidence_used[0].evidence_source == "raw_track_crop_fallback"
+
+
+def test_async_colour_track_enqueues_exactly_once_and_drains(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _async_manager(tmp_path)
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "async_crop.jpg"
+    cv2.imwrite(str(crop_path), image)
+    calls: list[str] = []
+
+    def _classify(request):
+        calls.append(request.local_track_id)
+        return _attribute_result(colour_label="WHITE", crop_path=str(crop_path))
+
+    monkeypatch.setattr(manager.vehicle_attribute_flow, "classify", _classify)
+    try:
+        first = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])
+        duplicate = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])
+        drained = manager.finalize_async_colour()
+    finally:
+        manager.finalize_async_colour()
+
+    assert first == []
+    assert duplicate == []
+    assert len(drained) == 1
+    assert drained[0].local_track_id == "CAM_001:TRACK_1"
+    assert calls == ["CAM_001:TRACK_1"]
+    assert manager.metrics["colour_jobs_enqueued"] == 1
+    assert manager.metrics["colour_jobs_duplicate_attempts"] == 1
+    assert manager.metrics["track_evidence_pending_count"] == 0
+
+
+def test_async_colour_preserves_camera_and_track_identity(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _async_manager(tmp_path)
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "async_identity.jpg"
+    cv2.imwrite(str(crop_path), image)
+    seen: list[tuple[str, str]] = []
+
+    def _classify(request):
+        seen.append((request.camera_id, request.local_track_id))
+        return _attribute_result(colour_label="BLUE", crop_path=str(crop_path))
+
+    monkeypatch.setattr(manager.vehicle_attribute_flow, "classify", _classify)
+    track_two = _track()
+    track_two.local_track_id = "CAM_002:TRACK_1"
+    track_two.camera_id = "CAM_002"
+    try:
+        immediate_from_enqueue = manager.enrich_completed_tracks(
+            [_track(), track_two],
+            [
+                _record_for_track(str(crop_path), local_track_id="CAM_001:TRACK_1", camera_id="CAM_001", native_tracker_id=1),
+                _record_for_track(str(crop_path), local_track_id="CAM_002:TRACK_1", camera_id="CAM_002", native_tracker_id=1),
+            ],
+        )
+        immediate = manager.drain_completed_results()
+        drained = immediate_from_enqueue + immediate + manager.finalize_async_colour()
+    finally:
+        manager.finalize_async_colour()
+
+    assert ("CAM_001", "CAM_001:TRACK_1") in seen
+    assert ("CAM_002", "CAM_002:TRACK_1") in seen
+    assert len(drained) == 2
+    assert {result.local_track_id for result in drained} == {"CAM_001:TRACK_1", "CAM_002:TRACK_1"}
+
+
+def test_async_colour_returns_before_worker_finishes(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _async_manager(tmp_path)
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "async_nonblocking.jpg"
+    cv2.imwrite(str(crop_path), image)
+
+    def _classify(request):
+        time.sleep(0.1)
+        return _attribute_result(colour_label="RED", crop_path=str(crop_path))
+
+    monkeypatch.setattr(manager.vehicle_attribute_flow, "classify", _classify)
+    started = time.perf_counter()
+    try:
+        immediate = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        drained = immediate + manager.finalize_async_colour()
+    finally:
+        manager.finalize_async_colour()
+
+    assert immediate == []
+    assert elapsed_ms < 100.0
+    assert len(drained) == 1
+    assert drained[0].vehicle_colour.label == "RED"
+
+
+def test_async_colour_worker_survives_failed_job(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _async_manager(tmp_path)
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "async_failure.jpg"
+    cv2.imwrite(str(crop_path), image)
+    call_count = 0
+
+    def _classify(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("mock florence failure")
+        return _attribute_result(colour_label="GREEN", crop_path=str(crop_path))
+
+    monkeypatch.setattr(manager.vehicle_attribute_flow, "classify", _classify)
+    second_track = _track()
+    second_track.local_track_id = "CAM_001:TRACK_2"
+    second_track.native_tracker_id = 2
+    try:
+        immediate = manager.enrich_completed_tracks(
+            [_track(), second_track],
+            [
+                _record_for_track(str(crop_path), local_track_id="CAM_001:TRACK_1", camera_id="CAM_001", native_tracker_id=1),
+                _record_for_track(str(crop_path), local_track_id="CAM_001:TRACK_2", camera_id="CAM_001", native_tracker_id=2),
+            ],
+        )
+        drained = immediate + manager.finalize_async_colour()
+    finally:
+        manager.finalize_async_colour()
+
+    by_track = {item.local_track_id: item for item in drained}
+    assert by_track["CAM_001:TRACK_1"].status == "error"
+    assert by_track["CAM_001:TRACK_2"].vehicle_colour.label == "GREEN"
+    assert manager.metrics["colour_jobs_failed"] == 1
+    assert manager.metrics["colour_jobs_completed"] == 1
+
+
+def test_async_colour_matches_sync_result_for_mocked_input(tmp_path: Path, monkeypatch) -> None:
+    sync_manager, _ = _manager(tmp_path / "sync", enabled=True)
+    async_manager, _ = _async_manager(tmp_path / "async")
+    image = np.full((30, 30, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "async_match.jpg"
+    cv2.imwrite(str(crop_path), image)
+
+    monkeypatch.setattr(
+        sync_manager.colour_classifier,
+        "classify",
+        lambda request: VehicleColourResult(label="WHITE", predictions=[], status="completed", source="florence2", aggregation_reason="weighted_agreement"),
+    )
+    monkeypatch.setattr(
+        async_manager.vehicle_attribute_flow,
+        "classify",
+        lambda request: _attribute_result(colour_label="WHITE", crop_path=str(crop_path)),
+    )
+    try:
+        sync_result = sync_manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+        async_manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])
+        async_result = async_manager.finalize_async_colour()[0]
+    finally:
+        async_manager.finalize_async_colour()
+
+    assert sync_result.vehicle_colour.label == async_result.vehicle_colour.label
+    assert async_result.vehicle_colour.label == "WHITE"

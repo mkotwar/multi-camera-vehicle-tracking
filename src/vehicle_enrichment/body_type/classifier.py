@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-import re
 from typing import Any
 
 import cv2
@@ -19,34 +18,12 @@ from ..schemas import (
     VehicleBodyTypeResult,
 )
 from ..shared import FlorenceBackend
-
-
-BODY_TYPE_TASK_PROMPT = "<VQA>"
-BODY_TYPE_PROMPT_TEXT = (
-    "What body type is this vehicle? Answer with one word: hatchback, sedan, suv, mpv, van, pickup, or other."
+from .labels import (
+    BODY_TYPE_ALLOWED_LABELS,
+    BODY_TYPE_PROMPT_TEXT,
+    BODY_TYPE_TASK_PROMPT,
+    normalize_body_type_label,
 )
-
-UNKNOWN_PHRASES = {
-    "",
-    "unknown",
-    "unclear",
-    "not visible",
-    "cannot determine",
-    "cant determine",
-    "unable to determine",
-    "cannot classify",
-    "not sure",
-}
-
-NORMALIZATION_RULES = [
-    ("SUV", {"suv", "sport utility vehicle", "sports utility vehicle"}),
-    ("SEDAN", {"sedan", "sedan car", "saloon"}),
-    ("HATCHBACK", {"hatchback", "hatch back"}),
-    ("MPV", {"mpv", "muv", "multi purpose vehicle", "multi-purpose vehicle", "multi utility vehicle"}),
-    ("VAN", {"van", "minivan"}),
-    ("PICKUP", {"pickup", "pickup truck", "pick up", "pick-up"}),
-    ("OTHER", {"other"}),
-]
 
 
 class VehicleBodyTypeClassifier:
@@ -61,7 +38,9 @@ class VehicleBodyTypeClassifier:
         )
         self.logger = logger
         self.enabled = bool(self.config.get("enabled", False))
-        self.allowed_labels = [str(item).strip().upper() for item in self.config.get("allowed_labels", []) if str(item).strip()]
+        self.allowed_labels = [
+            str(item).strip().upper() for item in self.config.get("allowed_labels", BODY_TYPE_ALLOWED_LABELS) if str(item).strip()
+        ]
         self.eligible_vehicle_classes = {
             str(item).strip().upper()
             for item in self.config.get("run_only_when_vehicle_class", ["CAR"])
@@ -108,10 +87,10 @@ class VehicleBodyTypeClassifier:
                 predictions=[],
                 status="skipped",
                 source="florence2",
-                reason="vehicle_class_not_eligible",
+                reason="non_car_vehicle",
                 model=self.backend.model_identifier,
                 adapter_active=self.backend.adapter_active,
-                aggregation_reason="vehicle_class_not_eligible",
+                aggregation_reason="non_car_vehicle",
                 task_prompt=BODY_TYPE_TASK_PROMPT,
                 prompt_text=BODY_TYPE_PROMPT_TEXT,
             )
@@ -130,7 +109,7 @@ class VehicleBodyTypeClassifier:
                 predictions=[],
                 status="skipped",
                 source="florence2",
-                reason="no_eligible_crops",
+                reason="no_body_type_usable_crop",
                 model=self.backend.model_identifier,
                 adapter_active=self.backend.adapter_active,
                 aggregation_reason=self._no_evidence_reason(request.evidence_items),
@@ -384,26 +363,7 @@ class VehicleBodyTypeClassifier:
         return str(payload.get("generated_text") or "")
 
     def normalize_label(self, raw_value: str) -> tuple[str, str]:
-        cleaned = " ".join(str(raw_value or "").strip().lower().replace("_", " ").split())
-        cleaned = re.sub(r"[^\w\s-]", " ", cleaned)
-        cleaned = " ".join(cleaned.split())
-        if cleaned in UNKNOWN_PHRASES:
-            return VEHICLE_BODY_TYPE_UNKNOWN, "unknown_phrase"
-        exact_matches = [label for label, phrases in NORMALIZATION_RULES if cleaned in phrases]
-        if len(exact_matches) == 1:
-            return exact_matches[0], "exact_phrase_match"
-        matches: list[str] = []
-        for label, phrases in NORMALIZATION_RULES:
-            for phrase in phrases:
-                if re.search(rf"\b{re.escape(phrase)}\b", cleaned):
-                    matches.append(label)
-                    break
-        unique_matches = sorted(set(matches))
-        if len(unique_matches) == 1:
-            return unique_matches[0], "contained_phrase_match"
-        if len(unique_matches) > 1:
-            return VEHICLE_BODY_TYPE_UNKNOWN, "ambiguous_multiple_labels"
-        return VEHICLE_BODY_TYPE_UNKNOWN, "unexpected_output"
+        return normalize_body_type_label(raw_value)
 
     def _aggregate_predictions(self, predictions: list[AttributePrediction]) -> tuple[str, str, float | None, float]:
         valid = [item for item in predictions if item.status == "completed" and item.label not in (None, VEHICLE_BODY_TYPE_UNKNOWN)]

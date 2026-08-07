@@ -751,6 +751,88 @@ def test_duplicate_same_frame_candidate_is_skipped_without_double_counting(tmp_p
     assert len(collector._track_candidates["CAM_001:TRACK_30"]) == 1
 
 
+def test_same_frame_replacement_keeps_cache_and_final_evidence_succeeds(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        deduplicate_similar_crops=True,
+        duplicate_iou_threshold=0.80,
+        minimum_frame_gap=2,
+    )
+    frame = _make_frame(width=120, height=80, sharp=True)
+    packet = _packet(120, frame)
+    original = collector._build_candidate(packet, _tracked(120, bbox_xyxy=(20.0, 20.0, 60.0, 60.0), confidence=0.60))
+    replacement = collector._build_candidate(packet, _tracked(120, bbox_xyxy=(20.0, 20.0, 62.0, 62.0), confidence=0.95))
+
+    assert original is not None and replacement is not None
+
+    track_id = original.candidate.local_track_id
+    collector._frame_cache[("CAM_001", 120)] = frame.copy()
+    collector._frame_ref_counts[("CAM_001", 120)] = 1
+    collector._track_candidates[track_id] = [original]
+
+    retained = collector._retain_candidate(track_id, replacement)
+    assert retained is True
+    collector._ensure_frame_cached(("CAM_001", 120), frame)
+    collector._frame_ref_counts[("CAM_001", 120)] = collector._frame_ref_counts.get(("CAM_001", 120), 0) + 1
+
+    track = _track([_observation(120)], local_track_id=track_id)
+    evidence = collector.finalize_track(track)
+
+    assert evidence
+    assert any(item.frame_number == 120 and item.crop_path is not None for item in evidence)
+    assert collector.metrics["missing_cache_frame_count"] == 0
+    assert ("CAM_001", 120) not in collector._frame_cache
+
+
+def test_different_frame_replacement_evicts_unreferenced_old_frame(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(
+        tmp_path,
+        deduplicate_similar_crops=True,
+        duplicate_iou_threshold=0.80,
+        minimum_frame_gap=30,
+    )
+    frame_old = _make_frame(width=120, height=80, fill=40)
+    frame_new = _make_frame(width=120, height=80, sharp=True, fill=90)
+    packet_old = _packet(120, frame_old)
+    packet_new = _packet(121, frame_new)
+    original = collector._build_candidate(packet_old, _tracked(120, bbox_xyxy=(20.0, 20.0, 60.0, 60.0), confidence=0.60))
+    replacement = collector._build_candidate(packet_new, _tracked(121, bbox_xyxy=(20.0, 20.0, 62.0, 62.0), confidence=0.95))
+
+    assert original is not None and replacement is not None
+
+    track_id = original.candidate.local_track_id
+    collector._frame_cache[("CAM_001", 120)] = frame_old.copy()
+    collector._frame_ref_counts[("CAM_001", 120)] = 1
+    collector._track_candidates[track_id] = [original]
+
+    retained = collector._retain_candidate(track_id, replacement)
+    assert retained is True
+    collector._ensure_frame_cached(("CAM_001", 121), frame_new)
+    collector._frame_ref_counts[("CAM_001", 121)] = collector._frame_ref_counts.get(("CAM_001", 121), 0) + 1
+
+    assert ("CAM_001", 120) not in collector._frame_cache
+    assert ("CAM_001", 121) in collector._frame_cache
+    assert collector.metrics["evidence_cache_evictions"] >= 1
+
+
+def test_same_frame_number_across_cameras_remains_isolated_on_release(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    collector.register_frame(_packet(120, frame, camera_id="CAM_001"), [_tracked(120, camera_id="CAM_001", tracker_id=1)])
+    collector.register_frame(_packet(120, frame, camera_id="CAM_002"), [_tracked(120, camera_id="CAM_002", tracker_id=1)])
+
+    track_one = _track([_observation(120, camera_id="CAM_001", local_track_id="CAM_001:TRACK_1")], camera_id="CAM_001", local_track_id="CAM_001:TRACK_1")
+    track_two = _track([_observation(120, camera_id="CAM_002", local_track_id="CAM_002:TRACK_1")], camera_id="CAM_002", local_track_id="CAM_002:TRACK_1")
+
+    collector.finalize_track(track_one)
+
+    assert ("CAM_001", 120) not in collector._frame_cache
+    assert ("CAM_002", 120) in collector._frame_cache
+
+    collector.finalize_track(track_two)
+    assert ("CAM_002", 120) not in collector._frame_cache
+
+
 def test_missing_frame_fail_closed_raises_pipeline_runtime_error(tmp_path: Path) -> None:
     collector, _output_manager = _collector(tmp_path, fail_pipeline_on_error=True)
     collector.register_frame(_packet(0, _make_frame(fill=40)), [_tracked(0, confidence=0.95)])

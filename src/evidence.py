@@ -184,6 +184,10 @@ class EvidenceCollector:
             "tracks_by_camera": {},
             "saved_files_by_camera": {},
             "cache_peak_frames": 0,
+            "evidence_cache_hits": 0,
+            "evidence_cache_misses": 0,
+            "evidence_cache_evictions": 0,
+            "evidence_cache_eviction_skipped_referenced": 0,
             "cache_frames_released": 0,
             "cache_release_attempts": 0,
             "cache_release_deferred": 0,
@@ -302,6 +306,7 @@ class EvidenceCollector:
                 continue
             retained = self._retain_candidate(local_track_id, candidate_entry)
             if retained:
+                self._ensure_frame_cached(frame_key, frame_packet.frame)
                 self._frame_ref_counts[frame_key] = self._frame_ref_counts.get(frame_key, 0) + 1
                 self._metrics["candidate_crops_retained"] += 1
             else:
@@ -309,6 +314,12 @@ class EvidenceCollector:
                 if frame_cached and self._frame_ref_counts.get(frame_key, 0) <= 0:
                     self._frame_cache.pop(frame_key, None)
         self._register_capture_zone_frame(frame_packet, tracked_detections)
+
+    def _ensure_frame_cached(self, frame_key: tuple[str, int], frame: np.ndarray) -> None:
+        if frame_key in self._frame_cache:
+            return
+        self._frame_cache[frame_key] = frame.copy()
+        self._metrics["cache_peak_frames"] = max(self._metrics["cache_peak_frames"], len(self._frame_cache))
 
     def _retain_candidate(self, local_track_id: str, candidate_entry: _StoredCandidate) -> bool:
         existing_candidates = self._track_candidates.setdefault(local_track_id, [])
@@ -1266,6 +1277,7 @@ class EvidenceCollector:
                 try:
                     raise RuntimeError(f"Evidence frame missing from cache for {track.local_track_id} frame={frame_number}")
                 except RuntimeError as exc:
+                    self._metrics["evidence_cache_misses"] += 1
                     self._metrics["missing_cache_frame_count"] += 1
                     self._metrics["evidence_items_skipped_missing_frame"] += len(roles)
                     self._handle_error(
@@ -1279,6 +1291,7 @@ class EvidenceCollector:
                     )
                 frame_assets[frame_number] = {"crop_path": None, "annotated_frame_path": None}
                 continue
+            self._metrics["evidence_cache_hits"] += 1
             crop_path: str | None = None
             annotated_path: str | None = None
             try:
@@ -1605,6 +1618,7 @@ class EvidenceCollector:
                 self._frame_ref_counts.pop(frame_key, None)
                 if frame_key in self._frame_cache:
                     self._frame_cache.pop(frame_key, None)
+                    self._metrics["evidence_cache_evictions"] += 1
                     self._metrics["cache_frames_released"] += 1
                     self.logger.debug(
                         "Frame cache release camera_id=%s frame_number=%s reason=no_remaining_references",
@@ -1613,6 +1627,7 @@ class EvidenceCollector:
                     )
             else:
                 self._frame_ref_counts[frame_key] = remaining
+                self._metrics["evidence_cache_eviction_skipped_referenced"] += 1
                 self._metrics["cache_release_deferred"] += 1
                 self.logger.debug(
                     "Frame cache release deferred camera_id=%s frame_number=%s remaining_references=%s",

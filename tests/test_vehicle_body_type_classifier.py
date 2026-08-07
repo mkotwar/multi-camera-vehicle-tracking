@@ -98,7 +98,7 @@ def _classifier(backend: FakeBackend) -> VehicleBodyTypeClassifier:
             "maximum_crops_per_track": 2,
             "minimum_crop_width": 256,
             "minimum_crop_height": 192,
-            "allowed_labels": ["SUV", "SEDAN", "HATCHBACK", "MPV", "VAN", "PICKUP", "OTHER", "UNKNOWN"],
+            "allowed_labels": ["SUV", "SEDAN", "HATCHBACK", "MPV", "VAN", "PICKUP", "COUPE", "CONVERTIBLE", "WAGON", "UNKNOWN"],
         },
         backend=backend,
         logger=FakeLogger(),
@@ -107,9 +107,10 @@ def _classifier(backend: FakeBackend) -> VehicleBodyTypeClassifier:
 
 def test_only_car_is_eligible(tmp_path: Path) -> None:
     classifier = _classifier(FakeBackend())
-    result = classifier.classify(_request(tmp_path, vehicle_class="TRUCK"))
-    assert result.status == "skipped"
-    assert result.reason == "vehicle_class_not_eligible"
+    for vehicle_class in ["TRUCK", "MOTORCYCLE", "3WHEELER", "BUS", "UNKNOWN"]:
+        result = classifier.classify(_request(tmp_path, vehicle_class=vehicle_class))
+        assert result.status == "skipped"
+        assert result.reason == "non_car_vehicle"
 
 
 def test_crop_dimension_eligibility_and_maximum_crop_count(tmp_path: Path) -> None:
@@ -137,7 +138,7 @@ def test_below_minimum_florence_size_is_rejected(tmp_path: Path) -> None:
     classifier = _classifier(FakeBackend())
     result = classifier.classify(_request(tmp_path, items=[_item(tmp_path, "too_narrow", width=255, height=192)]))
     assert result.status == "skipped"
-    assert result.reason == "no_eligible_crops"
+    assert result.reason == "no_body_type_usable_crop"
 
 
 def test_prompt_construction_uses_vqa_and_constrained_text(tmp_path: Path) -> None:
@@ -153,9 +154,15 @@ def test_synonym_and_ambiguous_normalization_rules(tmp_path: Path) -> None:
     assert classifier.normalize_label("sport utility vehicle") == ("SUV", "exact_phrase_match")
     assert classifier.normalize_label("saloon") == ("SEDAN", "exact_phrase_match")
     assert classifier.normalize_label("hatch back") == ("HATCHBACK", "exact_phrase_match")
+    assert classifier.normalize_label("pickup truck") == ("PICKUP", "exact_phrase_match")
+    assert classifier.normalize_label("station wagon") == ("WAGON", "exact_phrase_match")
+    assert classifier.normalize_label("cabriolet") == ("CONVERTIBLE", "exact_phrase_match")
+    assert classifier.normalize_label("coupé") == ("COUPE", "exact_phrase_match")
     assert classifier.normalize_label("van sedan") == ("UNKNOWN", "ambiguous_multiple_labels")
     assert classifier.normalize_label("sedan") == ("SEDAN", "exact_phrase_match")
     assert classifier.normalize_label("The closest body type is SUV.") == ("SUV", "contained_phrase_match")
+    assert classifier.normalize_label("car") == ("UNKNOWN", "unknown_phrase")
+    assert classifier.normalize_label("unanswerable") == ("UNKNOWN", "unknown_phrase")
     assert classifier.normalize_label("qA") == ("UNKNOWN", "unexpected_output")
 
 

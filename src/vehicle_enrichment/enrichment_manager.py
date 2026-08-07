@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import queue
 import shutil
+import threading
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,7 @@ from src.output_writer import RunOutputManager
 
 from .attribute_aggregator import AttributeAggregator
 from .body_type import VehicleBodyTypeClassifier
+from .body_type.labels import BODY_TYPE_ALLOWED_LABELS, BODY_TYPE_PROMPT_TEXT, BODY_TYPE_TASK_PROMPT
 from .colour import VehicleColourClassifier
 from .evidence_adapter import EvidenceAdapter
 from .evidence_quality import EvidenceQualityEvaluator, normalize_quality_config
@@ -31,6 +35,7 @@ from .plate import (
 )
 from .schemas import (
     ATTRIBUTE_STATUS_DISABLED,
+    ATTRIBUTE_STATUS_READY,
     ENRICHMENT_STATUS_COMPLETED,
     ENRICHMENT_STATUS_DISABLED,
     ENRICHMENT_STATUS_ERROR,
@@ -38,8 +43,10 @@ from .schemas import (
     ENRICHMENT_STATUS_NO_EVIDENCE,
     PlateDetectionResult,
     PlateOCRResult,
+    PlateQualityResult,
     TrackEnrichmentRequest,
     TrackEnrichmentResult,
+    VehicleMakeModelResult,
     VehicleBodyTypeResult,
     VehicleColourResult,
 )
@@ -59,6 +66,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
     image_size_policy = dict(section.get("image_size_policy", {}) or {})
     evidence_quality = dict(section.get("evidence_quality", {}) or {})
     track_evidence = dict(section.get("track_evidence", {}) or {})
+    async_colour = dict(section.get("async_colour", {}) or {})
     florence_comparison = dict(section.get("florence_comparison", {}) or {})
     ocr_mukul = dict(section.get("ocr_mukul", {}) or {})
     vehicle_attributes = dict(section.get("vehicle_attributes", {}) or {})
@@ -69,6 +77,12 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
         "trigger": str(section.get("trigger", "track_completed")).strip() or "track_completed",
         "florence_mode": str(section.get("florence_mode", "current")).strip() or "current",
         "fail_open": bool(section.get("fail_open", True)),
+        "async_colour": {
+            "enabled": bool(async_colour.get("enabled", False)),
+            "queue_size": max(1, int(async_colour.get("queue_size", 100))),
+            "worker_count": max(1, int(async_colour.get("worker_count", 1))),
+            "queue_put_timeout_seconds": float(async_colour.get("queue_put_timeout_seconds", 0.1)),
+        },
         "best_crops_per_track": max(1, int(section.get("best_crops_per_track", 3))),
         "write_separate_output": bool(section.get("write_separate_output", True)),
         "extend_tracks_json": bool(section.get("extend_tracks_json", True)),
@@ -205,9 +219,27 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "body_type": {
                 "enabled": bool(vehicle_attribute_body_type.get("enabled", True)),
                 "backend": str(vehicle_attribute_body_type.get("backend", "base_florence")).strip() or "base_florence",
-                "task_token": str(vehicle_attribute_body_type.get("task_token", vehicle_attributes.get("task_token", "<VQA>"))).strip() or "<VQA>",
-                "prompt": str(vehicle_attribute_body_type.get("prompt", vehicle_attributes.get("prompt", "")) or ""),
+                "task_token": str(vehicle_attribute_body_type.get("task_token", BODY_TYPE_TASK_PROMPT)).strip() or BODY_TYPE_TASK_PROMPT,
+                "prompt": str(vehicle_attribute_body_type.get("prompt", BODY_TYPE_PROMPT_TEXT) or BODY_TYPE_PROMPT_TEXT),
                 "generation": dict(vehicle_attribute_body_type.get("generation", {}) or {}),
+                "car_only": bool(vehicle_attribute_body_type.get("car_only", True)),
+                "run_only_when_vehicle_class": [
+                    str(item).strip().upper()
+                    for item in vehicle_attribute_body_type.get("run_only_when_vehicle_class", ["CAR"])
+                    if str(item).strip()
+                ],
+                "maximum_crops_per_track": max(
+                    1, int(vehicle_attribute_body_type.get("maximum_crops_per_track", vehicle_attributes.get("maximum_crops_per_track", track_evidence.get("final_crops_per_attribute", 3))))
+                ),
+                "minimum_original_width": max(1, int(vehicle_attribute_body_type.get("minimum_original_width", 120))),
+                "minimum_original_height": max(1, int(vehicle_attribute_body_type.get("minimum_original_height", 100))),
+                "preferred_original_width": max(1, int(vehicle_attribute_body_type.get("preferred_original_width", 240))),
+                "preferred_original_height": max(1, int(vehicle_attribute_body_type.get("preferred_original_height", 160))),
+                "allowed_labels": [
+                    str(item).strip().upper()
+                    for item in vehicle_attribute_body_type.get("allowed_labels", BODY_TYPE_ALLOWED_LABELS)
+                    if str(item).strip()
+                ],
             },
             "florence": dict(vehicle_attributes.get("florence", {}) or {}),
         },
@@ -224,6 +256,43 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "run_only_when_plate_detected": bool(ocr.get("run_only_when_plate_detected", True)),
         },
     }
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedTrackEnrichment:
+    track: LocalTrack
+    request: TrackEnrichmentRequest
+    vehicle_class_confidence: float | None
+    started_iso: str
+    started_monotonic: float
+    evidence_source_name: str
+    selected_items: tuple[Any, ...]
+    candidate_crop_count: int
+    eligible_crop_count: int
+    preferred_crop_count: int
+    readable_crop_count: int
+    fallback_crop_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class ColourEnrichmentJob:
+    sequence_number: int
+    local_track_id: str
+    camera_id: str
+    vehicle_class: str
+    prepared: PreparedTrackEnrichment
+
+
+@dataclass(slots=True, frozen=True)
+class ColourEnrichmentWorkerResult:
+    sequence_number: int
+    local_track_id: str
+    camera_id: str
+    attribute_result: Any | None
+    error_message: str | None
+    worker_started_at: str
+    worker_completed_at: str
+    worker_duration_ms: float
 
 
 class VehicleEnrichmentManager:
@@ -308,6 +377,32 @@ class VehicleEnrichmentManager:
             image_size_policy=self.image_size_policy,
             logger=logger,
         )
+        self.async_colour_config = dict(self.config.get("async_colour", {}) or {})
+        self.async_colour_enabled = bool(
+            self.async_colour_config.get("enabled", False)
+            and self.config["vehicle_attributes"]["enabled"]
+        )
+        self.colour_queue_size = int(self.async_colour_config.get("queue_size", 100))
+        self.colour_worker_count = int(self.async_colour_config.get("worker_count", 1))
+        self.colour_queue_put_timeout_seconds = float(self.async_colour_config.get("queue_put_timeout_seconds", 0.1))
+        if self.async_colour_enabled and self.colour_worker_count != 1:
+            raise ValueError("vehicle_enrichment.async_colour.worker_count must be exactly 1 for this step.")
+        self._colour_job_queue: queue.Queue[ColourEnrichmentJob | None] | None = None
+        self._colour_result_queue: queue.SimpleQueue[ColourEnrichmentWorkerResult] | None = None
+        self._colour_worker_thread: threading.Thread | None = None
+        self._colour_job_sequence = 0
+        self._pending_jobs_by_track: dict[str, PreparedTrackEnrichment] = {}
+        self._enqueued_track_ids: set[str] = set()
+        self._completed_track_ids: set[str] = set()
+        if self.async_colour_enabled:
+            self._colour_job_queue = queue.Queue(maxsize=self.colour_queue_size)
+            self._colour_result_queue = queue.SimpleQueue()
+            self._colour_worker_thread = threading.Thread(
+                target=self._colour_worker_loop,
+                name="colour-enrichment-worker",
+                daemon=True,
+            )
+            self._colour_worker_thread.start()
         self._results_by_track: dict[str, TrackEnrichmentResult] = {}
         self._metrics: dict[str, Any] = {
             "completed_tracks_received": 0,
@@ -351,12 +446,33 @@ class VehicleEnrichmentManager:
             "florence_original_size_distribution": {},
             "body_type_selected_crop_count": 0,
             "colour_selected_crop_count": 0,
+            "car_tracks_total": 0,
+            "car_tracks_with_body_type_crop": 0,
+            "car_tracks_sent_to_body_type_florence": 0,
+            "car_tracks_with_valid_body_type": 0,
+            "car_tracks_body_type_unknown": 0,
+            "body_type_label_distribution": {},
             "body_type_tracks_waited_for_completion": 0,
             "colour_tracks_waited_for_completion": 0,
             "early_classification_attempts": 0,
             "early_classification_successes": 0,
             "track_evidence_release_count": 0,
             "track_evidence_pending_count": 0,
+            "colour_async_enabled": self.async_colour_enabled,
+            "colour_worker_count": self.colour_worker_count if self.async_colour_enabled else 0,
+            "colour_queue_count": 1 if self.async_colour_enabled else 0,
+            "colour_queue_size": self.colour_queue_size if self.async_colour_enabled else 0,
+            "colour_jobs_enqueued": 0,
+            "colour_jobs_started": 0,
+            "colour_jobs_completed": 0,
+            "colour_jobs_failed": 0,
+            "colour_jobs_duplicate_attempts": 0,
+            "colour_jobs_lost": 0,
+            "colour_queue_peak_depth": 0,
+            "colour_queue_block_count": 0,
+            "colour_queue_block_time_ms": 0.0,
+            "colour_worker_busy_time_ms": 0.0,
+            "colour_worker_shutdown_pending_jobs": 0,
             "plate_ocr_adapter_loads": 0,
             "plate_ocr_inference_calls": 0,
             "plate_ocr_skipped_no_plate": 0,
@@ -370,9 +486,11 @@ class VehicleEnrichmentManager:
     @property
     def metrics(self) -> dict[str, Any]:
         payload = dict(self._metrics)
+        payload["track_evidence_pending_count"] = len(self._pending_jobs_by_track)
         payload["crops_rejected_by_reason"] = dict(self._metrics["crops_rejected_by_reason"])
         payload["florence_original_size_distribution"] = dict(self._metrics["florence_original_size_distribution"])
         payload["vehicle_class_metrics"] = dict(self._metrics["vehicle_class_metrics"])
+        payload["body_type_label_distribution"] = dict(self._metrics["body_type_label_distribution"])
         payload.update(self.florence_backend.metrics)
         payload.update({f"ocr_backend_{key}": value for key, value in self.ocr_mukul_backend.metrics.items()})
         payload.update(self.body_type_classifier.metrics)
@@ -385,6 +503,9 @@ class VehicleEnrichmentManager:
         payload["body_type_inference_calls"] = int(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_body_inference_calls", 0))
         payload["colour_inference_calls"] = int(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_colour_inference_calls", 0))
         payload["average_colour_inference_time_ms"] = float(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_average_colour_inference_time_ms", 0.0) or 0.0)
+        payload["body_type_average_inference_ms"] = float(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_average_body_inference_time_ms", 0.0) or 0.0)
+        payload["florence_model_instances"] = 1 if self.config["vehicle_attributes"]["enabled"] else 0
+        payload["florence_concurrent_calls_possible"] = False if self.async_colour_enabled else False
         return payload
 
     @property
@@ -401,6 +522,32 @@ class VehicleEnrichmentManager:
             local_track_id = record["local_track_id"] if isinstance(record, dict) else record.local_track_id
             grouped_records[str(local_track_id)].append(record)
 
+        if not self.async_colour_enabled:
+            results: list[TrackEnrichmentResult] = []
+            for track in tracks:
+                self._metrics["completed_tracks_received"] += 1
+                self._metrics["vehicle_tracks_finalized"] += 1
+                self._metrics["current_in_memory_tracks"] += 1
+                started_monotonic = time.perf_counter()
+                started_iso = datetime.now(timezone.utc).isoformat()
+                try:
+                    result = self._enrich_single_track(
+                        track,
+                        grouped_records.get(track.local_track_id, []),
+                        started_iso,
+                        started_monotonic,
+                    )
+                except Exception as exc:
+                    self._metrics["enrichment_failures"] += 1
+                    if not self.config["fail_open"]:
+                        raise
+                    result = self._build_error_result(track, started_iso, started_monotonic, exc)
+                self._results_by_track[track.local_track_id] = result
+                self._metrics["enrichment_results_written"] += 1
+                results.append(result)
+                self._cleanup_track(track.local_track_id)
+            return results
+
         results: list[TrackEnrichmentResult] = []
         for track in tracks:
             self._metrics["completed_tracks_received"] += 1
@@ -408,8 +555,12 @@ class VehicleEnrichmentManager:
             self._metrics["current_in_memory_tracks"] += 1
             started_monotonic = time.perf_counter()
             started_iso = datetime.now(timezone.utc).isoformat()
+            local_track_id = str(track.local_track_id)
+            if local_track_id in self._enqueued_track_ids or local_track_id in self._completed_track_ids:
+                self._metrics["colour_jobs_duplicate_attempts"] += 1
+                continue
             try:
-                result = self._enrich_single_track(
+                prepared = self._prepare_track_for_async_colour(
                     track,
                     grouped_records.get(track.local_track_id, []),
                     started_iso,
@@ -420,11 +571,404 @@ class VehicleEnrichmentManager:
                 if not self.config["fail_open"]:
                     raise
                 result = self._build_error_result(track, started_iso, started_monotonic, exc)
-            self._results_by_track[track.local_track_id] = result
-            self._metrics["enrichment_results_written"] += 1
-            results.append(result)
-            self._cleanup_track(track.local_track_id)
+                self._results_by_track[track.local_track_id] = result
+                self._metrics["enrichment_results_written"] += 1
+                results.append(result)
+                self._cleanup_track(track.local_track_id)
+                continue
+            if isinstance(prepared, TrackEnrichmentResult):
+                self._results_by_track[track.local_track_id] = prepared
+                self._completed_track_ids.add(local_track_id)
+                self._metrics["enrichment_results_written"] += 1
+                results.append(prepared)
+                self._cleanup_track(track.local_track_id)
+                continue
+            self._enqueue_colour_job(prepared)
+        results.extend(self.drain_completed_results())
         return results
+
+    def drain_completed_results(self) -> list[TrackEnrichmentResult]:
+        if not self.async_colour_enabled or self._colour_result_queue is None:
+            return []
+        results: list[TrackEnrichmentResult] = []
+        while True:
+            try:
+                worker_result = self._colour_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            results.append(self._finish_async_result(worker_result))
+        return results
+
+    def finalize_async_colour(self) -> list[TrackEnrichmentResult]:
+        if not self.async_colour_enabled:
+            return []
+        if self._colour_job_queue is not None:
+            self._colour_job_queue.join()
+            self._colour_job_queue.put(None)
+        if self._colour_worker_thread is not None:
+            self._colour_worker_thread.join(timeout=30.0)
+        results = self.drain_completed_results()
+        self._metrics["colour_worker_shutdown_pending_jobs"] = len(self._pending_jobs_by_track)
+        return results
+
+    def _prepare_track_for_async_colour(
+        self,
+        track: LocalTrack,
+        evidence_records: list[TrackEvidence | dict[str, Any]],
+        started_iso: str,
+        started_monotonic: float,
+    ) -> PreparedTrackEnrichment | TrackEnrichmentResult:
+        vehicle_class_confidence = self._compute_vehicle_class_confidence(track)
+        if not self.enabled:
+            return self._build_base_result(
+                track=track,
+                vehicle_class_confidence=vehicle_class_confidence,
+                status=ENRICHMENT_STATUS_DISABLED,
+                evidence_used=[],
+                started_iso=started_iso,
+                started_monotonic=started_monotonic,
+                errors=[],
+            )
+
+        evidence_source_name, adapted = self._select_adapted_evidence(track, evidence_records)
+        raw_track_fallback_items = self._load_raw_track_crop_fallback_items(track)
+        adapted = self._merge_with_raw_track_crop_fallbacks(adapted, raw_track_fallback_items)
+        self._metrics["evidence_items_received"] += len(adapted)
+        if adapted:
+            self._metrics["tracks_with_existing_evidence"] += 1
+            if evidence_source_name == "capture_zone":
+                self._metrics["capture_zone_crops_used_by_enrichment"] += len(adapted)
+        else:
+            self._metrics["tracks_without_evidence"] += 1
+            if evidence_source_name == "capture_zone":
+                self._metrics["capture_zone_tracks_without_saved_evidence"] += 1
+            return self._build_base_result(
+                track=track,
+                vehicle_class_confidence=vehicle_class_confidence,
+                status=ENRICHMENT_STATUS_NO_EVIDENCE,
+                evidence_used=[],
+                started_iso=started_iso,
+                started_monotonic=started_monotonic,
+                errors=[],
+            )
+        self.logger.info(
+            "Evidence zone enrichment source camera=%s track=%s source=%s selected=%s",
+            track.camera_id,
+            track.local_track_id,
+            evidence_source_name,
+            len(adapted),
+        )
+
+        scored = [self.quality_evaluator.score_item(item) for item in adapted]
+        self._metrics["crop_candidates_evaluated"] += len(scored)
+        if scored:
+            self._metrics["tracks_with_candidate_evidence"] += 1
+        else:
+            self._metrics["tracks_without_candidate_evidence"] += 1
+        selected, rejected = self._select_best_evidence(scored)
+        for rejected_item in rejected:
+            self._metrics["crop_candidates_rejected"] += 1
+            for reason in rejected_item.rejection_reasons:
+                self._metrics["crops_rejected_by_reason"][reason] = self._metrics["crops_rejected_by_reason"].get(reason, 0) + 1
+                if reason == "crop_width_below_florence_minimum":
+                    self._metrics["florence_crops_rejected_width"] += 1
+                if reason == "crop_height_below_florence_minimum":
+                    self._metrics["florence_crops_rejected_height"] += 1
+                if reason == "crop_rejected_quality":
+                    self._metrics["florence_crops_rejected_quality"] += 1
+        self._metrics["crops_retained"] += len(selected)
+        selected = [self._materialize_selected_crop(track, item) for item in selected]
+        self._record_selected_crop_metrics(selected)
+        readable_crop_count = len([item for item in selected if getattr(item, "readable_crop", False)])
+        eligible_crop_count = len(
+            [
+                item
+                for item in selected
+                if getattr(item, "florence_eligible_for_body_type", False) or getattr(item, "florence_eligible_for_colour", False)
+            ]
+        )
+        preferred_crop_count = len([item for item in selected if getattr(item, "resolution_tier", "") == "preferred"])
+        fallback_crop_count = len([item for item in selected if str(getattr(item, "colour_selection_tier", "") or "") == "low_resolution_fallback"])
+        if eligible_crop_count > 0:
+            self._metrics["tracks_with_acceptable_crop"] += 1
+        else:
+            self._metrics["tracks_with_no_florence_eligible_crop"] += 1
+        if preferred_crop_count > 0:
+            self._metrics["tracks_with_preferred_crop"] += 1
+            self._metrics["vehicle_tracks_with_preferred_crop"] += 1
+        if scored:
+            self._metrics["vehicle_tracks_with_raw_crop"] += 1
+        if fallback_crop_count > 0:
+            self._metrics["vehicle_tracks_using_low_resolution_fallback"] += 1
+
+        request = TrackEnrichmentRequest(
+            local_track_id=track.local_track_id,
+            camera_id=track.camera_id,
+            native_tracker_id=track.native_tracker_id,
+            vehicle_class=str(track.final_class or "UNKNOWN").upper(),
+            vehicle_class_confidence=vehicle_class_confidence,
+            track_status=track.status,
+            completion_reason=track.completion_reason,
+            started_at_seconds=float(track.first_timestamp_seconds),
+            ended_at_seconds=float(track.last_timestamp_seconds),
+            evidence_items=selected,
+        )
+        return PreparedTrackEnrichment(
+            track=track,
+            request=request,
+            vehicle_class_confidence=vehicle_class_confidence,
+            started_iso=started_iso,
+            started_monotonic=started_monotonic,
+            evidence_source_name=evidence_source_name,
+            selected_items=tuple(selected),
+            candidate_crop_count=len(scored),
+            eligible_crop_count=eligible_crop_count,
+            preferred_crop_count=preferred_crop_count,
+            readable_crop_count=readable_crop_count,
+            fallback_crop_count=fallback_crop_count,
+        )
+
+    def _enqueue_colour_job(self, prepared: PreparedTrackEnrichment) -> None:
+        if self._colour_job_queue is None:
+            raise RuntimeError("Colour job queue is not initialized.")
+        self._colour_job_sequence += 1
+        local_track_id = str(prepared.track.local_track_id)
+        job = ColourEnrichmentJob(
+            sequence_number=self._colour_job_sequence,
+            local_track_id=local_track_id,
+            camera_id=str(prepared.track.camera_id),
+            vehicle_class=str(prepared.track.final_class or "UNKNOWN").upper(),
+            prepared=prepared,
+        )
+        queued = False
+        blocked_started_at: float | None = None
+        while not queued:
+            try:
+                self._colour_job_queue.put(job, timeout=self.colour_queue_put_timeout_seconds)
+                queued = True
+            except queue.Full:
+                self._metrics["colour_queue_block_count"] += 1
+                if blocked_started_at is None:
+                    blocked_started_at = time.perf_counter()
+        if blocked_started_at is not None:
+            self._metrics["colour_queue_block_time_ms"] += float((time.perf_counter() - blocked_started_at) * 1000.0)
+        self._pending_jobs_by_track[local_track_id] = prepared
+        self._enqueued_track_ids.add(local_track_id)
+        self._metrics["colour_jobs_enqueued"] += 1
+        self._metrics["colour_queue_peak_depth"] = max(
+            int(self._metrics["colour_queue_peak_depth"]),
+            self._colour_job_queue.qsize(),
+        )
+        self.logger.info(
+            "Colour job enqueued track=%s camera=%s queue_depth=%s",
+            local_track_id,
+            prepared.track.camera_id,
+            self._colour_job_queue.qsize(),
+        )
+
+    def _colour_worker_loop(self) -> None:
+        if self._colour_job_queue is None or self._colour_result_queue is None:
+            return
+        while True:
+            job = self._colour_job_queue.get()
+            if job is None:
+                self._colour_job_queue.task_done()
+                break
+            worker_started_iso = datetime.now(timezone.utc).isoformat()
+            started_monotonic = time.perf_counter()
+            error_message: str | None = None
+            attribute_result: Any | None = None
+            try:
+                self.logger.info("Colour worker started track=%s camera=%s", job.local_track_id, job.camera_id)
+                attribute_result = self.vehicle_attribute_flow.classify(job.prepared.request)
+            except Exception as exc:
+                error_message = str(exc)
+                self.logger.exception("Colour worker failed track=%s", job.local_track_id)
+            completed_iso = datetime.now(timezone.utc).isoformat()
+            duration_ms = float((time.perf_counter() - started_monotonic) * 1000.0)
+            self.logger.info(
+                "Colour worker completed track=%s camera=%s duration_ms=%.2f status=%s",
+                job.local_track_id,
+                job.camera_id,
+                duration_ms,
+                "failed" if error_message else "completed",
+            )
+            self._colour_result_queue.put(
+                ColourEnrichmentWorkerResult(
+                    sequence_number=job.sequence_number,
+                    local_track_id=job.local_track_id,
+                    camera_id=job.camera_id,
+                    attribute_result=attribute_result,
+                    error_message=error_message,
+                    worker_started_at=worker_started_iso,
+                    worker_completed_at=completed_iso,
+                    worker_duration_ms=duration_ms,
+                )
+            )
+            self._colour_job_queue.task_done()
+
+    def _finish_async_result(self, worker_result: ColourEnrichmentWorkerResult) -> TrackEnrichmentResult:
+        prepared = self._pending_jobs_by_track.pop(worker_result.local_track_id, None)
+        self._enqueued_track_ids.discard(worker_result.local_track_id)
+        if prepared is None:
+            self._metrics["colour_jobs_lost"] += 1
+            raise RuntimeError(f"Missing prepared async colour job for track {worker_result.local_track_id}")
+        self._metrics["colour_jobs_started"] += 1
+        self._metrics["colour_worker_busy_time_ms"] += float(worker_result.worker_duration_ms)
+        if worker_result.error_message:
+            self._metrics["colour_jobs_failed"] += 1
+            self._metrics["enrichment_failures"] += 1
+            if not self.config["fail_open"]:
+                raise RuntimeError(worker_result.error_message)
+            result = self._build_error_result(
+                prepared.track,
+                prepared.started_iso,
+                prepared.started_monotonic,
+                RuntimeError(worker_result.error_message),
+            )
+        else:
+            self._metrics["colour_jobs_completed"] += 1
+            result = self._build_async_vehicle_attribute_result(prepared, worker_result.attribute_result)
+        self._results_by_track[result.local_track_id] = result
+        self._completed_track_ids.add(result.local_track_id)
+        self._metrics["enrichment_results_written"] += 1
+        self._cleanup_track(result.local_track_id)
+        return result
+
+    def _build_async_vehicle_attribute_result(self, prepared: PreparedTrackEnrichment, attribute_result: Any) -> TrackEnrichmentResult:
+        track = prepared.track
+        selected = list(prepared.selected_items)
+        body_type_result = attribute_result.body_type
+        colour_result = attribute_result.colour
+        crop_level_captions = [
+            {
+                "crop_path": row["vehicle_crop_path"],
+                "frame_index": row["frame_index"],
+                "caption": row.get("colour_post_processed_response") or row.get("body_type_post_processed_response") or "",
+                "raw_response": row.get("colour_raw_response") or row.get("body_type_raw_response") or "",
+                "post_processed_response": row.get("colour_post_processed_response") or row.get("body_type_post_processed_response") or "",
+            }
+            for row in attribute_result.crop_level_rows
+        ]
+        crop_level_body_types = [
+            {
+                "crop_path": row["vehicle_crop_path"],
+                "frame_index": row["frame_index"],
+                "raw_body_type_phrase": "",
+                "normalized_body_type": row["parsed_body_type"],
+                "status": row.get("body_type_status"),
+                "reason": row.get("body_type_reason"),
+                "raw_response": row.get("body_type_raw_response"),
+                "task_token": row.get("body_type_task_token"),
+                "prompt": row.get("body_type_prompt"),
+                "effective_processor_text": row.get("body_type_effective_processor_text"),
+                "inference_time_ms": row.get("body_type_inference_time_ms"),
+            }
+            for row in attribute_result.crop_level_rows
+        ]
+        crop_level_colours = [
+            {
+                "crop_path": row["vehicle_crop_path"],
+                "frame_index": row["frame_index"],
+                "raw_colour_phrase": "",
+                "normalized_colour": row["parsed_colour"],
+                "status": row.get("colour_status"),
+                "reason": row.get("colour_reason"),
+                "crop_source": row.get("crop_source"),
+                "crop_available": row.get("crop_available"),
+                "crop_skip_reason": row.get("crop_skip_reason"),
+                "selection_tier": row.get("selection_tier"),
+                "raw_response": row.get("colour_raw_response"),
+                "task_token": row.get("colour_task_token"),
+                "prompt": row.get("colour_prompt"),
+                "effective_processor_text": row.get("colour_effective_processor_text"),
+                "inference_time_ms": row.get("colour_inference_time_ms"),
+            }
+            for row in attribute_result.crop_level_rows
+        ]
+        self._apply_prediction_selection_metadata(selected, body_type_result.predictions, "body_type")
+        self._apply_prediction_selection_metadata(selected, colour_result.predictions, "colour")
+        self._metrics["body_type_selected_crop_count"] += len(body_type_result.predictions)
+        self._metrics["colour_selected_crop_count"] += len(colour_result.predictions)
+        if str(track.final_class or "").upper() == "CAR":
+            self._metrics["car_tracks_total"] += 1
+            self._metrics["car_tracks_with_body_type_crop"] += int(attribute_result.body_type_selected_crop_count > 0)
+            self._metrics["car_tracks_sent_to_body_type_florence"] += int(attribute_result.body_type_florence_call_count > 0)
+            self._metrics["car_tracks_with_valid_body_type"] += int(str(body_type_result.label or "").upper() not in {"", "UNKNOWN"})
+            self._metrics["car_tracks_body_type_unknown"] += int(str(body_type_result.label or "").upper() in {"", "UNKNOWN"})
+        label_key = str(body_type_result.label or "UNKNOWN").upper()
+        self._metrics["body_type_label_distribution"][label_key] = int(self._metrics["body_type_label_distribution"].get(label_key, 0)) + 1
+        self._metrics["body_type_tracks_waited_for_completion"] += 1
+        self._metrics["colour_tracks_waited_for_completion"] += 1
+        colour_selection_tier = self._resolve_colour_selection_tier(colour_result.predictions, selected)
+        if colour_result.predictions:
+            self._metrics["vehicle_tracks_sent_to_florence"] += 1
+        else:
+            self._metrics["vehicle_tracks_with_zero_florence_calls"] += 1
+            if prepared.candidate_crop_count > 0 and prepared.readable_crop_count > 0:
+                self._metrics["vehicle_tracks_with_raw_crop_but_zero_florence_calls"] += 1
+        if str(colour_result.label or "").upper() not in {"", "UNKNOWN"}:
+            self._metrics["vehicle_tracks_with_valid_colour"] += 1
+        else:
+            self._metrics["vehicle_tracks_colour_unknown"] += 1
+        self._record_vehicle_class_metrics(
+            vehicle_class=str(track.final_class or "UNKNOWN").upper(),
+            has_raw_crop=prepared.candidate_crop_count > 0,
+            sent_to_florence=bool(colour_result.predictions),
+            used_fallback=prepared.fallback_crop_count > 0 or colour_selection_tier == "low_resolution_fallback",
+            valid_colour=str(colour_result.label or "").upper() not in {"", "UNKNOWN"},
+        )
+        return self._build_base_result(
+            track=track,
+            vehicle_class_confidence=prepared.vehicle_class_confidence,
+            status=ENRICHMENT_STATUS_COMPLETED if selected else ENRICHMENT_STATUS_NO_EVIDENCE,
+            evidence_used=selected,
+            started_iso=prepared.started_iso,
+            started_monotonic=prepared.started_monotonic,
+            errors=[],
+            body_type_result=body_type_result,
+            colour_result=colour_result,
+            vehicle_make=None,
+            vehicle_model=None,
+            plate_detected=False,
+            plate_text=None,
+            candidate_crop_count=prepared.candidate_crop_count,
+            eligible_crop_count=prepared.eligible_crop_count,
+            preferred_crop_count=prepared.preferred_crop_count,
+            readable_crop_count=prepared.readable_crop_count,
+            fallback_crop_count=prepared.fallback_crop_count,
+            selected_colour_crop_count=len(colour_result.predictions),
+            colour_selection_tier=colour_selection_tier,
+            selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
+            selected_colour_crop_paths=[str(item.source_crop_path) for item in colour_result.predictions if item.source_crop_path],
+            body_type_eligible=attribute_result.body_type_eligible,
+            body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count,
+            body_type_selected_crop_count=attribute_result.body_type_selected_crop_count,
+            body_type_florence_call_count=attribute_result.body_type_florence_call_count,
+            body_type_valid_prediction_count=attribute_result.body_type_valid_prediction_count,
+            body_type_failure_reason=attribute_result.body_type_failure_reason,
+            florence_mode=str(self.config["florence_mode"]).strip().lower(),
+            adapter_loaded=attribute_result.adapter_loaded,
+            selected_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
+            crop_level_captions=crop_level_captions,
+            crop_level_body_types=crop_level_body_types,
+            crop_level_colours=crop_level_colours,
+            final_body_type_reason=body_type_result.aggregation_reason or body_type_result.reason,
+            final_colour_reason=colour_result.aggregation_reason or colour_result.reason,
+            caption_inference_count=attribute_result.inference_count,
+            vehicle_attribute_raw_responses=attribute_result.raw_responses,
+            vehicle_attribute_selected_crop_paths=[str(item.get("vehicle_crop_path")) for item in attribute_result.crop_level_rows],
+            vehicle_attribute_inference_count=attribute_result.inference_count,
+            attribute_backend="base_florence",
+            plate_ocr_backend=None,
+            plate_ocr_attempted=False,
+            plate_ocr_raw_response=None,
+            plate_ocr_reason="plate_scope_frozen",
+            plate_quality_status="plate_scope_frozen",
+            comparison_payload=None,
+            classification_trigger="track_completion_async_colour",
+            final_reason=body_type_result.aggregation_reason or body_type_result.reason or colour_result.aggregation_reason or colour_result.reason,
+        )
 
     def _enrich_single_track(
         self,
@@ -547,9 +1091,9 @@ class VehicleEnrichmentManager:
                 {
                     "crop_path": row["vehicle_crop_path"],
                     "frame_index": row["frame_index"],
-                    "caption": row["post_processed_response"],
-                    "raw_response": row["raw_response"],
-                    "post_processed_response": row["post_processed_response"],
+                    "caption": row.get("colour_post_processed_response") or row.get("body_type_post_processed_response") or "",
+                    "raw_response": row.get("colour_raw_response") or row.get("body_type_raw_response") or "",
+                    "post_processed_response": row.get("colour_post_processed_response") or row.get("body_type_post_processed_response") or "",
                 }
                 for row in attribute_result.crop_level_rows
             ]
@@ -561,6 +1105,11 @@ class VehicleEnrichmentManager:
                     "normalized_body_type": row["parsed_body_type"],
                     "status": row.get("body_type_status"),
                     "reason": row.get("body_type_reason"),
+                    "raw_response": row.get("body_type_raw_response"),
+                    "task_token": row.get("body_type_task_token"),
+                    "prompt": row.get("body_type_prompt"),
+                    "effective_processor_text": row.get("body_type_effective_processor_text"),
+                    "inference_time_ms": row.get("body_type_inference_time_ms"),
                 }
                 for row in attribute_result.crop_level_rows
             ]
@@ -576,6 +1125,11 @@ class VehicleEnrichmentManager:
                     "crop_available": row.get("crop_available"),
                     "crop_skip_reason": row.get("crop_skip_reason"),
                     "selection_tier": row.get("selection_tier"),
+                    "raw_response": row.get("colour_raw_response"),
+                    "task_token": row.get("colour_task_token"),
+                    "prompt": row.get("colour_prompt"),
+                    "effective_processor_text": row.get("colour_effective_processor_text"),
+                    "inference_time_ms": row.get("colour_inference_time_ms"),
                 }
                 for row in attribute_result.crop_level_rows
             ]
@@ -647,6 +1201,15 @@ class VehicleEnrichmentManager:
                 self._metrics["capture_zone_motorcycle_valid_colours"] += 1
         self._metrics["body_type_selected_crop_count"] += len(body_type_result.predictions)
         self._metrics["colour_selected_crop_count"] += len(colour_result.predictions)
+        if str(track.final_class or "").upper() == "CAR":
+            self._metrics["car_tracks_total"] += 1
+            if self.config["vehicle_attributes"]["enabled"]:
+                self._metrics["car_tracks_with_body_type_crop"] += int(attribute_result.body_type_selected_crop_count > 0)
+                self._metrics["car_tracks_sent_to_body_type_florence"] += int(attribute_result.body_type_florence_call_count > 0)
+                self._metrics["car_tracks_with_valid_body_type"] += int(str(body_type_result.label or "").upper() not in {"", "UNKNOWN"})
+                self._metrics["car_tracks_body_type_unknown"] += int(str(body_type_result.label or "").upper() in {"", "UNKNOWN"})
+        label_key = str(body_type_result.label or "UNKNOWN").upper()
+        self._metrics["body_type_label_distribution"][label_key] = int(self._metrics["body_type_label_distribution"].get(label_key, 0)) + 1
         self._metrics["body_type_tracks_waited_for_completion"] += 1
         self._metrics["colour_tracks_waited_for_completion"] += 1
         colour_selection_tier = self._resolve_colour_selection_tier(colour_result.predictions, selected)
@@ -667,19 +1230,61 @@ class VehicleEnrichmentManager:
             used_fallback=fallback_crop_count > 0 or colour_selection_tier == "low_resolution_fallback",
             valid_colour=str(colour_result.label or "").upper() not in {"", "UNKNOWN"},
         )
-        make_model_result = self.make_model_classifier.classify(request)
-        plate_detection_result = self.plate_detector.detect(selected[0]) if selected else PlateDetectionResult(detected=False, predictions=[], status="skipped", source="plate.detector", reason="no_selected_vehicle_crop")
-        plate_quality_result = self.plate_quality_validator.validate(None)
-        if not getattr(plate_detection_result, "detected", False):
+        make_model_enabled = bool(getattr(self.make_model_classifier, "enabled", False))
+        plate_detection_enabled = bool(getattr(self.plate_detector, "enabled", False))
+        plate_ocr_enabled = bool(getattr(self.plate_ocr_engine, "enabled", False))
+        if make_model_enabled:
+            make_model_result = self.make_model_classifier.classify(request)
+        else:
+            make_model_result = VehicleMakeModelResult(
+                make=None,
+                model=None,
+                predictions=[],
+                status=ATTRIBUTE_STATUS_DISABLED,
+                source="make_model.classifier",
+                reason="make_model_scope_frozen",
+            )
+        if plate_detection_enabled and selected:
+            plate_detection_result = self.plate_detector.detect(selected[0])
+            plate_quality_result = self.plate_quality_validator.validate(None)
+        elif plate_detection_enabled:
+            plate_detection_result = PlateDetectionResult(
+                detected=False,
+                predictions=[],
+                status="skipped",
+                source="plate.detector",
+                reason="no_selected_vehicle_crop",
+            )
+            plate_quality_result = self.plate_quality_validator.validate(None)
+        else:
+            plate_detection_result = PlateDetectionResult(
+                detected=False,
+                predictions=[],
+                status=ATTRIBUTE_STATUS_DISABLED,
+                source="plate.detector",
+                reason="plate_scope_frozen",
+            )
+            plate_quality_result = PlateQualityResult(
+                acceptable=None,
+                predictions=[],
+                status=ATTRIBUTE_STATUS_DISABLED,
+                source="plate.quality_validator",
+                reason="plate_scope_frozen",
+            )
+        if plate_detection_enabled and not getattr(plate_detection_result, "detected", False):
             self._metrics["plate_ocr_skipped_no_plate"] += 1
             plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="skipped", source="plate.ocr_engine", reason="no_plate_detected")
-        else:
+        elif plate_detection_enabled and plate_ocr_enabled:
             self._metrics["plate_ocr_attempts"] += 1
             self._metrics["gpu_memory_before_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
             plate_ocr_result = self.plate_ocr_engine.recognize(None)
             self._metrics["gpu_memory_after_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
             if plate_ocr_result.status == "completed":
                 self._metrics["plate_ocr_inference_calls"] += 1
+        elif plate_detection_enabled:
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_ocr_disabled")
+        else:
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_scope_frozen")
         plate_aggregate = self.plate_result_aggregator.aggregate(plate_detection_result, plate_quality_result, plate_ocr_result)
         overall_status = (
             ENRICHMENT_STATUS_COMPLETED
@@ -710,6 +1315,12 @@ class VehicleEnrichmentManager:
             colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
             selected_colour_crop_paths=[str(item.source_crop_path) for item in colour_result.predictions if item.source_crop_path],
+            body_type_eligible=attribute_result.body_type_eligible if self.config["vehicle_attributes"]["enabled"] else str(track.final_class or "").upper() == "CAR",
+            body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count if self.config["vehicle_attributes"]["enabled"] else 0,
+            body_type_selected_crop_count=attribute_result.body_type_selected_crop_count if self.config["vehicle_attributes"]["enabled"] else len(body_type_result.predictions),
+            body_type_florence_call_count=attribute_result.body_type_florence_call_count if self.config["vehicle_attributes"]["enabled"] else len(body_type_result.predictions),
+            body_type_valid_prediction_count=attribute_result.body_type_valid_prediction_count if self.config["vehicle_attributes"]["enabled"] else sum(1 for item in body_type_result.predictions if str(item.label or "").upper() not in {"", "UNKNOWN"}),
+            body_type_failure_reason=attribute_result.body_type_failure_reason if self.config["vehicle_attributes"]["enabled"] else (body_type_result.aggregation_reason or body_type_result.reason),
             florence_mode=florence_mode,
             adapter_loaded=adapter_loaded,
             selected_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
@@ -859,6 +1470,12 @@ class VehicleEnrichmentManager:
         colour_selection_tier: str | None = None,
         selected_body_type_crop_paths: list[str] | None = None,
         selected_colour_crop_paths: list[str] | None = None,
+        body_type_eligible: bool | None = None,
+        body_type_candidate_crop_count: int = 0,
+        body_type_selected_crop_count: int = 0,
+        body_type_florence_call_count: int = 0,
+        body_type_valid_prediction_count: int = 0,
+        body_type_failure_reason: str | None = None,
         florence_mode: str | None = None,
         adapter_loaded: bool | None = None,
         selected_crop_paths: list[str] | None = None,
@@ -910,6 +1527,12 @@ class VehicleEnrichmentManager:
             colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=list(selected_body_type_crop_paths or []),
             selected_colour_crop_paths=list(selected_colour_crop_paths or []),
+            body_type_eligible=body_type_eligible,
+            body_type_candidate_crop_count=body_type_candidate_crop_count,
+            body_type_selected_crop_count=body_type_selected_crop_count,
+            body_type_florence_call_count=body_type_florence_call_count,
+            body_type_valid_prediction_count=body_type_valid_prediction_count,
+            body_type_failure_reason=body_type_failure_reason,
             florence_mode=florence_mode,
             adapter_loaded=adapter_loaded,
             selected_crop_paths=list(selected_crop_paths or []),

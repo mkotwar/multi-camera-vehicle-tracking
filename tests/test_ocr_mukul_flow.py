@@ -119,10 +119,13 @@ def test_word_boundaries_avoid_false_matches() -> None:
 def test_combined_format_and_natural_language_parse_both_attributes() -> None:
     combined = parse_caption_attributes("COLOUR: BLACK; BODY_TYPE: MPV")
     natural = parse_caption_attributes("A dark grey sport utility vehicle")
+    pink = parse_caption_attributes("A pink hatchback parked by the road")
     assert combined.normalized_colour == "BLACK"
     assert combined.normalized_body_type == "MPV"
     assert natural.normalized_colour == "GREY"
     assert natural.normalized_body_type == "SUV"
+    assert pink.normalized_colour == "PINK"
+    assert pink.normalized_body_type == "HATCHBACK"
 
 
 def test_plate_like_response_returns_unknown_attributes() -> None:

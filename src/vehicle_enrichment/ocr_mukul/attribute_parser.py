@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from ..body_type.labels import normalize_body_type_label
+
 
 OCR_MUKUL_UNKNOWN = "UNKNOWN"
 ATTRIBUTE_REASON_PLATE_LIKE = "plate_like_response_in_attribute_path"
@@ -14,6 +16,7 @@ _COLOUR_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("SILVER", ("silver", "metallic silver")),
     ("BLUE", ("blue", "navy blue", "cobalt", "azure")),
     ("RED", ("red", "maroon", "burgundy", "crimson", "scarlet")),
+    ("PINK", ("pink", "hot pink", "light pink", "bright pink", "rose pink")),
     ("GREEN", ("green", "olive", "forest green", "emerald")),
     ("YELLOW", ("yellow", "mustard")),
     ("ORANGE", ("orange", "amber", "rust")),
@@ -31,6 +34,7 @@ _BODY_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("VAN", ("van", "minivan")),
     ("COUPE", ("coupe",)),
     ("CONVERTIBLE", ("convertible", "cabriolet")),
+    ("WAGON", ("station wagon", "estate", "wagon")),
 ]
 
 _VEHICLE_NOUNS = r"(?:car|vehicle|sedan|hatchback|suv|truck|pickup|van|minivan|wagon|coupe|convertible|bus|motorcycle|3wheeler)"
@@ -111,10 +115,18 @@ def _extract_colour_phrase(text: str) -> tuple[str | None, str]:
 def _extract_body_phrase(text: str) -> tuple[str | None, str]:
     explicit = _extract_explicit_field(text, "BODY_TYPE") or _extract_explicit_field(text, "BODY TYPE")
     if explicit:
+        normalized, _reason = normalize_body_type_label(explicit)
+        if normalized != OCR_MUKUL_UNKNOWN:
+            return explicit, normalized
         raw_phrase, canonical = _match_phrase(explicit, _BODY_RULES)
         if canonical is not None:
             return raw_phrase or explicit, canonical
-    return _match_phrase(text, _BODY_RULES) if _normalize_text(text) not in _UNCERTAIN_PHRASES else (None, OCR_MUKUL_UNKNOWN)
+    if _normalize_text(text) in _UNCERTAIN_PHRASES:
+        return None, OCR_MUKUL_UNKNOWN
+    normalized, _reason = normalize_body_type_label(text)
+    if normalized != OCR_MUKUL_UNKNOWN:
+        return text, normalized
+    return _match_phrase(text, _BODY_RULES)
 
 
 def parse_caption_attributes(caption: str) -> ParsedCaptionAttributes:

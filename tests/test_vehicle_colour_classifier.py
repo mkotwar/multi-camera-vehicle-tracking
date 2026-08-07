@@ -13,6 +13,7 @@ from src.vehicle_enrichment.colour.classifier import (
     VehicleColourClassifier,
     get_colour_prompt_variants,
 )
+from src.vehicle_enrichment.colour.search_aliases import expand_colour_search_labels
 from src.vehicle_enrichment.schemas import EnrichmentEvidenceItem, TrackEnrichmentRequest
 
 
@@ -132,6 +133,7 @@ def _classifier(backend: FakeBackend, *, enabled=True, **overrides) -> VehicleCo
             "GREY",
             "SILVER",
             "RED",
+            "PINK",
             "BLUE",
             "GREEN",
             "YELLOW",
@@ -191,7 +193,7 @@ def test_body_type_and_colour_share_same_backend_and_load_once(tmp_path: Path) -
             "maximum_crops_per_track": 2,
             "minimum_crop_width": 100,
             "minimum_crop_height": 80,
-            "allowed_labels": ["SUV", "SEDAN", "HATCHBACK", "MPV", "VAN", "PICKUP", "OTHER", "UNKNOWN"],
+            "allowed_labels": ["SUV", "SEDAN", "HATCHBACK", "MPV", "VAN", "PICKUP", "COUPE", "CONVERTIBLE", "WAGON", "UNKNOWN"],
         },
         backend=backend,
         logger=FakeLogger(),
@@ -221,6 +223,13 @@ def test_gray_normalizes_to_grey() -> None:
     assert classifier.normalize_label("gray") == ("GREY", "exact_phrase_match")
     assert classifier.normalize_label("metallic gray") == ("GREY", "exact_phrase_match")
     assert classifier.normalize_label("dark gray") == ("GREY", "exact_phrase_match")
+
+
+def test_pink_normalizes_to_pink() -> None:
+    classifier = _classifier(FakeBackend())
+    assert classifier.normalize_label("pink") == ("PINK", "exact_phrase_match")
+    assert classifier.normalize_label("PINK") == ("PINK", "exact_phrase_match")
+    assert classifier.normalize_label("Pink vehicle") == ("PINK", "contained_phrase_match")
 
 
 def test_generic_responses_remain_unknown() -> None:
@@ -359,6 +368,27 @@ def test_matching_conflicting_and_mixed_predictions_aggregate_correctly(tmp_path
         _request(tmp_path, items=[_item(tmp_path, "x1", quality=0.9), _item(tmp_path, "x2", quality=0.2)])
     )
     assert mixed_result.label == "WHITE"
+
+
+def test_all_pink_predictions_aggregate_to_pink(tmp_path: Path) -> None:
+    classifier = _classifier(FakeBackend(["pink", "pink", "pink"]), maximum_crops_per_track=3)
+    result = classifier.classify(
+        _request(
+            tmp_path,
+            items=[
+                _item(tmp_path, "p1", quality=0.9),
+                _item(tmp_path, "p2", quality=0.8),
+                _item(tmp_path, "p3", quality=0.7),
+            ],
+        )
+    )
+    assert result.label == "PINK"
+
+
+def test_colour_search_aliases_expand_red_to_red_and_pink_only() -> None:
+    assert expand_colour_search_labels("RED") == ("RED", "PINK")
+    assert expand_colour_search_labels("PINK") == ("PINK",)
+    assert expand_colour_search_labels("BLUE") == ("BLUE",)
 
 
 def test_raw_responses_and_crop_paths_are_preserved(tmp_path: Path) -> None:

@@ -275,6 +275,12 @@ class TrackEnrichmentResult:
     colour_selection_tier: str | None = None
     selected_body_type_crop_paths: list[str] = field(default_factory=list)
     selected_colour_crop_paths: list[str] = field(default_factory=list)
+    body_type_eligible: bool | None = None
+    body_type_candidate_crop_count: int = 0
+    body_type_selected_crop_count: int = 0
+    body_type_florence_call_count: int = 0
+    body_type_valid_prediction_count: int = 0
+    body_type_failure_reason: str | None = None
     florence_mode: str | None = None
     adapter_loaded: bool | None = None
     selected_crop_paths: list[str] = field(default_factory=list)

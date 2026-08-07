@@ -27,11 +27,11 @@ COLOUR_PROMPT_TEXT = (
     "Ignore windows, tyres, lights, number plates, shadows, reflections, "
     "road colour, and background. "
     "Answer with exactly one label: "
-    "black, white, grey, silver, red, blue, green, yellow, "
+    "black, white, grey, silver, red, pink, blue, green, yellow, "
     "orange, brown, beige, purple, or other."
 )
 COLOUR_FALLBACK_PROMPT_TEXT = (
-    "Choose one vehicle colour only: black, white, grey, silver, red, blue, green, yellow, orange, brown, beige, purple, or other."
+    "Choose one vehicle colour only: black, white, grey, silver, red, pink, blue, green, yellow, orange, brown, beige, purple, or other."
 )
 
 COLOUR_PROMPT_VARIANTS: dict[str, dict[str, str]] = {
@@ -44,19 +44,19 @@ COLOUR_PROMPT_VARIANTS: dict[str, dict[str, str]] = {
     "prompt_b": {
         "id": "prompt_b",
         "task_prompt": "<VQA>",
-        "prompt_text": "Vehicle body colour. Answer with one word only: black, white, grey, silver, red, blue, green, yellow, orange, brown, beige, purple, or other.",
+        "prompt_text": "Vehicle body colour. Answer with one word only: black, white, grey, silver, red, pink, blue, green, yellow, orange, brown, beige, purple, or other.",
         "description": "short direct prompt",
     },
     "prompt_c": {
         "id": "prompt_c",
         "task_prompt": "<VQA>",
-        "prompt_text": "Look only at the painted exterior body panels of the vehicle. What is the main colour? Answer with exactly one word from: black, white, grey, silver, red, blue, green, yellow, orange, brown, beige, purple, other.",
+        "prompt_text": "Look only at the painted exterior body panels of the vehicle. What is the main colour? Answer with exactly one word from: black, white, grey, silver, red, pink, blue, green, yellow, orange, brown, beige, purple, other.",
         "description": "explicit object focus",
     },
     "prompt_d": {
         "id": "prompt_d",
         "task_prompt": "<VQA>",
-        "prompt_text": "Classify the vehicle exterior colour into exactly one category: black, white, grey, silver, red, blue, green, yellow, orange, brown, beige, purple, or other.",
+        "prompt_text": "Classify the vehicle exterior colour into exactly one category: black, white, grey, silver, red, pink, blue, green, yellow, orange, brown, beige, purple, or other.",
         "description": "classification wording",
     },
     "prompt_e": {
@@ -68,7 +68,7 @@ COLOUR_PROMPT_VARIANTS: dict[str, dict[str, str]] = {
     "prompt_f": {
         "id": "prompt_f",
         "task_prompt": "",
-        "prompt_text": "What is the dominant exterior colour of this vehicle? Ignore windows, tyres, lights, number plates, shadows, reflections, road colour, and background. Answer with exactly one label: black, white, grey, silver, red, blue, green, yellow, orange, brown, beige, purple, or other.",
+        "prompt_text": "What is the dominant exterior colour of this vehicle? Ignore windows, tyres, lights, number plates, shadows, reflections, road colour, and background. Answer with exactly one label: black, white, grey, silver, red, pink, blue, green, yellow, orange, brown, beige, purple, or other.",
         "description": "no task prefix fallback",
     },
 }
@@ -81,6 +81,7 @@ COLOUR_LABEL_RULES: list[tuple[str, set[str]]] = [
     ("GREY", {"grey", "gray", "dark grey", "dark gray", "light grey", "light gray", "metallic grey", "metallic gray"}),
     ("SILVER", {"silver", "metallic silver"}),
     ("RED", {"red", "dark red", "light red", "maroon"}),
+    ("PINK", {"pink", "hot pink", "light pink", "bright pink"}),
     ("BLUE", {"blue", "dark blue", "light blue", "navy blue"}),
     ("GREEN", {"green", "dark green", "light green", "olive green"}),
     ("YELLOW", {"yellow"}),

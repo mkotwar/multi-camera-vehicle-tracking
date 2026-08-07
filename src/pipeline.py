@@ -7,6 +7,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import csv
 from pathlib import Path
+import shutil
 from typing import Any
 
 import yaml
@@ -237,10 +238,16 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     worker_count = int(ingestion.get("worker_count", 7))
     target_read_fps = ingestion.get("target_read_fps", 10.0)
     frame_queue_size = int(ingestion.get("frame_queue_size", 200))
+    per_camera_buffer_size = int(ingestion.get("per_camera_buffer_size", 2))
+    scheduler_policy = str(ingestion.get("scheduler_policy", "round_robin")).strip().lower() or "round_robin"
     if worker_count < 1:
         raise ConfigurationError("ingestion.worker_count must be at least 1.")
     if frame_queue_size < 1:
         raise ConfigurationError("ingestion.frame_queue_size must be at least 1.")
+    if per_camera_buffer_size < 1:
+        raise ConfigurationError("ingestion.per_camera_buffer_size must be at least 1.")
+    if scheduler_policy != "round_robin":
+        raise ConfigurationError("ingestion.scheduler_policy must be round_robin.")
     if target_read_fps is not None and float(target_read_fps) <= 0.0:
         raise ConfigurationError("ingestion.target_read_fps must be positive when provided.")
 
@@ -437,6 +444,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "worker_count": worker_count,
             "target_read_fps": None if target_read_fps is None else float(target_read_fps),
             "frame_queue_size": frame_queue_size,
+            "per_camera_buffer_size": per_camera_buffer_size,
+            "scheduler_policy": scheduler_policy,
             "queue_put_timeout_seconds": float(ingestion.get("queue_put_timeout_seconds", 2.0)),
             "queue_get_timeout_seconds": float(ingestion.get("queue_get_timeout_seconds", 1.0)),
             "stop_on_camera_error": bool(ingestion.get("stop_on_camera_error", False)),
@@ -671,6 +680,13 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             bool(validated_config["vehicle_enrichment"].get("shared_florence", {}).get("adapter_enabled", False)),
             bool(validated_config["vehicle_enrichment"].get("plate", {}).get("ocr", {}).get("enabled", False)),
         )
+        logger.info(
+            "Async colour enrichment: enabled=%s worker_count=%s queue_count=%s queue_size=%s",
+            bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)),
+            int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("worker_count", 0)),
+            1 if bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)) else 0,
+            int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("queue_size", 0)),
+        )
         metadata.status = RUN_STATUS_RUNNING
         output_manager.save_metadata(metadata)
 
@@ -799,6 +815,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
             enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
             detector_tracker.reset_camera(camera_id)
+        enrichment_results.extend(vehicle_enrichment_manager.finalize_async_colour())
         ingestion_manager.set_saved_raw_frames_by_camera(saved_raw_frames_by_camera)
         ingestion_manager.stop()
         metrics = ingestion_manager.get_metrics()
@@ -1007,6 +1024,36 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 json.dumps(vehicle_colour_result_rows, indent=2),
                 encoding="utf-8",
             )
+        vehicle_body_type_result_rows = _build_vehicle_body_type_result_rows(enrichment_results)
+        if vehicle_body_type_result_rows:
+            with (output_manager.run_directory / "vehicle_body_type_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_body_type_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_body_type_result_rows)
+            (output_manager.run_directory / "vehicle_body_type_results.json").write_text(
+                json.dumps(vehicle_body_type_result_rows, indent=2),
+                encoding="utf-8",
+            )
+            with (output_manager.body_type_results_directory / "vehicle_body_type_results.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(vehicle_body_type_result_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(vehicle_body_type_result_rows)
+            (output_manager.body_type_results_directory / "vehicle_body_type_results.json").write_text(
+                json.dumps(vehicle_body_type_result_rows, indent=2),
+                encoding="utf-8",
+            )
+            for row in vehicle_body_type_result_rows:
+                crop_path = Path(str(row.get("crop_path") or ""))
+                if not crop_path.exists():
+                    continue
+                camera_id = str(row.get("camera_id") or "UNKNOWN")
+                local_track_id = str(row.get("local_track_id") or "TRACK_UNKNOWN")
+                track_name = local_track_id.split(":")[-1]
+                target_dir = output_manager.body_type_selected_crops_directory / camera_id / track_name
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / crop_path.name
+                if crop_path.resolve() != target_path.resolve():
+                    shutil.copyfile(str(crop_path), str(target_path))
         vehicle_colour_track_summary_rows = _build_vehicle_colour_track_summary_rows(enrichment_results)
         if vehicle_colour_track_summary_rows:
             with (output_manager.run_directory / "vehicle_colour_track_summary.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -1059,6 +1106,18 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "max_frames_per_camera": validated_config["input"]["max_frames_per_camera"],
                 "frame_limit_mode": "unlimited" if validated_config["input"]["max_frames_per_camera"] is None else "limited",
                 "worker_count": metrics["worker_count"],
+                "ingestion_worker_count": int(metrics.get("ingestion_worker_count", metrics["worker_count"])),
+                "per_camera_buffer_count": int(metrics.get("per_camera_buffer_count", 0)),
+                "per_camera_buffer_size": int(metrics.get("per_camera_buffer_size", 0)),
+                "scheduler_policy": str(metrics.get("scheduler_policy", "round_robin")),
+                "camera_read_jobs": int(metrics.get("camera_read_jobs", 0)),
+                "camera_read_failures": int(metrics.get("camera_read_failures", 0)),
+                "frames_scheduled_by_camera": dict(metrics.get("frames_scheduled_by_camera", {})),
+                "frames_consumed_by_camera": dict(metrics.get("frames_consumed_by_camera", {})),
+                "per_camera_buffer_peak": dict(metrics.get("per_camera_buffer_peak", {})),
+                "buffer_full_count": int(metrics.get("buffer_full_count", 0)),
+                "max_consecutive_frames_same_camera": int(metrics.get("max_consecutive_frames_same_camera", 0)),
+                "scheduler_skipped_empty_camera": int(metrics.get("scheduler_skipped_empty_camera", 0)),
                 "processed_frames": metadata.processed_frames,
                 "frames_by_camera": metrics["frames_by_camera"],
                 "frames_by_worker": metrics["frames_by_worker"],
@@ -1092,6 +1151,29 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "vehicle_pipeline_trace_path": str(vehicle_pipeline_trace_path),
                 "vehicle_enrichment_enabled": validated_config["vehicle_enrichment"]["enabled"],
                 "vehicle_enrichment_result_count": len(enrichment_results),
+                "colour_async_enabled": bool(vehicle_enrichment_manager.metrics.get("colour_async_enabled", False)),
+                "colour_worker_count": int(vehicle_enrichment_manager.metrics.get("colour_worker_count", 0)),
+                "colour_queue_count": int(vehicle_enrichment_manager.metrics.get("colour_queue_count", 0)),
+                "colour_queue_size": int(vehicle_enrichment_manager.metrics.get("colour_queue_size", 0)),
+                "colour_queue_peak_depth": int(vehicle_enrichment_manager.metrics.get("colour_queue_peak_depth", 0)),
+                "colour_queue_block_count": int(vehicle_enrichment_manager.metrics.get("colour_queue_block_count", 0)),
+                "colour_jobs_enqueued": int(vehicle_enrichment_manager.metrics.get("colour_jobs_enqueued", 0)),
+                "colour_jobs_completed": int(vehicle_enrichment_manager.metrics.get("colour_jobs_completed", 0)),
+                "colour_jobs_failed": int(vehicle_enrichment_manager.metrics.get("colour_jobs_failed", 0)),
+                "colour_jobs_duplicate_attempts": int(vehicle_enrichment_manager.metrics.get("colour_jobs_duplicate_attempts", 0)),
+                "colour_jobs_lost": int(vehicle_enrichment_manager.metrics.get("colour_jobs_lost", 0)),
+                "pending_colour_jobs_at_shutdown": int(vehicle_enrichment_manager.metrics.get("track_evidence_pending_count", 0)),
+                "colour_worker_busy_time_ms": float(vehicle_enrichment_manager.metrics.get("colour_worker_busy_time_ms", 0.0) or 0.0),
+                "detection_total_inference_time_ms": float(sum(inference_times)),
+                "overall_pipeline_runtime_ms": float((datetime.now(timezone.utc) - datetime.fromisoformat(metadata.started_at)).total_seconds() * 1000.0),
+                "car_tracks_total": int(vehicle_enrichment_manager.metrics.get("car_tracks_total", 0)),
+                "car_tracks_with_body_type_crop": int(vehicle_enrichment_manager.metrics.get("car_tracks_with_body_type_crop", 0)),
+                "car_tracks_sent_to_body_type_florence": int(vehicle_enrichment_manager.metrics.get("car_tracks_sent_to_body_type_florence", 0)),
+                "car_tracks_with_valid_body_type": int(vehicle_enrichment_manager.metrics.get("car_tracks_with_valid_body_type", 0)),
+                "car_tracks_body_type_unknown": int(vehicle_enrichment_manager.metrics.get("car_tracks_body_type_unknown", 0)),
+                "body_type_distribution": dict(vehicle_enrichment_manager.metrics.get("body_type_label_distribution", {})),
+                "body_type_florence_inference_count": int(vehicle_enrichment_manager.metrics.get("body_type_inference_calls", 0)),
+                "body_type_average_inference_ms": float(vehicle_enrichment_manager.metrics.get("body_type_average_inference_ms", 0.0) or 0.0),
                 "run_directory": str(output_manager.run_directory),
             }
         )
@@ -1117,6 +1199,11 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         logger.info("Pipeline completed")
         return 0, output_manager.run_id, str(output_manager.run_directory)
     except Exception as exc:
+        if vehicle_enrichment_manager is not None:
+            try:
+                vehicle_enrichment_manager.finalize_async_colour()
+            except Exception:
+                logger.exception("VehicleEnrichmentManager shutdown failed during error handling")
         if ingestion_manager is not None:
             try:
                 ingestion_manager.stop()
@@ -1434,16 +1521,65 @@ def _build_vehicle_attribute_result_rows(enrichment_results: list[Any]) -> list[
                     "local_track_id": result.local_track_id,
                     "frame_index": frame_index,
                     "vehicle_crop_path": crop_path,
-                    "task_token": getattr(result.vehicle_colour, "task_prompt", None) or getattr(result.vehicle_body_type, "task_prompt", None),
-                    "prompt": getattr(result.vehicle_colour, "prompt_text", None) or getattr(result.vehicle_body_type, "prompt_text", None),
-                    "effective_processor_text": f"{getattr(result.vehicle_colour, 'task_prompt', '') or getattr(result.vehicle_body_type, 'task_prompt', '')}{getattr(result.vehicle_colour, 'prompt_text', '') or getattr(result.vehicle_body_type, 'prompt_text', '')}",
-                    "raw_response": caption_row.get("caption"),
+                    "colour_task_token": colour_item.get("task_token"),
+                    "colour_prompt": colour_item.get("prompt"),
+                    "colour_effective_processor_text": colour_item.get("effective_processor_text"),
+                    "colour_raw_response": colour_item.get("raw_response"),
                     "parsed_colour": colour_item.get("normalized_colour"),
+                    "body_type_task_token": body_item.get("task_token"),
+                    "body_type_prompt": body_item.get("prompt"),
+                    "body_type_effective_processor_text": body_item.get("effective_processor_text"),
+                    "body_type_raw_response": body_item.get("raw_response"),
                     "parsed_body_type": body_item.get("normalized_body_type"),
                     "colour_reason": result.final_colour_reason,
                     "body_type_reason": result.final_body_type_reason,
-                    "inference_time_ms": "",
+                    "colour_inference_time_ms": colour_item.get("inference_time_ms"),
+                    "body_type_inference_time_ms": body_item.get("inference_time_ms"),
                     "adapter_loaded": False,
+                }
+            )
+    return rows
+
+
+def _build_vehicle_body_type_result_rows(enrichment_results: list[Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        if getattr(result, "attribute_backend", None) != "base_florence":
+            continue
+        body_predictions = list(getattr(result.vehicle_body_type, "predictions", []) or [])
+        prediction_lookup = {
+            (str(prediction.source_crop_path or ""), int(prediction.source_frame_number if prediction.source_frame_number is not None else -1)): prediction
+            for prediction in body_predictions
+        }
+        for body_item in list(getattr(result, "crop_level_body_types", []) or []):
+            crop_path = str(body_item.get("crop_path") or "")
+            frame_index = int(body_item.get("frame_index", -1))
+            prediction = prediction_lookup.get((crop_path, frame_index))
+            evidence = next(
+                (
+                    item
+                    for item in list(getattr(result, "evidence_used", []) or [])
+                    if str(getattr(item, "vehicle_crop_path", "") or "") == crop_path
+                    and int(getattr(item, "frame_number", -1)) == frame_index
+                ),
+                None,
+            )
+            rows.append(
+                {
+                    "camera_id": result.camera_id,
+                    "local_track_id": result.local_track_id,
+                    "vehicle_class": result.vehicle_class,
+                    "frame_number": frame_index,
+                    "crop_path": crop_path,
+                    "crop_width": getattr(evidence, "original_crop_width", None),
+                    "crop_height": getattr(evidence, "original_crop_height", None),
+                    "quality_score": getattr(evidence, "quality_score", None),
+                    "resolution_tier": getattr(evidence, "resolution_tier", None),
+                    "raw_response": body_item.get("raw_response") or ("" if prediction is None or prediction.raw_response in (None, "") else str(prediction.raw_response)),
+                    "parsed_body_type": body_item.get("normalized_body_type"),
+                    "status": body_item.get("status") or ("completed" if prediction is not None else "skipped"),
+                    "reason": body_item.get("reason") or getattr(result, "final_body_type_reason", None),
+                    "inference_duration_ms": body_item.get("inference_time_ms") or getattr(prediction, "inference_duration_ms", None),
                 }
             )
     return rows
@@ -1592,7 +1728,9 @@ def _build_vehicle_pipeline_trace_rows(
         enrichment = enrichment_by_track.get(local_track_id)
         geometry = geometry_by_track.get(local_track_id, {})
         colour_predictions = list(getattr(getattr(enrichment, "vehicle_colour", None), "predictions", []) or []) if enrichment is not None else []
+        body_predictions = list(getattr(getattr(enrichment, "vehicle_body_type", None), "predictions", []) or []) if enrichment is not None else []
         valid_colour_prediction_count = sum(1 for prediction in colour_predictions if str(getattr(prediction, "label", "UNKNOWN")).upper() not in {"", "UNKNOWN", "NONE"})
+        valid_body_prediction_count = sum(1 for prediction in body_predictions if str(getattr(prediction, "label", "UNKNOWN")).upper() not in {"", "UNKNOWN", "NONE"})
         selected_crop_paths = list(getattr(enrichment, "selected_crop_paths", []) or []) if enrichment is not None else []
         florence_call_count = int(getattr(enrichment, "vehicle_attribute_inference_count", 0) or len(colour_predictions)) if enrichment is not None else 0
         failure_stage = "SUCCESS"
@@ -1648,6 +1786,13 @@ def _build_vehicle_pipeline_trace_rows(
                 "florence_call_count": florence_call_count,
                 "valid_colour_prediction_count": int(valid_colour_prediction_count),
                 "final_colour": str(getattr(getattr(enrichment, "vehicle_colour", None), "label", "UNKNOWN") if enrichment is not None else "UNKNOWN"),
+                "body_type_eligible": getattr(enrichment, "body_type_eligible", None) if enrichment is not None else None,
+                "body_type_candidate_crop_count": int(getattr(enrichment, "body_type_candidate_crop_count", 0) if enrichment is not None else 0),
+                "body_type_selected_crop_count": int(getattr(enrichment, "body_type_selected_crop_count", 0) if enrichment is not None else 0),
+                "body_type_florence_call_count": int(getattr(enrichment, "body_type_florence_call_count", 0) if enrichment is not None else 0),
+                "body_type_valid_prediction_count": int(getattr(enrichment, "body_type_valid_prediction_count", valid_body_prediction_count) if enrichment is not None else valid_body_prediction_count),
+                "body_type_final": str(getattr(getattr(enrichment, "vehicle_body_type", None), "label", "UNKNOWN") if enrichment is not None else "UNKNOWN"),
+                "body_type_failure_reason": getattr(enrichment, "body_type_failure_reason", None) if enrichment is not None else None,
                 "failure_stage": failure_stage,
                 "failure_reason": failure_reason,
             }

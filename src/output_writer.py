@@ -26,6 +26,8 @@ class RunOutputManager:
         self.track_crops_directory = self.run_directory / "04_track_crops"
         self.florence_selected_crops_directory = self.run_directory / "05_florence_selected_crops"
         self.florence_results_directory = self.run_directory / "06_florence_results"
+        self.body_type_selected_crops_directory = self.run_directory / "07_body_type_selected_crops"
+        self.body_type_results_directory = self.run_directory / "07_body_type_results"
         self.evidence_directory = self.run_directory / "evidence"
         self.errors_directory = self.run_directory / "errors"
         self.raw_frames_directory = self.run_directory / "raw_frames"
@@ -40,6 +42,8 @@ class RunOutputManager:
         self.track_crops_directory.mkdir(parents=True, exist_ok=True)
         self.florence_selected_crops_directory.mkdir(parents=True, exist_ok=True)
         self.florence_results_directory.mkdir(parents=True, exist_ok=True)
+        self.body_type_selected_crops_directory.mkdir(parents=True, exist_ok=True)
+        self.body_type_results_directory.mkdir(parents=True, exist_ok=True)
         self.evidence_directory.mkdir(parents=True, exist_ok=True)
         self.errors_directory.mkdir(parents=True, exist_ok=True)
         self.raw_frames_directory.mkdir(parents=True, exist_ok=True)
@@ -272,6 +276,13 @@ class RunOutputManager:
             "florence_call_count",
             "valid_colour_prediction_count",
             "final_colour",
+            "body_type_eligible",
+            "body_type_candidate_crop_count",
+            "body_type_selected_crop_count",
+            "body_type_florence_call_count",
+            "body_type_valid_prediction_count",
+            "body_type_final",
+            "body_type_failure_reason",
             "failure_stage",
             "failure_reason",
         ]
