@@ -214,6 +214,7 @@ vehicle_enrichment:
       backend: base_florence
       task_token: "<VQA>"
       prompt: "What colour is the vehicle?"
+      inference_strategy: adaptive_fallback
       generation:
         max_new_tokens: 16
         num_beams: 1

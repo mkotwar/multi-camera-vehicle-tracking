@@ -346,3 +346,159 @@ def test_active_config_contains_prompt_a_and_runtime_reads_it() -> None:
     normalized = normalize_vehicle_enrichment_config(raw["vehicle_enrichment"])
     assert normalized["vehicle_attributes"]["body_type"]["prompt"] == body_type["prompt"]
     assert normalized["vehicle_attributes"]["body_type"]["allowed_labels"] == ["SEDAN", "HATCHBACK", "SUV", "MPV", "UNKNOWN"]
+
+
+def test_vehicle_attribute_flow_adaptive_fallback_stops_after_first_valid_colour(tmp_path: Path) -> None:
+    backend = _FakeBackend(["black"])
+    request = _request(tmp_path)
+    request.evidence_items = request.evidence_items * 3
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {
+                "enabled": True,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "inference_strategy": "adaptive_fallback",
+            },
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+    result = flow.classify(request)
+    assert result.colour.label == "BLACK"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 1
+    assert flow.metrics["colour_tracks_resolved_crop1"] == 1
+    assert flow.metrics["fallback_to_crop2_count"] == 0
+
+
+def test_vehicle_attribute_flow_adaptive_fallback_uses_second_crop_when_first_unknown(tmp_path: Path) -> None:
+    backend = _FakeBackend(["unknown", "green"])
+    request = _request(tmp_path)
+    request.evidence_items = request.evidence_items * 3
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {
+                "enabled": True,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "inference_strategy": "adaptive_fallback",
+            },
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+    result = flow.classify(request)
+    assert result.colour.label == "GREEN"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 2
+    assert flow.metrics["colour_tracks_resolved_crop2"] == 1
+    assert flow.metrics["fallback_to_crop2_count"] == 1
+
+
+def test_vehicle_attribute_flow_adaptive_fallback_uses_third_crop_when_needed(tmp_path: Path) -> None:
+    backend = _FakeBackend(["unknown", "unknown", "pink"])
+    request = _request(tmp_path)
+    request.evidence_items = request.evidence_items * 3
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {
+                "enabled": True,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "inference_strategy": "adaptive_fallback",
+            },
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+    result = flow.classify(request)
+    assert result.colour.label == "PINK"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 3
+    assert flow.metrics["colour_tracks_resolved_crop3"] == 1
+    assert flow.metrics["fallback_to_crop3_count"] == 1
+
+
+def test_vehicle_attribute_flow_adaptive_fallback_returns_unknown_when_all_unknown(tmp_path: Path) -> None:
+    backend = _FakeBackend(["unknown", "unknown", "unknown"])
+    request = _request(tmp_path)
+    request.evidence_items = request.evidence_items * 3
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {
+                "enabled": True,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "inference_strategy": "adaptive_fallback",
+            },
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+    result = flow.classify(request)
+    assert result.colour.label == "UNKNOWN"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 3
+    assert flow.metrics["colour_tracks_unresolved"] == 1
+
+
+def test_vehicle_attribute_flow_all_selected_strategy_still_calls_all_available_crops(tmp_path: Path) -> None:
+    backend = _FakeBackend(["black", "green", "blue"])
+    request = _request(tmp_path)
+    request.evidence_items = request.evidence_items * 3
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {
+                "enabled": True,
+                "task_token": "<VQA>",
+                "prompt": "What colour is the vehicle?",
+                "inference_strategy": "all_selected",
+            },
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+    flow.classify(request)
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 3

@@ -73,6 +73,9 @@ class BaseFlorenceVehicleAttributesFlow:
         self.body_type_enabled = bool(body_type_section.get("enabled", True))
         self.colour_task_token = str(colour_section.get("task_token", self.task_token)).strip() or self.task_token
         self.colour_prompt = str(colour_section.get("prompt", self.prompt) or "")
+        self.colour_inference_strategy = str(colour_section.get("inference_strategy", "all_selected")).strip().lower() or "all_selected"
+        if self.colour_inference_strategy not in {"all_selected", "adaptive_fallback"}:
+            raise ValueError("vehicle_enrichment.vehicle_attributes.colour.inference_strategy must be all_selected or adaptive_fallback.")
         self.colour_generation = dict(colour_section.get("generation", {}) or {})
         self.body_type_task_token = str(body_type_section.get("task_token", self.task_token)).strip() or self.task_token
         self.body_type_prompt = str(body_type_section.get("prompt", BODY_TYPE_PROMPT_TEXT) or BODY_TYPE_PROMPT_TEXT)
@@ -111,6 +114,7 @@ class BaseFlorenceVehicleAttributesFlow:
             "vehicle_attribute_empty_response_count": 0,
             "vehicle_attribute_total_colour_inference_ms": 0.0,
             "vehicle_attribute_average_colour_inference_time_ms": 0.0,
+            "vehicle_attribute_average_colour_calls_per_track": 0.0,
             "vehicle_attribute_total_body_inference_ms": 0.0,
             "vehicle_attribute_average_body_inference_time_ms": 0.0,
             "vehicle_attribute_skipped_missing_crop": 0,
@@ -118,6 +122,15 @@ class BaseFlorenceVehicleAttributesFlow:
             "vehicle_attribute_tracks_with_zero_florence_calls": 0,
             "vehicle_attribute_non_car_body_type_skips": 0,
             "vehicle_attribute_body_type_no_usable_crop_skips": 0,
+            "colour_tracks_processed": 0,
+            "colour_tracks_resolved_crop1": 0,
+            "colour_tracks_resolved_crop2": 0,
+            "colour_tracks_resolved_crop3": 0,
+            "colour_tracks_unresolved": 0,
+            "colour_florence_calls_total": 0,
+            "fallback_to_crop2_count": 0,
+            "fallback_to_crop3_count": 0,
+            "colour_inference_strategy": self.colour_inference_strategy,
             "gpu_memory_before_attribute_load_mb": 0.0,
             "gpu_memory_after_attribute_load_mb": 0.0,
         }
@@ -159,6 +172,8 @@ class BaseFlorenceVehicleAttributesFlow:
         local_inference_count = 0
         for item in selected_items:
             self._ensure_crop_row(crop_rows_by_key, request, item)
+        colour_resolved_rank: int | None = None
+        for index, item in enumerate(selected_items, start=1):
             try:
                 colour_payload = self._infer_single_crop(
                     item,
@@ -187,6 +202,7 @@ class BaseFlorenceVehicleAttributesFlow:
             colour_predictions.append(colour_prediction)
             self._metrics["vehicle_attribute_inference_calls"] += 1
             self._metrics["vehicle_attribute_colour_inference_calls"] += 1
+            self._metrics["colour_florence_calls_total"] += 1
             self._metrics["vehicle_attribute_total_colour_inference_ms"] += float(colour_payload["inference_time_ms"])
             local_inference_count += 1
             self._count_response_reason(colour_reason)
@@ -200,6 +216,16 @@ class BaseFlorenceVehicleAttributesFlow:
             row["colour_status"] = colour_status
             row["colour_reason"] = colour_prediction.reason
             row["colour_inference_time_ms"] = colour_payload["inference_time_ms"]
+            if self.colour_inference_strategy == "adaptive_fallback" and self._is_valid_colour_prediction(colour_prediction):
+                colour_resolved_rank = index
+                break
+
+        if self.colour_inference_strategy == "adaptive_fallback" and colour_resolved_rank is not None:
+            for item in selected_items[colour_resolved_rank:]:
+                row = crop_rows_by_key[(str(item.vehicle_crop_path), int(item.frame_number))]
+                row["colour_status"] = "skipped"
+                row["colour_reason"] = "adaptive_not_needed"
+                row["crop_skip_reason"] = "adaptive_not_needed"
 
         body_type_eligible = self._body_type_eligible(request.vehicle_class)
         body_type_failure_reason: str | None = None
@@ -258,11 +284,14 @@ class BaseFlorenceVehicleAttributesFlow:
                 )
         else:
             body_label, body_reason, body_agreement, body_weight = VEHICLE_BODY_TYPE_UNKNOWN, "disabled", None, 0.0
-        colour_label, colour_reason, colour_agreement, colour_weight = aggregate_predictions(
-            colour_predictions,
-            unknown_label=VEHICLE_COLOUR_UNKNOWN,
-            conflict_reason="conflicting_colour_predictions",
-        )
+        if self.colour_inference_strategy == "adaptive_fallback":
+            colour_label, colour_reason, colour_agreement, colour_weight = self._adaptive_colour_result(colour_predictions)
+        else:
+            colour_label, colour_reason, colour_agreement, colour_weight = aggregate_predictions(
+                colour_predictions,
+                unknown_label=VEHICLE_COLOUR_UNKNOWN,
+                conflict_reason="conflicting_colour_predictions",
+            )
         self._metrics["vehicle_attribute_average_colour_inference_time_ms"] = (
             float(self._metrics["vehicle_attribute_total_colour_inference_ms"] / self._metrics["vehicle_attribute_colour_inference_calls"])
             if self._metrics["vehicle_attribute_colour_inference_calls"] > 0
@@ -271,6 +300,30 @@ class BaseFlorenceVehicleAttributesFlow:
         self._metrics["vehicle_attribute_average_body_inference_time_ms"] = (
             float(self._metrics["vehicle_attribute_total_body_inference_ms"] / self._metrics["vehicle_attribute_body_inference_calls"])
             if self._metrics["vehicle_attribute_body_inference_calls"] > 0
+            else 0.0
+        )
+        self._metrics["colour_tracks_processed"] += 1
+        if colour_label == VEHICLE_COLOUR_UNKNOWN:
+            self._metrics["colour_tracks_unresolved"] += 1
+        elif (self.colour_inference_strategy == "adaptive_fallback" and colour_resolved_rank == 1) or (
+            self.colour_inference_strategy != "adaptive_fallback" and len(colour_predictions) == 1
+        ):
+            self._metrics["colour_tracks_resolved_crop1"] += 1
+        elif (self.colour_inference_strategy == "adaptive_fallback" and colour_resolved_rank == 2) or (
+            self.colour_inference_strategy != "adaptive_fallback" and len(colour_predictions) == 2
+        ):
+            self._metrics["colour_tracks_resolved_crop2"] += 1
+            if self.colour_inference_strategy == "adaptive_fallback":
+                self._metrics["fallback_to_crop2_count"] += 1
+        elif (self.colour_inference_strategy == "adaptive_fallback" and colour_resolved_rank == 3) or (
+            self.colour_inference_strategy != "adaptive_fallback" and len(colour_predictions) >= 3
+        ):
+            self._metrics["colour_tracks_resolved_crop3"] += 1
+            if self.colour_inference_strategy == "adaptive_fallback":
+                self._metrics["fallback_to_crop3_count"] += 1
+        self._metrics["vehicle_attribute_average_colour_calls_per_track"] = (
+            float(self._metrics["colour_florence_calls_total"] / self._metrics["colour_tracks_processed"])
+            if self._metrics["colour_tracks_processed"] > 0
             else 0.0
         )
         self._metrics["vehicle_attribute_valid_body_type"] += int(self.body_type_enabled and body_label != VEHICLE_BODY_TYPE_UNKNOWN)
@@ -435,6 +488,16 @@ class BaseFlorenceVehicleAttributesFlow:
             self._metrics["vehicle_attribute_unsupported_colour_count"] += 1
         elif reason == "empty_response":
             self._metrics["vehicle_attribute_empty_response_count"] += 1
+
+    @staticmethod
+    def _is_valid_colour_prediction(prediction: AttributePrediction) -> bool:
+        return str(prediction.label or "").strip().upper() not in {"", VEHICLE_COLOUR_UNKNOWN}
+
+    def _adaptive_colour_result(self, colour_predictions: list[AttributePrediction]) -> tuple[str, str, float | None, float]:
+        for prediction in colour_predictions:
+            if self._is_valid_colour_prediction(prediction):
+                return str(prediction.label).upper(), "adaptive_first_valid", None, float(prediction.quality_weight or 0.0)
+        return VEHICLE_COLOUR_UNKNOWN, "adaptive_no_valid_predictions", None, 0.0
 
     @staticmethod
     def _resolve_crop_source(item: Any) -> str:

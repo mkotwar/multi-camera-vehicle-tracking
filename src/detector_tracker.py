@@ -9,6 +9,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 import supervision as sv
+import torch
 from ultralytics import YOLO
 
 from .models import BBoxQualityDiagnostic, ConfigurationError, Detection, FramePacket, TrackedDetection
@@ -78,6 +79,13 @@ class DetectorTrackerResult:
     detected_frame: np.ndarray
     tracked_frame: np.ndarray
     inference_time_ms: float
+    preprocess_ms: float = 0.0
+    model_inference_ms: float = 0.0
+    postprocess_ms: float = 0.0
+    result_conversion_ms: float = 0.0
+    result_routing_ms: float = 0.0
+    tracker_update_ms: float = 0.0
+    total_detection_ms: float = 0.0
 
 
 class VehicleDetectorTracker:
@@ -123,6 +131,14 @@ class VehicleDetectorTracker:
             )
         )
         self.agnostic_nms = bool(detection_config.get("agnostic_nms", False))
+        batch_config = dict(detection_config.get("batch", {}) or {})
+        self.batching_enabled = bool(batch_config.get("enabled", False))
+        self.max_batch_size = int(batch_config.get("max_size", 1) or 1)
+        self.max_batch_wait_ms = float(batch_config.get("max_wait_ms", 0.0) or 0.0)
+        if self.max_batch_size < 1:
+            raise ConfigurationError("detection.batch.max_size must be at least 1.")
+        if self.max_batch_wait_ms < 0.0:
+            raise ConfigurationError("detection.batch.max_wait_ms must be at least 0.")
         self.allowed_classes = [self._normalize_class_name(name) for name in detection_config.get("allowed_classes", []) if str(name).strip()]
         raw_allowed_class_ids = detection_config.get("allowed_class_ids", OCR_MUKUL_DEFAULT_ALLOWED_CLASS_IDS)
         self.allowed_class_ids = tuple(int(item) for item in raw_allowed_class_ids)
@@ -174,6 +190,24 @@ class VehicleDetectorTracker:
             "trackers_created_by_camera_namespace": {},
             "inference_times_ms": [],
             "inference_errors": [],
+            "detection_batch_size_configured": self.max_batch_size if self.batching_enabled else 1,
+            "detection_max_batch_wait_ms_configured": self.max_batch_wait_ms if self.batching_enabled else 0.0,
+            "detection_batches_total": 0,
+            "detection_frames_total": 0,
+            "detection_batch_size_sum": 0,
+            "max_detection_batch_size_observed": 0,
+            "partial_detection_batches": 0,
+            "yolo_model_invocations": 0,
+            "yolo_frames_processed": 0,
+            "yolo_inference_time_total_ms": 0.0,
+            "yolo_inference_time_per_batch_ms": [],
+            "preprocess_times_ms": [],
+            "model_inference_stage_times_ms": [],
+            "postprocess_times_ms": [],
+            "result_conversion_times_ms": [],
+            "result_routing_times_ms": [],
+            "tracker_update_times_ms": [],
+            "total_detection_times_ms": [],
         }
         self._load_model_once()
         self.logger.info("Detector backend: %s", self.detection_backend)
@@ -182,6 +216,18 @@ class VehicleDetectorTracker:
     @property
     def metrics(self) -> dict[str, Any]:
         self._refresh_tracker_metrics()
+        gpu_memory_allocated_mb: float | None = None
+        gpu_memory_reserved_mb: float | None = None
+        gpu_peak_allocated_mb: float | None = None
+        gpu_peak_reserved_mb: float | None = None
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            try:
+                gpu_memory_allocated_mb = float(torch.cuda.memory_allocated() / (1024 * 1024))
+                gpu_memory_reserved_mb = float(torch.cuda.memory_reserved() / (1024 * 1024))
+                gpu_peak_allocated_mb = float(torch.cuda.max_memory_allocated() / (1024 * 1024))
+                gpu_peak_reserved_mb = float(torch.cuda.max_memory_reserved() / (1024 * 1024))
+            except Exception:
+                pass
         return {
             **self._metrics,
             "tracker_camera_ids": list(self._metrics["tracker_camera_ids"]),
@@ -190,6 +236,17 @@ class VehicleDetectorTracker:
             "trackers_created_by_camera_namespace": dict(self._metrics["trackers_created_by_camera_namespace"]),
             "inference_times_ms": list(self._metrics["inference_times_ms"]),
             "inference_errors": list(self._metrics["inference_errors"]),
+            "preprocess_times_ms": list(self._metrics["preprocess_times_ms"]),
+            "model_inference_stage_times_ms": list(self._metrics["model_inference_stage_times_ms"]),
+            "postprocess_times_ms": list(self._metrics["postprocess_times_ms"]),
+            "result_conversion_times_ms": list(self._metrics["result_conversion_times_ms"]),
+            "result_routing_times_ms": list(self._metrics["result_routing_times_ms"]),
+            "tracker_update_times_ms": list(self._metrics["tracker_update_times_ms"]),
+            "total_detection_times_ms": list(self._metrics["total_detection_times_ms"]),
+            "gpu_memory_allocated_mb": gpu_memory_allocated_mb,
+            "gpu_memory_reserved_mb": gpu_memory_reserved_mb,
+            "gpu_peak_allocated_mb": gpu_peak_allocated_mb,
+            "gpu_peak_reserved_mb": gpu_peak_reserved_mb,
         }
 
     def get_bbox_quality_profile(self, class_name: str) -> BBoxQualityProfile:
@@ -197,11 +254,144 @@ class VehicleDetectorTracker:
         return self._class_bbox_quality_profiles.get(normalized, self._default_bbox_quality_profile)
 
     def infer_yolo_detections(self, packet: FramePacket) -> list[Detection]:
+        return self.infer_yolo_detections_batch([packet])[0]
+
+    def infer_yolo_detections_batch(self, packets: list[FramePacket]) -> list[list[Detection]]:
+        raw_results = self._infer_raw_results_batch(packets)
         if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
-            raw_result = self._infer_ocr_mukul_result(packet)
-            return self._convert_ocr_mukul_result(raw_result)
+            return [self._convert_ocr_mukul_result(item) for item in raw_results]
+        return [self._convert_yolo_result(item) for item in raw_results]
+
+    def process_frames(self, packets: list[FramePacket]) -> list[DetectorTrackerResult]:
+        if not packets:
+            return []
+        started_at = time.perf_counter()
+        raw_results = self._infer_raw_results_batch(packets)
+        batch_inference_time_ms = (time.perf_counter() - started_at) * 1000.0
+        batch_size = len(packets)
+        per_frame_inference_time_ms = batch_inference_time_ms / float(batch_size)
+        self._record_batch_metrics(batch_size=batch_size, batch_inference_time_ms=batch_inference_time_ms)
+        results: list[DetectorTrackerResult] = []
+        for packet, raw_result in zip(packets, raw_results):
+            raw_detections, accepted_detections, bbox_quality_diagnostics, stage_timings = self._build_detection_payload(
+                packet,
+                raw_result,
+                inference_wall_time_ms=per_frame_inference_time_ms,
+            )
+            tracker_started_at = time.perf_counter()
+            tracked_detections = self.track_detections(packet, accepted_detections, raw_result=raw_result)
+            tracker_update_ms = (time.perf_counter() - tracker_started_at) * 1000.0
+            self._metrics["inference_times_ms"].append(per_frame_inference_time_ms)
+            self._metrics["preprocess_times_ms"].append(stage_timings["preprocess_ms"])
+            self._metrics["model_inference_stage_times_ms"].append(stage_timings["model_inference_ms"])
+            self._metrics["postprocess_times_ms"].append(stage_timings["postprocess_ms"])
+            self._metrics["result_conversion_times_ms"].append(stage_timings["result_conversion_ms"])
+            self._metrics["result_routing_times_ms"].append(stage_timings["result_routing_ms"])
+            self._metrics["tracker_update_times_ms"].append(tracker_update_ms)
+            self._metrics["total_detection_times_ms"].append(stage_timings["total_detection_ms"])
+            rejected_detection_count = len([item for item in bbox_quality_diagnostics if not item.accepted_by_bbox_quality])
+            self.logger.debug(
+                "camera=%s frame=%s raw_detections=%s accepted_detections=%s rejected_detections=%s tracked_observations=%s tracker_ids=%s batch_size=%s inference_ms=%.3f total_detection_ms=%.3f",
+                packet.camera_id,
+                packet.frame_number,
+                len(raw_detections),
+                len(accepted_detections),
+                rejected_detection_count,
+                len(tracked_detections),
+                [item.tracker_id for item in tracked_detections],
+                batch_size,
+                per_frame_inference_time_ms,
+                stage_timings["total_detection_ms"],
+            )
+            results.append(
+                DetectorTrackerResult(
+                    detections=accepted_detections,
+                    tracked_detections=tracked_detections,
+                    bbox_quality_diagnostics=bbox_quality_diagnostics,
+                    detected_frame=self.annotate_detected_frame(packet.frame, accepted_detections, bbox_quality_diagnostics),
+                    tracked_frame=self.annotate_tracked_frame(packet.frame, packet.camera_id, tracked_detections),
+                    inference_time_ms=per_frame_inference_time_ms,
+                    preprocess_ms=stage_timings["preprocess_ms"],
+                    model_inference_ms=stage_timings["model_inference_ms"],
+                    postprocess_ms=stage_timings["postprocess_ms"],
+                    result_conversion_ms=stage_timings["result_conversion_ms"],
+                    result_routing_ms=stage_timings["result_routing_ms"],
+                    tracker_update_ms=tracker_update_ms,
+                    total_detection_ms=stage_timings["total_detection_ms"],
+                )
+            )
+        return results
+
+    def _build_detection_payload(
+        self,
+        packet: FramePacket,
+        raw_result: Any,
+        *,
+        inference_wall_time_ms: float,
+    ) -> tuple[list[Detection], list[Detection], list[BBoxQualityDiagnostic], dict[str, float]]:
+        result_conversion_started_at = time.perf_counter()
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            raw_detections = self._convert_ocr_mukul_result(raw_result)
+        else:
+            raw_detections = self._convert_yolo_result(raw_result)
+        result_conversion_ms = (time.perf_counter() - result_conversion_started_at) * 1000.0
+        result_routing_started_at = time.perf_counter()
+        accepted_detections, bbox_quality_diagnostics = self.filter_detections(packet, raw_detections)
+        result_routing_ms = (time.perf_counter() - result_routing_started_at) * 1000.0
+        speed_metrics = self._extract_result_speed_metrics(raw_result)
+        total_detection_ms = float(inference_wall_time_ms + result_conversion_ms + result_routing_ms)
+        return (
+            raw_detections,
+            accepted_detections,
+            bbox_quality_diagnostics,
+            {
+                "preprocess_ms": speed_metrics["preprocess_ms"],
+                "model_inference_ms": speed_metrics["model_inference_ms"],
+                "postprocess_ms": speed_metrics["postprocess_ms"],
+                "result_conversion_ms": result_conversion_ms,
+                "result_routing_ms": result_routing_ms,
+                "total_detection_ms": total_detection_ms,
+            },
+        )
+
+    def _extract_result_speed_metrics(self, raw_result: Any) -> dict[str, float]:
+        speed = getattr(raw_result, "speed", {}) or {}
+        if not isinstance(speed, dict):
+            speed = {}
+        return {
+            "preprocess_ms": float(speed.get("preprocess", 0.0) or 0.0),
+            "model_inference_ms": float(speed.get("inference", 0.0) or 0.0),
+            "postprocess_ms": float(speed.get("postprocess", 0.0) or 0.0),
+        }
+
+    def _record_batch_metrics(self, *, batch_size: int, batch_inference_time_ms: float) -> None:
+        self._metrics["detection_batches_total"] += 1
+        self._metrics["detection_frames_total"] += batch_size
+        self._metrics["detection_batch_size_sum"] += batch_size
+        self._metrics["max_detection_batch_size_observed"] = max(
+            int(self._metrics["max_detection_batch_size_observed"]),
+            batch_size,
+        )
+        if batch_size < int(self._metrics["detection_batch_size_configured"]):
+            self._metrics["partial_detection_batches"] += 1
+        self._metrics["yolo_model_invocations"] += 1
+        self._metrics["yolo_frames_processed"] += batch_size
+        self._metrics["yolo_inference_time_total_ms"] += float(batch_inference_time_ms)
+        self._metrics["yolo_inference_time_per_batch_ms"].append(float(batch_inference_time_ms))
+
+    def _infer_raw_results_batch(self, packets: list[FramePacket]) -> list[Any]:
+        if not packets:
+            return []
+        if len(packets) == 1:
+            packet = packets[0]
+            return [self._infer_single_raw_result(packet)]
+        return self._infer_raw_results_true_batch(packets)
+
+    def _infer_single_raw_result(self, packet: FramePacket) -> Any:
+        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+            return self._infer_ocr_mukul_result(packet)
         try:
-            raw_result = self._model.predict(
+            return self._model.predict(
                 source=packet.frame,
                 conf=self.confidence_threshold,
                 iou=self.iou_threshold,
@@ -212,25 +402,73 @@ class VehicleDetectorTracker:
                 verbose=False,
             )[0]
         except Exception as exc:
-            self._metrics["inference_errors"].append(
-                {
-                    "camera_id": packet.camera_id,
-                    "frame_number": packet.frame_number,
-                    "model_path": str(self.model_path),
-                    "error_type": exc.__class__.__name__,
-                    "error_message": str(exc),
-                }
-            )
-            self.logger.error(
-                "Inference failed camera=%s frame=%s model=%s error_type=%s error=%s",
-                packet.camera_id,
-                packet.frame_number,
-                self.model_path,
-                exc.__class__.__name__,
-                exc,
-            )
+            self._record_inference_error([packet], exc, error_label="Inference failed")
             raise
-        return self._convert_yolo_result(raw_result)
+
+    def _infer_raw_results_true_batch(self, packets: list[FramePacket]) -> list[Any]:
+        frames = [packet.frame for packet in packets]
+        try:
+            if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
+                if callable(self._model):
+                    results = self._model(
+                        frames,
+                        conf=self.confidence_threshold,
+                        imgsz=self.image_size,
+                        device=self.runtime_device_info.yolo_device,
+                        half=self.runtime_device_info.yolo_half,
+                        verbose=False,
+                    )
+                else:
+                    results = self._model.predict(
+                        source=frames,
+                        conf=self.confidence_threshold,
+                        imgsz=self.image_size,
+                        device=self.runtime_device_info.yolo_device,
+                        half=self.runtime_device_info.yolo_half,
+                        verbose=False,
+                    )
+            else:
+                results = self._model.predict(
+                    source=frames,
+                    conf=self.confidence_threshold,
+                    iou=self.iou_threshold,
+                    imgsz=self.image_size,
+                    device=self.runtime_device_info.yolo_device,
+                    half=self.runtime_device_info.yolo_half,
+                    agnostic_nms=self.agnostic_nms,
+                    verbose=False,
+                )
+        except Exception as exc:
+            self._record_inference_error(packets, exc, error_label="Batched inference failed")
+            raise
+        if not isinstance(results, list) or len(results) != len(packets):
+            raise ConfigurationError("YOLO batch inference returned an unexpected result shape.")
+        return results
+
+    def _record_inference_error(self, packets: list[FramePacket], exc: Exception, *, error_label: str) -> None:
+        frame_refs = [
+            {
+                "camera_id": packet.camera_id,
+                "frame_number": packet.frame_number,
+            }
+            for packet in packets
+        ]
+        self._metrics["inference_errors"].append(
+            {
+                "frames": frame_refs,
+                "model_path": str(self.model_path),
+                "error_type": exc.__class__.__name__,
+                "error_message": str(exc),
+            }
+        )
+        self.logger.error(
+            "%s frames=%s model=%s error_type=%s error=%s",
+            error_label,
+            frame_refs,
+            self.model_path,
+            exc.__class__.__name__,
+            exc,
+        )
 
     def filter_detections(
         self,
@@ -280,37 +518,7 @@ class VehicleDetectorTracker:
         return tracked_results
 
     def process_frame(self, packet: FramePacket) -> DetectorTrackerResult:
-        started_at = time.perf_counter()
-        raw_result: Any | None = None
-        if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
-            raw_result = self._infer_ocr_mukul_result(packet)
-            raw_detections = self._convert_ocr_mukul_result(raw_result)
-        else:
-            raw_detections = self.infer_yolo_detections(packet)
-        accepted_detections, bbox_quality_diagnostics = self.filter_detections(packet, raw_detections)
-        tracked_detections = self.track_detections(packet, accepted_detections, raw_result=raw_result)
-        inference_time_ms = (time.perf_counter() - started_at) * 1000.0
-        self._metrics["inference_times_ms"].append(inference_time_ms)
-        rejected_detection_count = len([item for item in bbox_quality_diagnostics if not item.accepted_by_bbox_quality])
-        self.logger.debug(
-            "camera=%s frame=%s raw_detections=%s accepted_detections=%s rejected_detections=%s tracked_observations=%s tracker_ids=%s inference_ms=%.3f",
-            packet.camera_id,
-            packet.frame_number,
-            len(raw_detections),
-            len(accepted_detections),
-            rejected_detection_count,
-            len(tracked_detections),
-            [item.tracker_id for item in tracked_detections],
-            inference_time_ms,
-        )
-        return DetectorTrackerResult(
-            detections=accepted_detections,
-            tracked_detections=tracked_detections,
-            bbox_quality_diagnostics=bbox_quality_diagnostics,
-            detected_frame=self.annotate_detected_frame(packet.frame, accepted_detections, bbox_quality_diagnostics),
-            tracked_frame=self.annotate_tracked_frame(packet.frame, packet.camera_id, tracked_detections),
-            inference_time_ms=inference_time_ms,
-        )
+        return self.process_frames([packet])[0]
 
     def reset_camera(self, camera_id: str) -> None:
         for key in list(self._trackers):
@@ -403,6 +611,11 @@ class VehicleDetectorTracker:
         if not self.model_path.exists():
             raise ConfigurationError(f"Model file not found: {self.model_path}")
         self._model = self._model_loader(str(self.model_path))
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         self._metrics["model_load_count"] += 1
         self._model_class_names = self._extract_model_class_names(self._model)
         if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:

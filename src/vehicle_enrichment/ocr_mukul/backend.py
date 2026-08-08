@@ -17,6 +17,7 @@ from ..schemas import (
     VehicleColourResult,
 )
 from ..shared.florence_backend import FlorenceBackend
+from ..taxonomy import SUPPORTED_VEHICLE_CLASSES
 from .aggregator import aggregate_predictions
 from .attribute_parser import OCR_MUKUL_UNKNOWN, ParsedCaptionAttributes, parse_caption_attributes
 from .caption_generator import CaptionInferenceResult, OCRMukulCaptionGenerator
@@ -57,7 +58,7 @@ class OCRMukulFlorenceFlow:
         }
         self.colour_vehicle_classes = {
             str(item).strip().upper()
-            for item in self.config.get("colour_vehicle_classes", ["3WHEELER", "BUS", "CAR", "MOTORCYCLE", "TRUCK"])
+            for item in self.config.get("colour_vehicle_classes", SUPPORTED_VEHICLE_CLASSES)
             if str(item).strip()
         }
         self._metrics: dict[str, Any] = {

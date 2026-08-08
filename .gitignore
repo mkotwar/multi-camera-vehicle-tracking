@@ -44,3 +44,14 @@ data/test_videos/*
 *.jpg
 *.jpeg
 *.png
+
+# Generated diagnostics / benchmark outputs
+diagnostics/
+
+# Frontend dependencies
+frontend/node_modules/
+node_modules/
+
+# Frontend build output
+frontend/dist/
+frontend/coverage/

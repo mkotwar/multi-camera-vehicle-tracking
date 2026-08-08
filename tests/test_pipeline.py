@@ -111,11 +111,58 @@ class FakeVehicleDetectorTracker:
             "trackers_created_by_camera_namespace": {"CAM_001:camera": 1, "CAM_002:camera": 1},
             "inference_times_ms": [],
             "inference_errors": [],
+            "preprocess_times_ms": [],
+            "model_inference_stage_times_ms": [],
+            "postprocess_times_ms": [],
+            "result_conversion_times_ms": [],
+            "result_routing_times_ms": [],
+            "tracker_update_times_ms": [],
+            "total_detection_times_ms": [],
         }
 
     def process_frame(self, packet):
         self.metrics["inference_times_ms"].append(5.0)
+        self.metrics["preprocess_times_ms"].append(1.0)
+        self.metrics["model_inference_stage_times_ms"].append(2.0)
+        self.metrics["postprocess_times_ms"].append(1.0)
+        self.metrics["result_conversion_times_ms"].append(0.5)
+        self.metrics["result_routing_times_ms"].append(0.25)
+        self.metrics["tracker_update_times_ms"].append(0.1)
+        self.metrics["total_detection_times_ms"].append(4.75)
         return _FakeDetectorTrackerResult(packet)
+
+    def process_frames(self, packets):
+        results = []
+        for packet in packets:
+            self.metrics["inference_times_ms"].append(5.0)
+            self.metrics["preprocess_times_ms"].append(1.0)
+            self.metrics["model_inference_stage_times_ms"].append(2.0)
+            self.metrics["postprocess_times_ms"].append(1.0)
+            self.metrics["result_conversion_times_ms"].append(0.5)
+            self.metrics["result_routing_times_ms"].append(0.25)
+            self.metrics["tracker_update_times_ms"].append(0.1)
+            self.metrics["total_detection_times_ms"].append(4.75)
+            results.append(_FakeDetectorTrackerResult(packet))
+        self.metrics.setdefault("detection_batches_total", 0)
+        self.metrics["detection_batches_total"] += 1
+        self.metrics.setdefault("detection_frames_total", 0)
+        self.metrics["detection_frames_total"] += len(packets)
+        self.metrics.setdefault("detection_batch_size_sum", 0)
+        self.metrics["detection_batch_size_sum"] += len(packets)
+        self.metrics["max_detection_batch_size_observed"] = max(
+            int(self.metrics.get("max_detection_batch_size_observed", 0) or 0),
+            len(packets),
+        )
+        self.metrics.setdefault("partial_detection_batches", 0)
+        self.metrics.setdefault("yolo_model_invocations", 0)
+        self.metrics["yolo_model_invocations"] += 1
+        self.metrics.setdefault("yolo_frames_processed", 0)
+        self.metrics["yolo_frames_processed"] += len(packets)
+        self.metrics.setdefault("yolo_inference_time_total_ms", 0.0)
+        self.metrics["yolo_inference_time_total_ms"] += 5.0 * len(packets)
+        self.metrics.setdefault("yolo_inference_time_per_batch_ms", [])
+        self.metrics["yolo_inference_time_per_batch_ms"].append(5.0 * len(packets))
+        return results
 
     def reset_camera(self, camera_id):
         return None
@@ -396,6 +443,13 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert dt_metrics["resolved_device"] == "cpu"
     assert dt_metrics["resolved_dtype"] == "float32"
     assert dt_metrics["cuda_device_name"] is None
+    assert dt_metrics["preprocess_stage_profile_ms"]["mean"] == pytest.approx(1.0)
+    assert dt_metrics["model_inference_stage_profile_ms"]["mean"] == pytest.approx(2.0)
+    assert dt_metrics["postprocess_stage_profile_ms"]["mean"] == pytest.approx(1.0)
+    assert dt_metrics["result_conversion_stage_profile_ms"]["mean"] == pytest.approx(0.5)
+    assert dt_metrics["result_routing_stage_profile_ms"]["mean"] == pytest.approx(0.25)
+    assert dt_metrics["tracker_update_stage_profile_ms"]["mean"] == pytest.approx(0.1)
+    assert dt_metrics["total_detection_stage_profile_ms"]["mean"] == pytest.approx(4.75)
     assert bbox_metrics["accepted_detections"] == 3
     assert bbox_metrics["rejected_detections"] == 0
     assert lifecycle_metrics["active_tracks_at_shutdown"] == 0

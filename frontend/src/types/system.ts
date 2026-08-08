@@ -1,0 +1,22 @@
+export type SystemStatus = {
+  pipeline_status: string;
+  camera_count: number;
+  processing_camera_count: number;
+  online_camera_count: number;
+  processed_fps: number;
+  yolo_status: string;
+  colour_worker_status: string;
+  colour_queue_depth: number;
+  colour_queue_capacity: number;
+  pending_colour_jobs: number;
+  cache_misses: number;
+  frame_loss: number;
+  order_violations: number;
+  last_update: string;
+  run_id?: string | null;
+  track_count?: number | null;
+  colour_queue_peak_depth?: number | null;
+  average_colour_calls_per_track?: number | null;
+  yolo_image_size?: number | null;
+  yolo_batch_size?: number | null;
+};

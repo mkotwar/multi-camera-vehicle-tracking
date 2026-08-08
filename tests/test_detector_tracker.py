@@ -28,8 +28,9 @@ class FakeBoxes:
 
 
 class FakeResult:
-    def __init__(self, xyxy, cls, conf):
+    def __init__(self, xyxy, cls, conf, speed=None):
         self.boxes = FakeBoxes(xyxy, cls, conf)
+        self.speed = speed or {}
 
 
 class FakeModel:
@@ -39,13 +40,23 @@ class FakeModel:
         self.predict_calls = []
         self.call_calls = []
         self.next_result = FakeResult([], [], [])
+        self.next_results = None
 
     def predict(self, **kwargs):
         self.predict_calls.append(kwargs)
+        source = kwargs.get("source")
+        if isinstance(source, list):
+            if self.next_results is not None:
+                return list(self.next_results)
+            return [self.next_result for _ in source]
         return [self.next_result]
 
     def __call__(self, source, **kwargs):
         self.call_calls.append({"source": source, **kwargs})
+        if isinstance(source, list):
+            if self.next_results is not None:
+                return list(self.next_results)
+            return [self.next_result for _ in source]
         return [self.next_result]
 
 
@@ -144,6 +155,7 @@ def _config(
     dtype: str = "auto",
     detection_backend: str = "legacy_clean",
     tracking_backend: str = "supervision_bytetrack",
+    image_size: int | None = None,
 ) -> dict:
     return {
         "detection": {
@@ -153,7 +165,7 @@ def _config(
             "dtype": dtype,
             "confidence_threshold": 0.2 if detection_backend == "ocr_mukul" else 0.38,
             "iou_threshold": 0.45,
-            "image_size": 1024 if detection_backend == "ocr_mukul" else 640,
+            "image_size": image_size if image_size is not None else (1024 if detection_backend == "ocr_mukul" else 640),
             "agnostic_nms": agnostic_nms,
             "allowed_classes": ["car", "truck", "bus", "motorcycle", "3wheeler"],
             "allowed_class_ids": list(range(8)),
@@ -183,6 +195,7 @@ def _build_tracker(
     agnostic_nms: bool = False,
     detection_backend: str = "legacy_clean",
     tracking_backend: str = "supervision_bytetrack",
+    image_size: int | None = None,
 ):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
@@ -203,6 +216,7 @@ def _build_tracker(
             agnostic_nms=agnostic_nms,
             detection_backend=detection_backend,
             tracking_backend=tracking_backend,
+            image_size=image_size,
         ),
         _logger(),
         model_loader=lambda _: model,
@@ -817,3 +831,103 @@ def test_ocr_mukul_backend_creates_one_tracker_per_camera(tmp_path: Path) -> Non
     assert created_trackers[0].frame_rate == 12.0
     assert created_trackers[1].frame_rate == 20.0
     assert detector_tracker.metrics["tracker_camera_ids"] == ["CAM_001", "CAM_002"]
+
+
+def test_process_frames_batch_size_one_preserves_single_frame_behavior(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(tmp_path)
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.9])
+    result = detector_tracker.process_frames([_frame_packet()])[0]
+    assert len(model.predict_calls) == 1
+    assert not isinstance(model.predict_calls[0]["source"], list)
+    assert len(result.detections) == 1
+    assert detector_tracker.metrics["yolo_model_invocations"] == 1
+
+
+def test_process_frames_uses_one_true_batch_for_multiple_frames(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(tmp_path)
+    model.next_results = [
+        FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.91]),
+        FakeResult(xyxy=[[30, 30, 140, 150]], cls=[1], conf=[0.88]),
+        FakeResult(xyxy=[[40, 40, 160, 170]], cls=[3], conf=[0.86]),
+        FakeResult(xyxy=[[50, 50, 180, 190]], cls=[4], conf=[0.84]),
+    ]
+    packets = [
+        _frame_packet(camera_id="CAM_001", frame_number=10),
+        _frame_packet(camera_id="CAM_002", frame_number=20),
+        _frame_packet(camera_id="CAM_003", frame_number=30),
+        _frame_packet(camera_id="CAM_004", frame_number=40),
+    ]
+    results = detector_tracker.process_frames(packets)
+    assert len(model.predict_calls) == 1
+    assert isinstance(model.predict_calls[0]["source"], list)
+    assert len(model.predict_calls[0]["source"]) == 4
+    assert [result.tracked_detections[0].camera_id for result in results] == ["CAM_001", "CAM_002", "CAM_003", "CAM_004"]
+    assert [result.tracked_detections[0].frame_number for result in results] == [10, 20, 30, 40]
+    assert detector_tracker.metrics["detection_batches_total"] == 1
+    assert detector_tracker.metrics["max_detection_batch_size_observed"] == 4
+
+
+def test_process_frames_preserves_timestamp_and_routes_trackers_per_camera(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(tmp_path)
+    model.next_results = [
+        FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.91]),
+        FakeResult(xyxy=[[30, 30, 140, 150]], cls=[0], conf=[0.88]),
+    ]
+    packets = [
+        _frame_packet(camera_id="CAM_001", frame_number=10, fps=10.0),
+        _frame_packet(camera_id="CAM_002", frame_number=20, fps=20.0),
+    ]
+    results = detector_tracker.process_frames(packets)
+    assert results[0].tracked_detections[0].timestamp_seconds == pytest.approx(1.0)
+    assert results[1].tracked_detections[0].timestamp_seconds == pytest.approx(1.0)
+    assert len(created_trackers) == 2
+    assert created_trackers[0].frame_rate == 10.0
+    assert created_trackers[1].frame_rate == 20.0
+
+
+def test_process_frames_records_partial_final_batch_metrics(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(tmp_path)
+    detector_tracker._metrics["detection_batch_size_configured"] = 4
+    model.next_results = [
+        FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.9]),
+        FakeResult(xyxy=[[30, 30, 140, 150]], cls=[0], conf=[0.88]),
+    ]
+    detector_tracker.process_frames([
+        _frame_packet(camera_id="CAM_001"),
+        _frame_packet(camera_id="CAM_002", frame_number=1),
+    ])
+    metrics = detector_tracker.metrics
+    assert metrics["partial_detection_batches"] == 1
+    assert metrics["detection_frames_total"] == 2
+    assert metrics["yolo_model_invocations"] == 1
+
+
+@pytest.mark.parametrize("image_size", [1024, 896, 768])
+def test_configured_imgsz_is_forwarded_to_yolo_inference(tmp_path: Path, image_size: int) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(tmp_path, image_size=image_size)
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[0], conf=[0.9])
+    detector_tracker.process_frame(_frame_packet())
+    assert model.predict_calls[0]["imgsz"] == image_size
+
+
+def test_process_frame_records_stage_timing_metrics_from_result_speed(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(tmp_path)
+    model.next_result = FakeResult(
+        xyxy=[[20, 20, 120, 120]],
+        cls=[0],
+        conf=[0.9],
+        speed={"preprocess": 1.5, "inference": 8.25, "postprocess": 2.75},
+    )
+    result = detector_tracker.process_frame(_frame_packet())
+    metrics = detector_tracker.metrics
+    assert result.preprocess_ms == pytest.approx(1.5)
+    assert result.model_inference_ms == pytest.approx(8.25)
+    assert result.postprocess_ms == pytest.approx(2.75)
+    assert result.result_conversion_ms >= 0.0
+    assert result.result_routing_ms >= 0.0
+    assert result.tracker_update_ms >= 0.0
+    assert result.total_detection_ms >= result.result_conversion_ms + result.result_routing_ms
+    assert metrics["preprocess_times_ms"] == [pytest.approx(1.5)]
+    assert metrics["model_inference_stage_times_ms"] == [pytest.approx(8.25)]
+    assert metrics["postprocess_times_ms"] == [pytest.approx(2.75)]
+    assert len(metrics["total_detection_times_ms"]) == 1

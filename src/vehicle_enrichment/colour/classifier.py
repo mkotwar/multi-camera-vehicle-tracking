@@ -19,6 +19,7 @@ from ..schemas import (
     VehicleColourResult,
 )
 from ..shared import FlorenceBackend
+from ..taxonomy import SUPPORTED_VEHICLE_CLASSES
 
 
 COLOUR_TASK_PROMPT = "<VQA>"
@@ -161,7 +162,7 @@ class VehicleColourClassifier:
         self.allowed_labels = [str(item).strip().upper() for item in self.config.get("allowed_labels", []) if str(item).strip()]
         self.eligible_vehicle_classes = {
             str(item).strip().upper()
-            for item in self.config.get("run_only_when_vehicle_class", ["3WHEELER", "BUS", "CAR", "MOTORCYCLE", "TRUCK"])
+            for item in self.config.get("run_only_when_vehicle_class", SUPPORTED_VEHICLE_CLASSES)
             if str(item).strip()
         }
         self.maximum_crops_per_track = max(1, int(self.config.get("maximum_crops_per_track", 2)))

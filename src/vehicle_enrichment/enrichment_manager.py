@@ -51,6 +51,7 @@ from .schemas import (
     VehicleColourResult,
 )
 from .shared import FlorenceBackend, FlorenceBackendConfig
+from .taxonomy import SUPPORTED_VEHICLE_CLASSES
 
 
 def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
@@ -174,7 +175,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             "backend": str(colour.get("backend", "florence2")).strip() or "florence2",
             "run_only_when_vehicle_class": [
                 str(item).strip().upper()
-                for item in colour.get("run_only_when_vehicle_class", ["3WHEELER", "BUS", "CAR", "MOTORCYCLE", "TRUCK"])
+                for item in colour.get("run_only_when_vehicle_class", SUPPORTED_VEHICLE_CLASSES)
                 if str(item).strip()
             ],
             "maximum_crops_per_track": max(
@@ -198,7 +199,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
             ],
             "colour_vehicle_classes": [
                 str(item).strip().upper()
-                for item in ocr_mukul.get("colour_vehicle_classes", colour.get("eligible_vehicle_classes", colour.get("run_only_when_vehicle_class", ["3WHEELER", "BUS", "CAR", "MOTORCYCLE", "TRUCK"])))
+                for item in ocr_mukul.get("colour_vehicle_classes", colour.get("eligible_vehicle_classes", colour.get("run_only_when_vehicle_class", SUPPORTED_VEHICLE_CLASSES)))
                 if str(item).strip()
             ],
         },
@@ -214,6 +215,7 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
                 "backend": str(vehicle_attribute_colour.get("backend", "base_florence")).strip() or "base_florence",
                 "task_token": str(vehicle_attribute_colour.get("task_token", vehicle_attributes.get("task_token", "<VQA>"))).strip() or "<VQA>",
                 "prompt": str(vehicle_attribute_colour.get("prompt", vehicle_attributes.get("prompt", "")) or ""),
+                "inference_strategy": str(vehicle_attribute_colour.get("inference_strategy", "all_selected")).strip() or "all_selected",
                 "generation": dict(vehicle_attribute_colour.get("generation", {}) or {}),
             },
             "body_type": {
@@ -937,10 +939,10 @@ class VehicleEnrichmentManager:
             preferred_crop_count=prepared.preferred_crop_count,
             readable_crop_count=prepared.readable_crop_count,
             fallback_crop_count=prepared.fallback_crop_count,
-            selected_colour_crop_count=len(colour_result.predictions),
+            selected_colour_crop_count=len(selected),
             colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
-            selected_colour_crop_paths=[str(item.source_crop_path) for item in colour_result.predictions if item.source_crop_path],
+            selected_colour_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
             body_type_eligible=attribute_result.body_type_eligible,
             body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count,
             body_type_selected_crop_count=attribute_result.body_type_selected_crop_count,
@@ -1311,10 +1313,10 @@ class VehicleEnrichmentManager:
             preferred_crop_count=preferred_crop_count,
             readable_crop_count=readable_crop_count,
             fallback_crop_count=fallback_crop_count,
-            selected_colour_crop_count=len(colour_result.predictions),
+            selected_colour_crop_count=len(selected),
             colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
-            selected_colour_crop_paths=[str(item.source_crop_path) for item in colour_result.predictions if item.source_crop_path],
+            selected_colour_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
             body_type_eligible=attribute_result.body_type_eligible if self.config["vehicle_attributes"]["enabled"] else str(track.final_class or "").upper() == "CAR",
             body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count if self.config["vehicle_attributes"]["enabled"] else 0,
             body_type_selected_crop_count=attribute_result.body_type_selected_crop_count if self.config["vehicle_attributes"]["enabled"] else len(body_type_result.predictions),

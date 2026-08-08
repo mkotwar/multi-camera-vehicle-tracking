@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import queue
+import time
 import traceback
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from pathlib import Path
 import shutil
 from typing import Any
 
+import numpy as np
 import yaml
 
 from .detector_tracker import VehicleDetectorTracker
@@ -27,6 +29,7 @@ from .models import (
     RunMetadata,
 )
 from .output_writer import RunOutputManager
+from .runtime_state import get_runtime_state_manager
 from .track_manager import TrackManager
 from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
 
@@ -114,6 +117,30 @@ def _load_raw_config(config_path: str | Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ConfigurationError("Configuration root must be a mapping.")
     return payload
+
+
+def _build_distribution_stats(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(array.mean()),
+        "p50": float(np.percentile(array, 50)),
+        "p95": float(np.percentile(array, 95)),
+        "max": float(array.max()),
+    }
+
+
+def _build_runtime_local_track_id(camera_id: str, tracker_namespace: str, native_tracker_id: int) -> str:
+    normalized_namespace = str(tracker_namespace).strip()
+    if normalized_namespace == "camera":
+        return f"{camera_id}:TRACK_{native_tracker_id}"
+    return f"{camera_id}:{normalized_namespace.upper()}:TRACK_{native_tracker_id}"
+
+
+def _short_track_id(local_track_id: str) -> str:
+    parts = str(local_track_id).split(":")
+    return parts[-1] if parts else local_track_id
 
 
 def _validate_capture_zone_profile(profile: dict[str, Any], context: str) -> dict[str, Any]:
@@ -277,6 +304,14 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     if not resolved_model_path.exists():
         raise ConfigurationError(f"Resolved model path does not exist: {resolved_model_path}")
     detection_backend = str(detection.get("backend", "ocr_mukul")).strip().lower() or "ocr_mukul"
+    detection_batch = dict(detection.get("batch", {}) or {})
+    detection_batch_enabled = bool(detection_batch.get("enabled", False))
+    detection_batch_max_size = int(detection_batch.get("max_size", 1) or 1)
+    detection_batch_max_wait_ms = float(detection_batch.get("max_wait_ms", 0.0) or 0.0)
+    if detection_batch_max_size < 1:
+        raise ConfigurationError("detection.batch.max_size must be at least 1.")
+    if detection_batch_max_wait_ms < 0.0:
+        raise ConfigurationError("detection.batch.max_wait_ms must be at least 0.")
     allowed_classes = [str(item).strip() for item in detection.get("allowed_classes", []) if str(item).strip()]
     allowed_class_ids = [int(item) for item in detection.get("allowed_class_ids", list(range(8)))]
     if detection_backend == "legacy_clean" and not allowed_classes:
@@ -467,6 +502,11 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "iou_threshold": float(detection.get("iou_threshold", 0.45)),
             "image_size": int(detection.get("image_size", 1024 if detection_backend == "ocr_mukul" else 640)),
             "agnostic_nms": bool(detection.get("agnostic_nms", False)),
+            "batch": {
+                "enabled": detection_batch_enabled,
+                "max_size": detection_batch_max_size,
+                "max_wait_ms": detection_batch_max_wait_ms,
+            },
             "allowed_classes": allowed_classes,
             "allowed_class_ids": allowed_class_ids,
             "bbox_quality": normalized_bbox_quality,
@@ -637,6 +677,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
     track_manager: TrackManager | None = None
     evidence_collector: EvidenceCollector | None = None
     vehicle_enrichment_manager: VehicleEnrichmentManager | None = None
+    runtime_state = get_runtime_state_manager()
     try:
         logger.info("Pipeline started")
         if deferred_setup_error is not None:
@@ -668,6 +709,11 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         if bool(validated_config["output"]["save_run_config"]):
             output_manager.save_effective_config(validated_config)
         logger.info("Config loaded")
+        runtime_state.initialize_run(
+            run_id=output_manager.run_id,
+            run_directory=str(output_manager.run_directory),
+            cameras=[camera for camera in validated_config["input"]["cameras"] if camera["enabled"]],
+        )
         frame_limit = validated_config["input"]["max_frames_per_camera"]
         logger.info(
             "Frame limit per camera: %s",
@@ -686,6 +732,20 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("worker_count", 0)),
             1 if bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)) else 0,
             int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("queue_size", 0)),
+        )
+        logger.info(
+            "Detection batching: enabled=%s max_size=%s max_wait_ms=%s",
+            bool(validated_config["detection"].get("batch", {}).get("enabled", False)),
+            int(validated_config["detection"].get("batch", {}).get("max_size", 1) or 1),
+            float(validated_config["detection"].get("batch", {}).get("max_wait_ms", 0.0) or 0.0),
+        )
+        runtime_state.update_system_status(
+            yolo_status="loaded",
+            colour_worker_status="running" if bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)) else "disabled",
+            colour_queue_capacity=int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("queue_size", 0) or 0),
+            pending_colour_jobs=0,
+            frame_loss=0,
+            order_violations=0,
         )
         metadata.status = RUN_STATUS_RUNNING
         output_manager.save_metadata(metadata)
@@ -740,74 +800,188 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         saved_detected_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         saved_tracked_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         enrichment_results = []
+        detection_batch_config = dict(validated_config["detection"].get("batch", {}) or {})
+        detection_batch_enabled = bool(detection_batch_config.get("enabled", False))
+        detection_batch_max_size = int(detection_batch_config.get("max_size", 1) or 1)
+        detection_batch_max_wait_ms = float(detection_batch_config.get("max_wait_ms", 0.0) or 0.0)
+        detection_batch_wait_times_ms: list[float] = []
+        detection_latency_ms: list[float] = []
+        frame_order_violations = 0
+        last_processed_frame_by_camera: dict[str, int] = {}
 
         while True:
             try:
-                packet = ingestion_manager.get_packet()
+                first_packet = ingestion_manager.get_packet()
             except queue.Empty:
                 if ingestion_manager.is_finished() and ingestion_manager.frame_queue.empty():
                     break
                 continue
 
-            frames_by_camera[packet.camera_id] += 1
-            metadata.processed_frames += 1
-            result = detector_tracker.process_frame(packet)
-            detections_by_camera[packet.camera_id] += len(result.detections)
-            tracked_observations_by_camera[packet.camera_id] += len(result.tracked_detections)
-            raw_detections += len(result.bbox_quality_diagnostics)
-            accepted_detections += len(result.detections)
-            bbox_quality_diagnostics.extend(asdict(item) for item in result.bbox_quality_diagnostics)
-            for detection_item in result.detections:
-                normalized_class = str(detection_item.class_name).strip().lower()
-                detections_by_class[normalized_class] = detections_by_class.get(normalized_class, 0) + 1
-                accepted_by_class[normalized_class] = accepted_by_class.get(normalized_class, 0) + 1
-            for diagnostic in result.bbox_quality_diagnostics:
-                if diagnostic.accepted_by_bbox_quality:
-                    continue
-                rejected_detections += 1
-                normalized_class = str(diagnostic.class_name).strip().lower()
-                rejected_by_class[normalized_class] = rejected_by_class.get(normalized_class, 0) + 1
-                if diagnostic.rejection_reason is not None:
-                    rejected_by_reason[diagnostic.rejection_reason] = rejected_by_reason.get(diagnostic.rejection_reason, 0) + 1
-            for tracked_item in result.tracked_detections:
-                unique_native_track_ids_by_camera[packet.camera_id].add(tracked_item.tracker_id)
-            evidence_collector.register_frame(packet, result.tracked_detections)
-            completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
-            lifecycle_completed_tracks.extend(completed_now)
-            finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
-            enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
-            logger.debug(
-                "camera=%s worker=%s frame=%s timestamp=%.3f queue_size=%s detections=%s tracked=%s",
-                packet.camera_id,
-                packet.worker_id,
-                packet.frame_number,
-                packet.timestamp_seconds,
-                ingestion_manager.frame_queue.qsize(),
-                len(result.detections),
-                len(result.tracked_detections),
-            )
-            if frames_by_camera[packet.camera_id] % 10 == 0:
-                logger.info(
-                    "%s processed_frames=%s detections=%s tracked=%s",
+            batch_packets: list[Any] = [first_packet]
+            batch_collected_at: list[float] = [time.perf_counter()]
+            batch_started_at = batch_collected_at[0]
+            if detection_batch_enabled and detection_batch_max_size > 1:
+                batch_deadline = batch_started_at + (detection_batch_max_wait_ms / 1000.0)
+                while len(batch_packets) < detection_batch_max_size:
+                    remaining = batch_deadline - time.perf_counter()
+                    if detection_batch_max_wait_ms <= 0.0:
+                        remaining = 0.0
+                    if remaining < 0.0:
+                        break
+                    try:
+                        next_packet = ingestion_manager.get_packet(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    batch_packets.append(next_packet)
+                    batch_collected_at.append(time.perf_counter())
+            detection_batch_wait_times_ms.append((time.perf_counter() - batch_started_at) * 1000.0)
+            batch_results = detector_tracker.process_frames(batch_packets)
+            batch_completed_at = time.perf_counter()
+
+            for packet, result, collected_at in zip(batch_packets, batch_results, batch_collected_at):
+                if packet.frame_number <= last_processed_frame_by_camera.get(packet.camera_id, -1):
+                    frame_order_violations += 1
+                last_processed_frame_by_camera[packet.camera_id] = packet.frame_number
+                detection_latency_ms.append((batch_completed_at - collected_at) * 1000.0)
+                frames_by_camera[packet.camera_id] += 1
+                metadata.processed_frames += 1
+                detections_by_camera[packet.camera_id] += len(result.detections)
+                tracked_observations_by_camera[packet.camera_id] += len(result.tracked_detections)
+                raw_detections += len(result.bbox_quality_diagnostics)
+                accepted_detections += len(result.detections)
+                bbox_quality_diagnostics.extend(asdict(item) for item in result.bbox_quality_diagnostics)
+                for detection_item in result.detections:
+                    normalized_class = str(detection_item.class_name).strip().lower()
+                    detections_by_class[normalized_class] = detections_by_class.get(normalized_class, 0) + 1
+                    accepted_by_class[normalized_class] = accepted_by_class.get(normalized_class, 0) + 1
+                for diagnostic in result.bbox_quality_diagnostics:
+                    if diagnostic.accepted_by_bbox_quality:
+                        continue
+                    rejected_detections += 1
+                    normalized_class = str(diagnostic.class_name).strip().lower()
+                    rejected_by_class[normalized_class] = rejected_by_class.get(normalized_class, 0) + 1
+                    if diagnostic.rejection_reason is not None:
+                        rejected_by_reason[diagnostic.rejection_reason] = rejected_by_reason.get(diagnostic.rejection_reason, 0) + 1
+                for tracked_item in result.tracked_detections:
+                    unique_native_track_ids_by_camera[packet.camera_id].add(tracked_item.tracker_id)
+                evidence_collector.register_frame(packet, result.tracked_detections)
+                completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
+                lifecycle_completed_tracks.extend(completed_now)
+                finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
+                enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
+                runtime_detection_rows: list[dict[str, Any]] = []
+                for tracked_item in result.tracked_detections:
+                    local_track_id = _build_runtime_local_track_id(packet.camera_id, tracked_item.tracker_namespace, int(tracked_item.tracker_id))
+                    short_track_id = _short_track_id(local_track_id)
+                    colour_value = None
+                    colour_status = "pending"
+                    runtime_detection_rows.append(
+                        {
+                            "track_id": short_track_id,
+                            "local_track_id": local_track_id,
+                            "vehicle_class": str(tracked_item.raw_class_name),
+                            "bbox": [float(value) for value in tracked_item.bbox_xyxy],
+                            "confidence": float(tracked_item.confidence),
+                            "colour": colour_value,
+                            "colour_status": colour_status,
+                        }
+                    )
+                    runtime_state.update_track_runtime(
+                        camera_id=packet.camera_id,
+                        local_track_id=local_track_id,
+                        short_track_id=short_track_id,
+                        vehicle_class=str(tracked_item.raw_class_name),
+                        bbox=list(tracked_item.bbox_xyxy),
+                        confidence=float(tracked_item.confidence),
+                        timestamp_seconds=float(tracked_item.timestamp_seconds),
+                        frame_number=int(tracked_item.frame_number),
+                        colour=colour_value,
+                        colour_status=colour_status,
+                        status="active",
+                    )
+                runtime_state.update_camera_runtime(
+                    camera_id=packet.camera_id,
+                    frame_number=int(packet.frame_number),
+                    timestamp_seconds=float(packet.timestamp_seconds),
+                    input_fps=float(packet.source_fps),
+                    detections=runtime_detection_rows,
+                    active_track_ids=[str(item["track_id"]) for item in runtime_detection_rows],
+                    active_vehicle_count=len(runtime_detection_rows),
+                    frame_bgr=result.tracked_frame,
+                    status="processing",
+                )
+                if completed_now:
+                    latest_enrichment_by_track = {
+                        str(item.local_track_id): item
+                        for item in enrichment_results[-len(completed_now):]
+                        if getattr(item, "local_track_id", None)
+                    }
+                    for completed_track in completed_now:
+                        local_track_id = str(completed_track.local_track_id)
+                        short_track_id = _short_track_id(local_track_id)
+                        enrichment_item = latest_enrichment_by_track.get(local_track_id)
+                        colour_label = None
+                        colour_status = "pending"
+                        evidence_rows = None
+                        if enrichment_item is not None:
+                            colour_payload = getattr(enrichment_item, "vehicle_colour", None)
+                            colour_label = None if colour_payload is None else getattr(colour_payload, "label", None)
+                            colour_status = "pending" if colour_payload is None else str(getattr(colour_payload, "status", "pending"))
+                            evidence_rows = list(getattr(enrichment_item, "evidence_used", []) or [])
+                        runtime_state.update_track_runtime(
+                            camera_id=str(completed_track.camera_id),
+                            local_track_id=local_track_id,
+                            short_track_id=short_track_id,
+                            vehicle_class=str(completed_track.final_class),
+                            bbox=list(completed_track.observations[-1].bbox_xyxy) if completed_track.observations else None,
+                            confidence=float(completed_track.observations[-1].confidence) if completed_track.observations else None,
+                            timestamp_seconds=float(completed_track.last_timestamp_seconds),
+                            frame_number=int(completed_track.last_frame),
+                            colour=colour_label,
+                            colour_status=colour_status,
+                            status="completed",
+                            evidence=evidence_rows,
+                        )
+                logger.debug(
+                    "camera=%s worker=%s frame=%s timestamp=%.3f queue_size=%s detections=%s tracked=%s batch_size=%s",
                     packet.camera_id,
-                    frames_by_camera[packet.camera_id],
-                    detections_by_camera[packet.camera_id],
-                    tracked_observations_by_camera[packet.camera_id],
+                    packet.worker_id,
+                    packet.frame_number,
+                    packet.timestamp_seconds,
+                    ingestion_manager.frame_queue.qsize(),
+                    len(result.detections),
+                    len(result.tracked_detections),
+                    len(batch_packets),
                 )
-            if _should_save_raw_frame(packet.frame_number, saved_raw_frames_by_camera[packet.camera_id], raw_frames_config):
-                output_manager.save_raw_frame(
-                    packet,
-                    image_format=str(raw_frames_config["image_format"]),
-                    jpeg_quality=int(raw_frames_config["jpeg_quality"]),
+                if frames_by_camera[packet.camera_id] % 10 == 0:
+                    logger.info(
+                        "%s processed_frames=%s detections=%s tracked=%s",
+                        packet.camera_id,
+                        frames_by_camera[packet.camera_id],
+                        detections_by_camera[packet.camera_id],
+                        tracked_observations_by_camera[packet.camera_id],
+                    )
+                if _should_save_raw_frame(packet.frame_number, saved_raw_frames_by_camera[packet.camera_id], raw_frames_config):
+                    output_manager.save_raw_frame(
+                        packet,
+                        image_format=str(raw_frames_config["image_format"]),
+                        jpeg_quality=int(raw_frames_config["jpeg_quality"]),
+                    )
+                    saved_raw_frames_by_camera[packet.camera_id] += 1
+                if _should_save_visualization_frame(packet.frame_number, saved_detected_frames_by_camera[packet.camera_id], detected_frames_config):
+                    output_manager.save_detected_frame(packet.camera_id, packet.frame_number, result.detected_frame)
+                    saved_detected_frames_by_camera[packet.camera_id] += 1
+                if _should_save_visualization_frame(packet.frame_number, saved_tracked_frames_by_camera[packet.camera_id], tracked_frames_config):
+                    output_manager.save_tracked_frame(packet.camera_id, packet.frame_number, result.tracked_frame)
+                    saved_tracked_frames_by_camera[packet.camera_id] += 1
+                runtime_state.update_system_status(
+                    colour_queue_depth=int(vehicle_enrichment_manager.metrics.get("colour_queue_peak_depth", 0) or 0),
+                    pending_colour_jobs=int(vehicle_enrichment_manager.metrics.get("track_evidence_pending_count", 0) or 0),
+                    cache_misses=int(evidence_collector.metrics.get("evidence_cache_misses", 0) or 0),
+                    frame_loss=0,
+                    order_violations=int(frame_order_violations),
                 )
-                saved_raw_frames_by_camera[packet.camera_id] += 1
-            if _should_save_visualization_frame(packet.frame_number, saved_detected_frames_by_camera[packet.camera_id], detected_frames_config):
-                output_manager.save_detected_frame(packet.camera_id, packet.frame_number, result.detected_frame)
-                saved_detected_frames_by_camera[packet.camera_id] += 1
-            if _should_save_visualization_frame(packet.frame_number, saved_tracked_frames_by_camera[packet.camera_id], tracked_frames_config):
-                output_manager.save_tracked_frame(packet.camera_id, packet.frame_number, result.tracked_frame)
-                saved_tracked_frames_by_camera[packet.camera_id] += 1
-            ingestion_manager.mark_task_done()
+                ingestion_manager.mark_task_done()
 
         for camera_id in frames_by_camera:
             completed_now = track_manager.flush_camera(camera_id)
@@ -816,6 +990,20 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
             detector_tracker.reset_camera(camera_id)
         enrichment_results.extend(vehicle_enrichment_manager.finalize_async_colour())
+        for enrichment_item in enrichment_results:
+            local_track_id = str(getattr(enrichment_item, "local_track_id", ""))
+            if not local_track_id:
+                continue
+            camera_id = str(getattr(enrichment_item, "camera_id", ""))
+            short_track_id = _short_track_id(local_track_id)
+            colour_payload = getattr(enrichment_item, "vehicle_colour", None)
+            runtime_state.update_track_colour(
+                camera_id=camera_id,
+                local_track_id=local_track_id,
+                short_track_id=short_track_id,
+                colour=None if colour_payload is None else getattr(colour_payload, "label", None),
+                colour_status="pending" if colour_payload is None else str(getattr(colour_payload, "status", "pending")),
+            )
         ingestion_manager.set_saved_raw_frames_by_camera(saved_raw_frames_by_camera)
         ingestion_manager.stop()
         metrics = ingestion_manager.get_metrics()
@@ -828,6 +1016,20 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         output_manager.save_ingestion_metrics(metrics)
         tracker_metrics = detector_tracker.metrics
         inference_times = tracker_metrics["inference_times_ms"]
+        preprocess_times = list(tracker_metrics.get("preprocess_times_ms", []) or [])
+        model_inference_stage_times = list(tracker_metrics.get("model_inference_stage_times_ms", []) or [])
+        postprocess_times = list(tracker_metrics.get("postprocess_times_ms", []) or [])
+        result_conversion_times = list(tracker_metrics.get("result_conversion_times_ms", []) or [])
+        result_routing_times = list(tracker_metrics.get("result_routing_times_ms", []) or [])
+        tracker_update_times = list(tracker_metrics.get("tracker_update_times_ms", []) or [])
+        total_detection_times = list(tracker_metrics.get("total_detection_times_ms", []) or [])
+        total_detection_stage_time_ms = float(sum(total_detection_times)) if total_detection_times else 0.0
+        preprocess_stage_time_ms = float(sum(preprocess_times)) if preprocess_times else 0.0
+        model_inference_stage_time_ms = float(sum(model_inference_stage_times)) if model_inference_stage_times else 0.0
+        postprocess_stage_time_ms = float(sum(postprocess_times)) if postprocess_times else 0.0
+        result_conversion_stage_time_ms = float(sum(result_conversion_times)) if result_conversion_times else 0.0
+        result_routing_stage_time_ms = float(sum(result_routing_times)) if result_routing_times else 0.0
+        tracker_update_stage_time_ms = float(sum(tracker_update_times)) if tracker_update_times else 0.0
         detection_tracking_metrics = {
             "detection_backend": validated_config["detection"]["backend"],
             "tracking_backend": validated_config["tracking"]["backend"],
@@ -846,6 +1048,9 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "iou_threshold": validated_config["detection"]["iou_threshold"],
             "image_size": validated_config["detection"]["image_size"],
             "agnostic_nms": validated_config["detection"]["agnostic_nms"],
+            "detection_batch_enabled": detection_batch_enabled,
+            "detection_batch_size_configured": detection_batch_max_size if detection_batch_enabled else 1,
+            "detection_batch_wait_ms_configured": detection_batch_max_wait_ms if detection_batch_enabled else 0.0,
             "isolation_mode": validated_config["tracking"]["isolation_mode"],
             "processed_frames_by_camera": frames_by_camera,
             "detections_by_camera": detections_by_camera,
@@ -867,6 +1072,55 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "average_inference_time_ms": float(sum(inference_times) / len(inference_times)) if inference_times else 0.0,
             "minimum_inference_time_ms": float(min(inference_times)) if inference_times else 0.0,
             "maximum_inference_time_ms": float(max(inference_times)) if inference_times else 0.0,
+            "preprocess_stage_profile_ms": _build_distribution_stats(preprocess_times),
+            "model_inference_stage_profile_ms": _build_distribution_stats(model_inference_stage_times),
+            "postprocess_stage_profile_ms": _build_distribution_stats(postprocess_times),
+            "result_conversion_stage_profile_ms": _build_distribution_stats(result_conversion_times),
+            "result_routing_stage_profile_ms": _build_distribution_stats(result_routing_times),
+            "tracker_update_stage_profile_ms": _build_distribution_stats(tracker_update_times),
+            "total_detection_stage_profile_ms": _build_distribution_stats(total_detection_times),
+            "preprocess_stage_total_ms": preprocess_stage_time_ms,
+            "model_inference_stage_total_ms": model_inference_stage_time_ms,
+            "postprocess_stage_total_ms": postprocess_stage_time_ms,
+            "result_conversion_stage_total_ms": result_conversion_stage_time_ms,
+            "result_routing_stage_total_ms": result_routing_stage_time_ms,
+            "tracker_update_stage_total_ms": tracker_update_stage_time_ms,
+            "total_detection_stage_total_ms": total_detection_stage_time_ms,
+            "preprocess_stage_share_of_total_percent": float((preprocess_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "model_inference_stage_share_of_total_percent": float((model_inference_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "postprocess_stage_share_of_total_percent": float((postprocess_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "result_conversion_stage_share_of_total_percent": float((result_conversion_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "result_routing_stage_share_of_total_percent": float((result_routing_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "tracker_update_stage_share_of_total_percent": float((tracker_update_stage_time_ms * 100.0) / total_detection_stage_time_ms) if total_detection_stage_time_ms > 0.0 else 0.0,
+            "detection_batches_total": int(tracker_metrics.get("detection_batches_total", 0) or 0),
+            "detection_frames_total": int(tracker_metrics.get("detection_frames_total", 0) or 0),
+            "average_detection_batch_size": float(
+                (tracker_metrics.get("detection_batch_size_sum", 0) or 0) / float(tracker_metrics.get("detection_batches_total", 0) or 1)
+            ) if int(tracker_metrics.get("detection_batches_total", 0) or 0) > 0 else 0.0,
+            "max_detection_batch_size_observed": int(tracker_metrics.get("max_detection_batch_size_observed", 0) or 0),
+            "partial_detection_batches": int(tracker_metrics.get("partial_detection_batches", 0) or 0),
+            "detection_batch_wait_time_ms_avg": float(sum(detection_batch_wait_times_ms) / len(detection_batch_wait_times_ms)) if detection_batch_wait_times_ms else 0.0,
+            "detection_batch_wait_time_ms_max": float(max(detection_batch_wait_times_ms)) if detection_batch_wait_times_ms else 0.0,
+            "yolo_model_invocations": int(tracker_metrics.get("yolo_model_invocations", 0) or 0),
+            "yolo_frames_processed": int(tracker_metrics.get("yolo_frames_processed", 0) or 0),
+            "yolo_inference_time_total_ms": float(tracker_metrics.get("yolo_inference_time_total_ms", 0.0) or 0.0),
+            "yolo_inference_time_per_batch_avg_ms": float(
+                sum(tracker_metrics.get("yolo_inference_time_per_batch_ms", []) or [])
+                / len(tracker_metrics.get("yolo_inference_time_per_batch_ms", []) or [1])
+            ) if list(tracker_metrics.get("yolo_inference_time_per_batch_ms", []) or []) else 0.0,
+            "yolo_inference_time_per_frame_avg_ms": float(
+                (tracker_metrics.get("yolo_inference_time_total_ms", 0.0) or 0.0)
+                / float(tracker_metrics.get("yolo_frames_processed", 0) or 1)
+            ) if int(tracker_metrics.get("yolo_frames_processed", 0) or 0) > 0 else 0.0,
+            "detection_latency_ms_avg": float(sum(detection_latency_ms) / len(detection_latency_ms)) if detection_latency_ms else 0.0,
+            "detection_latency_ms_p50": float(np.percentile(np.asarray(detection_latency_ms, dtype=np.float64), 50)) if detection_latency_ms else 0.0,
+            "detection_latency_ms_p95": float(np.percentile(np.asarray(detection_latency_ms, dtype=np.float64), 95)) if detection_latency_ms else 0.0,
+            "detection_latency_ms_max": float(max(detection_latency_ms)) if detection_latency_ms else 0.0,
+            "frame_order_violations": frame_order_violations,
+            "gpu_memory_allocated_mb": tracker_metrics.get("gpu_memory_allocated_mb"),
+            "gpu_memory_reserved_mb": tracker_metrics.get("gpu_memory_reserved_mb"),
+            "gpu_peak_allocated_mb": tracker_metrics.get("gpu_peak_allocated_mb"),
+            "gpu_peak_reserved_mb": tracker_metrics.get("gpu_peak_reserved_mb"),
             "duration_seconds": float(metrics.get("duration_seconds", 0.0)),
         }
         output_manager.save_detection_tracking_metrics(detection_tracking_metrics)
@@ -1164,6 +1418,16 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "colour_jobs_lost": int(vehicle_enrichment_manager.metrics.get("colour_jobs_lost", 0)),
                 "pending_colour_jobs_at_shutdown": int(vehicle_enrichment_manager.metrics.get("track_evidence_pending_count", 0)),
                 "colour_worker_busy_time_ms": float(vehicle_enrichment_manager.metrics.get("colour_worker_busy_time_ms", 0.0) or 0.0),
+                "colour_inference_strategy": str(vehicle_enrichment_manager.metrics.get("colour_inference_strategy", "")),
+                "colour_tracks_processed": int(vehicle_enrichment_manager.metrics.get("colour_tracks_processed", 0)),
+                "colour_tracks_resolved_crop1": int(vehicle_enrichment_manager.metrics.get("colour_tracks_resolved_crop1", 0)),
+                "colour_tracks_resolved_crop2": int(vehicle_enrichment_manager.metrics.get("colour_tracks_resolved_crop2", 0)),
+                "colour_tracks_resolved_crop3": int(vehicle_enrichment_manager.metrics.get("colour_tracks_resolved_crop3", 0)),
+                "colour_tracks_unresolved": int(vehicle_enrichment_manager.metrics.get("colour_tracks_unresolved", 0)),
+                "colour_florence_calls_total": int(vehicle_enrichment_manager.metrics.get("colour_florence_calls_total", 0)),
+                "average_colour_calls_per_track": float(vehicle_enrichment_manager.metrics.get("vehicle_attribute_average_colour_calls_per_track", 0.0) or 0.0),
+                "fallback_to_crop2_count": int(vehicle_enrichment_manager.metrics.get("fallback_to_crop2_count", 0)),
+                "fallback_to_crop3_count": int(vehicle_enrichment_manager.metrics.get("fallback_to_crop3_count", 0)),
                 "detection_total_inference_time_ms": float(sum(inference_times)),
                 "overall_pipeline_runtime_ms": float((datetime.now(timezone.utc) - datetime.fromisoformat(metadata.started_at)).total_seconds() * 1000.0),
                 "car_tracks_total": int(vehicle_enrichment_manager.metrics.get("car_tracks_total", 0)),
@@ -1176,6 +1440,24 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "body_type_average_inference_ms": float(vehicle_enrichment_manager.metrics.get("body_type_average_inference_ms", 0.0) or 0.0),
                 "run_directory": str(output_manager.run_directory),
             }
+        )
+        runtime_state.update_system_status(
+            colour_queue_depth=int(vehicle_enrichment_manager.metrics.get("colour_queue_peak_depth", 0) or 0),
+            colour_queue_capacity=int(vehicle_enrichment_manager.metrics.get("colour_queue_size", 0) or 0),
+            pending_colour_jobs=0,
+            cache_misses=int(evidence_metrics.get("evidence_cache_misses", 0) or 0),
+            frame_loss=0,
+            order_violations=int(frame_order_violations),
+            yolo_status="completed",
+            colour_worker_status="completed",
+        )
+        runtime_state.mark_run_completed(
+            status=metadata.status,
+            summary={
+                "run_id": metadata.run_id,
+                "processed_frames": metadata.processed_frames,
+                "run_directory": str(output_manager.run_directory),
+            },
         )
         logger.info(
             "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s track_crop_manifest=%s capture_zone_index=%s capture_zone_metrics=%s motorcycle_geometry_report=%s vehicle_pipeline_trace=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
@@ -1218,6 +1500,16 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         metadata.error_count += 1
         metadata.completed_at = datetime.now(timezone.utc).isoformat()
         output_manager.save_metadata(metadata)
+        runtime_state.set_pipeline_status("failed", run_id=output_manager.run_id)
+        runtime_state.mark_run_completed(
+            status=metadata.status,
+            summary={
+                "run_id": metadata.run_id,
+                "processed_frames": metadata.processed_frames,
+                "run_directory": str(output_manager.run_directory),
+                "error_type": exc.__class__.__name__,
+            },
+        )
         logger.exception("Pipeline failed")
         output_manager.save_error(
             "pipeline_error",
