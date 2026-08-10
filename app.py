@@ -7,9 +7,21 @@ from pathlib import Path
 from src.pipeline import run_pipeline
 
 
+def resolve_default_config_path() -> str:
+    new_default = Path("config/default.yaml")
+    legacy_default = Path("config.yaml")
+    if new_default.exists():
+        return str(new_default)
+    return str(legacy_default)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Step 1 multicamera vehicle tracking foundation pipeline.")
-    parser.add_argument("--config", default="config.yaml", help="Path to the YAML configuration file.")
+    parser.add_argument(
+        "--config",
+        default=resolve_default_config_path(),
+        help="Path to the YAML configuration file.",
+    )
     return parser.parse_args()
 
 

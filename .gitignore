@@ -6,6 +6,7 @@
 **/__pycache__/
 *.pyc
 .pytest_cache/
+**pycache**/
 
 # Pytest generated temporary files
 pytest_tmp/
@@ -16,6 +17,7 @@ pytest_tmp/
 # Runtime outputs
 logs/
 outputs/
+*.log
 
 # Models
 *.pt
@@ -55,3 +57,4 @@ node_modules/
 # Frontend build output
 frontend/dist/
 frontend/coverage/
+*.tsbuildinfo

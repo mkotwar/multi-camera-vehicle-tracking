@@ -66,7 +66,7 @@ def test_body_type_prompt_comparison_writes_outputs(tmp_path: Path) -> None:
     backend = _FakeBackend(["car", "sedan", "hyundai", "suv"])
     result = module.run_prompt_comparison(
         manual_review_csv=review_csv,
-        config_path=Path("config.validation_car_body_type.yaml"),
+        config_path=Path("config/archive/config.validation_car_body_type.yaml"),
         output_dir=output_dir,
         backend=backend,
     )

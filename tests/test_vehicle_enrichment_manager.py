@@ -438,11 +438,134 @@ def test_normalize_vehicle_enrichment_config_supports_colour_only_vehicle_attrib
         }
     )
 
-    assert normalized["vehicle_attributes"]["enabled"] is True
-    assert normalized["vehicle_attributes"]["reuse_single_response_for_attributes"] is False
-    assert normalized["vehicle_attributes"]["colour"]["enabled"] is True
-    assert normalized["vehicle_attributes"]["colour"]["prompt"] == "What colour is the vehicle?"
-    assert normalized["vehicle_attributes"]["body_type"]["enabled"] is False
+    assert normalized["enrichment"]["enabled"] is True
+    assert normalized["enrichment"]["reuse_single_response_for_attributes"] is False
+    assert normalized["enrichment"]["colour"]["enabled"] is True
+    assert normalized["enrichment"]["colour"]["prompt"] == "What colour is the vehicle?"
+    assert normalized["enrichment"]["body_type"]["enabled"] is False
+
+
+def test_normalize_vehicle_enrichment_config_supports_canonical_schema() -> None:
+    normalized = normalize_vehicle_enrichment_config(
+        {
+            "enabled": True,
+            "florence": {
+                "enabled": True,
+                "backend": "florence2",
+                "model_id": "florence-model",
+                "processor_path": "florence-processor",
+                "adapter": {"enabled": True, "path": "adapter-path", "fail_if_missing": True},
+                "device": "cpu",
+                "dtype": "float16",
+                "local_files_only": True,
+                "lazy_load": True,
+                "trust_remote_code": True,
+                "attention_implementation": "eager",
+            },
+            "enrichment": {
+                "enabled": True,
+                "colour": {
+                    "enabled": True,
+                    "backend": "base_florence",
+                    "task_token": "<VQA>",
+                    "prompt": "What colour is the vehicle?",
+                    "generation": {"max_new_tokens": 16, "num_beams": 1, "use_cache": True},
+                    "async": {"enabled": True, "queue_size": 9, "worker_count": 1, "queue_put_timeout_seconds": 0.2},
+                },
+                "body_type": {
+                    "enabled": True,
+                    "backend": "florence2",
+                    "run_only_when_vehicle_class": ["CAR"],
+                    "allowed_labels": ["SEDAN", "UNKNOWN"],
+                },
+                "make_model": {"enabled": False},
+                "plate": {
+                    "enabled": True,
+                    "detector": {"enabled": True, "model_path": "plate.pt"},
+                    "colour": {"enabled": False},
+                    "ocr": {"enabled": True, "backend": "ocr_mukul_adapter", "task_token": "<OCR>", "prompt": ""},
+                },
+            },
+        }
+    )
+
+    assert normalized["florence"]["backend"] == "florence"
+    assert normalized["florence"]["model_id"] == "florence-model"
+    assert normalized["florence"]["adapter"]["enabled"] is True
+    assert normalized["florence"]["adapter"]["path"] == "adapter-path"
+    assert normalized["enrichment"]["colour"]["backend"] == "florence"
+    assert normalized["enrichment"]["body_type"]["backend"] == "florence"
+    assert normalized["enrichment"]["plate"]["detector"]["enabled"] is True
+    assert normalized["enrichment"]["plate"]["ocr"]["enabled"] is True
+    assert normalized["enrichment"]["colour"]["async"]["enabled"] is True
+
+
+def test_new_canonical_keys_win_over_legacy_keys() -> None:
+    normalized = normalize_vehicle_enrichment_config(
+        {
+            "shared_florence": {"enabled": True, "backend": "florence2", "base_model_id": "legacy-model"},
+            "vehicle_attributes": {
+                "enabled": True,
+                "colour": {"enabled": True, "prompt": "legacy colour prompt"},
+                "body_type": {"enabled": True, "prompt": "legacy body prompt"},
+            },
+            "plate": {"detection_enabled": False, "recognition_enabled": False},
+            "ocr": {"enabled": False, "run_only_when_plate_detected": True},
+            "florence": {"enabled": True, "backend": "base_florence", "model_id": "new-model"},
+            "enrichment": {
+                "enabled": True,
+                "colour": {"enabled": True, "prompt": "new colour prompt"},
+                "body_type": {"enabled": True, "prompt": "new body prompt"},
+                "plate": {"ocr": {"enabled": True, "task_token": "<OCR>"}, "detector": {"enabled": True, "model_path": "plate.pt"}},
+            },
+        }
+    )
+
+    assert normalized["florence"]["model_id"] == "new-model"
+    assert normalized["enrichment"]["colour"]["prompt"] == "new colour prompt"
+    assert normalized["enrichment"]["body_type"]["prompt"] == "new body prompt"
+    assert normalized["enrichment"]["plate"]["detector"]["enabled"] is True
+    assert normalized["enrichment"]["plate"]["ocr"]["enabled"] is True
+
+
+def test_legacy_translation_normalizes_backend_aliases_and_async_colour() -> None:
+    normalized = normalize_vehicle_enrichment_config(
+        {
+            "shared_florence": {"enabled": True, "backend": "florence2"},
+            "vehicle_attributes": {
+                "enabled": True,
+                "backend": "base_florence",
+                "colour": {"enabled": True, "backend": "base_florence"},
+                "body_type": {"enabled": True, "backend": "base_florence"},
+            },
+            "async_colour": {"enabled": True, "queue_size": 7, "worker_count": 1, "queue_put_timeout_seconds": 0.05},
+        }
+    )
+
+    assert normalized["florence"]["backend"] == "florence"
+    assert normalized["enrichment"]["colour"]["backend"] == "florence"
+    assert normalized["enrichment"]["body_type"]["backend"] == "florence"
+    assert normalized["enrichment"]["colour"]["async"]["enabled"] is True
+    assert normalized["enrichment"]["colour"]["async"]["queue_size"] == 7
+
+
+def test_legacy_plate_and_execution_mode_translate_to_canonical_shape(tmp_path: Path) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    normalized = normalize_vehicle_enrichment_config(
+        {
+            "shared_florence": {"enabled": True},
+            "plate": {"detection_enabled": True, "recognition_enabled": True, "colour_enabled": True, "detector": {"model_path": "plate.pt"}},
+            "ocr": {"enabled": False, "run_only_when_plate_detected": True},
+            "florence_mode": "ocr_mukul",
+        }
+    )
+
+    assert normalized["execution_mode"] == "ocr_mukul"
+    assert normalized["enrichment"]["plate"]["enabled"] is True
+    assert normalized["enrichment"]["plate"]["detector"]["enabled"] is True
+    assert normalized["enrichment"]["plate"]["ocr"]["enabled"] is True
+    assert normalized["enrichment"]["plate"]["colour"]["enabled"] is True
+    assert manager.config["execution_mode"] == "current"
 
 
 def test_manager_prefers_capture_zone_with_existing_fallback(tmp_path: Path) -> None:

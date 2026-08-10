@@ -337,15 +337,15 @@ def test_vehicle_attribute_flow_filters_out_non_active_body_labels(tmp_path: Pat
 
 
 def test_active_config_contains_prompt_a_and_runtime_reads_it() -> None:
-    config_path = Path("config.validation_car_body_type.yaml")
+    config_path = Path("config/archive/config.validation_car_body_type.yaml")
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     body_type = raw["vehicle_enrichment"]["vehicle_attributes"]["body_type"]
     assert body_type["prompt"] == "What type of car is shown in this image?\nAnswer with one word only:\nsedan, hatchback, suv, or mpv."
     assert body_type["allowed_labels"] == ["SEDAN", "HATCHBACK", "SUV", "MPV", "UNKNOWN"]
 
     normalized = normalize_vehicle_enrichment_config(raw["vehicle_enrichment"])
-    assert normalized["vehicle_attributes"]["body_type"]["prompt"] == body_type["prompt"]
-    assert normalized["vehicle_attributes"]["body_type"]["allowed_labels"] == ["SEDAN", "HATCHBACK", "SUV", "MPV", "UNKNOWN"]
+    assert normalized["enrichment"]["body_type"]["prompt"] == body_type["prompt"]
+    assert normalized["enrichment"]["body_type"]["allowed_labels"] == ["SEDAN", "HATCHBACK", "SUV", "MPV", "UNKNOWN"]
 
 
 def test_vehicle_attribute_flow_adaptive_fallback_stops_after_first_valid_colour(tmp_path: Path) -> None:

@@ -56,7 +56,7 @@ def test_body_type_prompt_experiment_v2_writes_outputs(tmp_path: Path) -> None:
     output_dir = tmp_path / "out"
     result = module.run_experiment(
         source_csv=source_csv,
-        config_path=Path("config.validation_car_body_type.yaml"),
+        config_path=Path("config/archive/config.validation_car_body_type.yaml"),
         output_dir=output_dir,
         backend=backend,
     )

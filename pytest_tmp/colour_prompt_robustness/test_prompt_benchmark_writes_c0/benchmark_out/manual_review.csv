@@ -1,7 +1,0 @@
-image_path,track_id,prompt_id,raw_response,parsed_label,normalization_reason,manual_colour,is_correct,review_notes
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_a,white,WHITE,exact_phrase_match,,,
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_b,white,WHITE,exact_phrase_match,,,
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_c,white,WHITE,exact_phrase_match,,,
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_d,white,WHITE,exact_phrase_match,,,
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_e,white,WHITE,exact_phrase_match,,,
-D:\project\multi-camera-vehicle-tracking\pytest_tmp\colour_prompt_robustness\test_prompt_benchmark_writes_c0\crops\image1.jpg,crops,prompt_f,white,WHITE,exact_phrase_match,,,

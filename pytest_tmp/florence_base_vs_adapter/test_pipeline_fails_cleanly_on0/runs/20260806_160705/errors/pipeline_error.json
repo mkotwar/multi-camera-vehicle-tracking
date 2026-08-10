@@ -1,6 +1,0 @@
-{
-  "run_id": "20260806_160705",
-  "error_type": "ConfigurationError",
-  "error_message": "At least one enabled camera is required.",
-  "traceback": "Traceback (most recent call last):\n  File \"D:\\project\\multi-camera-vehicle-tracking\\src\\pipeline.py\", line 454, in run_pipeline\n    validated_config = _validate_config(raw_config or _load_raw_config(config_file), config_file)\n  File \"D:\\project\\multi-camera-vehicle-tracking\\src\\pipeline.py\", line 190, in _validate_config\n    raise ConfigurationError(\"At least one enabled camera is required.\")\nsrc.models.ConfigurationError: At least one enabled camera is required.\n"
-}

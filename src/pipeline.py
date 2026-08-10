@@ -721,17 +721,17 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         )
         logger.info(
             "Vehicle enrichment startup: colour_enabled=%s body_type_enabled=%s adapter_enabled=%s plate_ocr_enabled=%s",
-            bool(validated_config["vehicle_enrichment"].get("vehicle_attributes", {}).get("colour", {}).get("enabled", False)),
-            bool(validated_config["vehicle_enrichment"].get("vehicle_attributes", {}).get("body_type", {}).get("enabled", True)),
-            bool(validated_config["vehicle_enrichment"].get("shared_florence", {}).get("adapter_enabled", False)),
-            bool(validated_config["vehicle_enrichment"].get("plate", {}).get("ocr", {}).get("enabled", False)),
+            bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("enabled", False)),
+            bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("body_type", {}).get("enabled", True)),
+            bool(validated_config["vehicle_enrichment"].get("florence", {}).get("adapter", {}).get("enabled", False)),
+            bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("plate", {}).get("ocr", {}).get("enabled", False)),
         )
         logger.info(
             "Async colour enrichment: enabled=%s worker_count=%s queue_count=%s queue_size=%s",
-            bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)),
-            int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("worker_count", 0)),
-            1 if bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)) else 0,
-            int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("queue_size", 0)),
+            bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("enabled", False)),
+            int(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("worker_count", 0)),
+            1 if bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("enabled", False)) else 0,
+            int(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("queue_size", 0)),
         )
         logger.info(
             "Detection batching: enabled=%s max_size=%s max_wait_ms=%s",
@@ -741,8 +741,8 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         )
         runtime_state.update_system_status(
             yolo_status="loaded",
-            colour_worker_status="running" if bool(validated_config["vehicle_enrichment"].get("async_colour", {}).get("enabled", False)) else "disabled",
-            colour_queue_capacity=int(validated_config["vehicle_enrichment"].get("async_colour", {}).get("queue_size", 0) or 0),
+            colour_worker_status="running" if bool(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("enabled", False)) else "disabled",
+            colour_queue_capacity=int(validated_config["vehicle_enrichment"].get("enrichment", {}).get("colour", {}).get("async", {}).get("queue_size", 0) or 0),
             pending_colour_jobs=0,
             frame_loss=0,
             order_violations=0,
@@ -1248,7 +1248,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 json.dumps(ocr_mukul_result_rows, indent=2),
                 encoding="utf-8",
             )
-        if validated_config["vehicle_enrichment"].get("florence_mode") == "comparison":
+        if validated_config["vehicle_enrichment"].get("execution_mode") == "comparison":
             _write_current_vs_ocr_mukul_artifacts(output_manager.run_directory, enrichment_results)
         vehicle_attribute_result_rows = _build_vehicle_attribute_result_rows(enrichment_results)
         if vehicle_attribute_result_rows:

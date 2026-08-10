@@ -54,8 +54,146 @@ from .shared import FlorenceBackend, FlorenceBackendConfig
 from .taxonomy import SUPPORTED_VEHICLE_CLASSES
 
 
+def _coalesce(*values: Any, default: Any = None) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return default
+
+
+def _normalize_backend_name(value: Any, *, default: str) -> str:
+    backend = str(value if value is not None else default).strip().lower() or default
+    if backend in {"florence2", "base_florence"}:
+        return "florence"
+    return backend
+
+
+def _normalize_generation_config(raw_generation: Any, *, max_new_tokens: int, num_beams: int, use_cache: bool) -> dict[str, Any]:
+    generation = dict(raw_generation or {})
+    return {
+        "max_new_tokens": int(generation.get("max_new_tokens", max_new_tokens)),
+        "num_beams": int(generation.get("num_beams", num_beams)),
+        "do_sample": bool(generation.get("do_sample", False)),
+        "use_cache": bool(generation.get("use_cache", use_cache)),
+        "early_stopping": bool(generation.get("early_stopping", False)),
+    }
+
+
+def _build_legacy_views(normalized: dict[str, Any]) -> dict[str, Any]:
+    florence = dict(normalized["florence"])
+    enrichment = dict(normalized["enrichment"])
+    colour = dict(enrichment["colour"])
+    body_type = dict(enrichment["body_type"])
+    plate = dict(enrichment["plate"])
+    plate_ocr = dict(plate["ocr"])
+    return {
+        "shared_florence": {
+            "enabled": bool(florence.get("enabled", False)),
+            "backend": str(florence.get("backend", "florence")),
+            "base_model_id": str(florence.get("base_model_id", "")),
+            "processor_path": str(florence.get("processor_path", "")),
+            "adapter_path": str(dict(florence.get("adapter", {}) or {}).get("path", "")),
+            "adapter_enabled": bool(dict(florence.get("adapter", {}) or {}).get("enabled", False)),
+            "device": str(florence.get("device", "auto")),
+            "dtype": str(florence.get("dtype", "auto")),
+            "trust_remote_code": bool(florence.get("trust_remote_code", True)),
+            "attention_implementation": str(florence.get("attention_implementation", "eager")),
+            "max_new_tokens": int(florence.get("max_new_tokens", 128)),
+            "num_beams": int(florence.get("num_beams", 3)),
+            "use_cache": bool(florence.get("use_cache", False)),
+            "local_files_only": bool(florence.get("local_files_only", False)),
+            "lazy_load": bool(florence.get("lazy_load", True)),
+            "fail_if_adapter_missing": bool(dict(florence.get("adapter", {}) or {}).get("fail_if_missing", False)),
+        },
+        "vehicle_attributes": {
+            "enabled": bool(enrichment.get("enabled", False)),
+            "backend": "florence",
+            "maximum_crops_per_track": max(
+                int(colour.get("maximum_crops_per_track", 3)),
+                int(body_type.get("maximum_crops_per_track", 3)),
+            ),
+            "reuse_single_response_for_attributes": bool(enrichment.get("reuse_single_response_for_attributes", False)),
+            "task_token": str(colour.get("task_token") or "<VQA>"),
+            "prompt": str(colour.get("prompt") or ""),
+            "colour": {
+                "enabled": bool(colour.get("enabled", False)),
+                "backend": str(colour.get("backend", "florence")),
+                "task_token": str(colour.get("task_token", "<VQA>")),
+                "prompt": str(colour.get("prompt", "")),
+                "inference_strategy": str(colour.get("inference_strategy", "all_selected")),
+                "generation": dict(colour.get("generation", {}) or {}),
+                "async": dict(colour.get("async", {}) or {}),
+            },
+            "body_type": {
+                "enabled": bool(body_type.get("enabled", False)),
+                "backend": str(body_type.get("backend", "florence")),
+                "task_token": str(body_type.get("task_token", BODY_TYPE_TASK_PROMPT)),
+                "prompt": str(body_type.get("prompt", BODY_TYPE_PROMPT_TEXT)),
+                "generation": dict(body_type.get("generation", {}) or {}),
+                "car_only": bool(body_type.get("car_only", True)),
+                "run_only_when_vehicle_class": list(body_type.get("run_only_when_vehicle_class", ["CAR"])),
+                "maximum_crops_per_track": int(body_type.get("maximum_crops_per_track", 3)),
+                "minimum_original_width": int(body_type.get("minimum_original_width", 120)),
+                "minimum_original_height": int(body_type.get("minimum_original_height", 100)),
+                "preferred_original_width": int(body_type.get("preferred_original_width", 240)),
+                "preferred_original_height": int(body_type.get("preferred_original_height", 160)),
+                "allowed_labels": list(body_type.get("allowed_labels", BODY_TYPE_ALLOWED_LABELS)),
+            },
+            "florence": {
+                key: value
+                for key, value in {
+                    "enabled": bool(florence.get("enabled", False)),
+                    "backend": str(florence.get("backend", "florence")),
+                    "base_model_id": str(florence.get("base_model_id", "")),
+                    "processor_path": str(florence.get("processor_path", "")),
+                    "adapter_path": "",
+                    "adapter_enabled": False,
+                    "device": str(florence.get("device", "auto")),
+                    "dtype": str(florence.get("dtype", "auto")),
+                    "trust_remote_code": bool(florence.get("trust_remote_code", True)),
+                    "attention_implementation": str(florence.get("attention_implementation", "eager")),
+                    "max_new_tokens": int(colour.get("generation", {}).get("max_new_tokens", florence.get("max_new_tokens", 16))),
+                    "num_beams": int(colour.get("generation", {}).get("num_beams", florence.get("num_beams", 1))),
+                    "use_cache": bool(colour.get("generation", {}).get("use_cache", True)),
+                    "local_files_only": bool(florence.get("local_files_only", True)),
+                    "lazy_load": bool(florence.get("lazy_load", True)),
+                    "fail_if_adapter_missing": False,
+                }.items()
+                if value is not None
+            },
+        },
+        "body_type": dict(body_type),
+        "colour": dict(colour),
+        "make_model": dict(enrichment["make_model"]),
+        "plate": {
+            "enabled": bool(plate.get("enabled", False)),
+            "detection_enabled": bool(plate["detector"].get("enabled", False)),
+            "colour_enabled": bool(plate["colour"].get("enabled", False)),
+            "recognition_enabled": bool(plate_ocr.get("enabled", False)),
+            "detector": dict(plate["detector"]),
+            "ocr": {
+                "enabled": bool(plate_ocr.get("enabled", False)),
+                "backend": str(plate_ocr.get("backend", "ocr_mukul_adapter")),
+                "task_token": str(plate_ocr.get("task_token", "<OCR>")),
+                "prompt": str(plate_ocr.get("prompt", "")),
+                "run_only_when_plate_detected": bool(plate_ocr.get("run_only_when_plate_detected", True)),
+                "florence": dict(plate_ocr.get("florence", {}) or {}),
+            },
+        },
+        "ocr": {
+            "enabled": bool(plate_ocr.get("enabled", False)),
+            "run_only_when_plate_detected": bool(plate_ocr.get("run_only_when_plate_detected", True)),
+        },
+        "ocr_mukul": dict(normalized["ocr_mukul"]),
+        "async_colour": dict(colour.get("async", {}) or {}),
+        "florence_mode": str(normalized["execution_mode"]),
+    }
+
+
 def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
     section = dict(raw_section or {})
+    if bool(section.get("__normalized__", False)):
+        return section
     evidence = dict(section.get("evidence", {}) or {})
     scoring = dict(evidence.get("scoring", {}) or {})
     shared_florence = dict(section.get("shared_florence", {}) or {})
@@ -73,20 +211,70 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
     vehicle_attributes = dict(section.get("vehicle_attributes", {}) or {})
     vehicle_attribute_colour = dict(vehicle_attributes.get("colour", {}) or {})
     vehicle_attribute_body_type = dict(vehicle_attributes.get("body_type", {}) or {})
-    return {
+    florence = dict(section.get("florence", {}) or {})
+    enrichment = dict(section.get("enrichment", {}) or {})
+    enrichment_colour = dict(enrichment.get("colour", {}) or {})
+    enrichment_body_type = dict(enrichment.get("body_type", {}) or {})
+    enrichment_make_model = dict(enrichment.get("make_model", {}) or {})
+    enrichment_plate = dict(enrichment.get("plate", {}) or {})
+    enrichment_plate_detector = dict(enrichment_plate.get("detector", {}) or {})
+    enrichment_plate_colour = dict(enrichment_plate.get("colour", {}) or {})
+    enrichment_plate_ocr = dict(enrichment_plate.get("ocr", {}) or {})
+    florence_adapter = dict(florence.get("adapter", {}) or {})
+    async_colour = dict(section.get("async_colour", {}) or {})
+    colour_async = dict(enrichment_colour.get("async", {}) or {})
+    deprecated_keys_used: list[str] = []
+    for legacy_key, replacement in (
+        ("shared_florence", "florence"),
+        ("vehicle_attributes", "enrichment"),
+        ("body_type", "enrichment.body_type"),
+        ("colour", "enrichment.colour"),
+        ("make_model", "enrichment.make_model"),
+        ("plate", "enrichment.plate"),
+        ("ocr", "enrichment.plate.ocr"),
+        ("async_colour", "enrichment.colour.async"),
+        ("florence_mode", "execution_mode"),
+    ):
+        if legacy_key in section:
+            deprecated_keys_used.append(f"Deprecated config key '{legacy_key}' detected; use '{replacement}'.")
+
+    florence_backend = _normalize_backend_name(
+        _coalesce(florence.get("backend"), shared_florence.get("backend"), vehicle_attributes.get("backend")),
+        default="florence",
+    )
+    base_model_id = str(
+        _coalesce(
+            florence.get("model_id"),
+            florence.get("base_model_id"),
+            shared_florence.get("base_model_id"),
+            dict(vehicle_attributes.get("florence", {}) or {}).get("base_model_id"),
+            "microsoft/Florence-2-base-ft",
+        )
+        or "microsoft/Florence-2-base-ft"
+    ).strip()
+    processor_path = str(
+        _coalesce(
+            florence.get("processor_path"),
+            shared_florence.get("processor_path"),
+            dict(vehicle_attributes.get("florence", {}) or {}).get("processor_path"),
+            base_model_id,
+        )
+        or base_model_id
+    ).strip()
+    florence_enabled = bool(_coalesce(florence.get("enabled"), shared_florence.get("enabled"), False))
+    florence_max_new_tokens = int(_coalesce(florence.get("max_new_tokens"), shared_florence.get("max_new_tokens"), 128))
+    florence_num_beams = int(_coalesce(florence.get("num_beams"), shared_florence.get("num_beams"), 3))
+    florence_use_cache = bool(_coalesce(florence.get("use_cache"), shared_florence.get("use_cache"), False))
+
+    normalized = {
         "enabled": bool(section.get("enabled", False)),
         "trigger": str(section.get("trigger", "track_completed")).strip() or "track_completed",
-        "florence_mode": str(section.get("florence_mode", "current")).strip() or "current",
+        "execution_mode": str(section.get("florence_mode", "current")).strip().lower() or "current",
         "fail_open": bool(section.get("fail_open", True)),
-        "async_colour": {
-            "enabled": bool(async_colour.get("enabled", False)),
-            "queue_size": max(1, int(async_colour.get("queue_size", 100))),
-            "worker_count": max(1, int(async_colour.get("worker_count", 1))),
-            "queue_put_timeout_seconds": float(async_colour.get("queue_put_timeout_seconds", 0.1)),
-        },
         "best_crops_per_track": max(1, int(section.get("best_crops_per_track", 3))),
         "write_separate_output": bool(section.get("write_separate_output", True)),
         "extend_tracks_json": bool(section.get("extend_tracks_json", True)),
+        "deprecated_warnings": deprecated_keys_used,
         "florence_comparison": {
             "enabled": bool(florence_comparison.get("enabled", False)),
             "current_flow": bool(florence_comparison.get("current_flow", True)),
@@ -120,23 +308,26 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
                 "brightness_weight": float(scoring.get("brightness_weight", 0.05)),
             },
         },
-        "shared_florence": {
-            "enabled": bool(shared_florence.get("enabled", False)),
-            "backend": str(shared_florence.get("backend", "florence2")).strip() or "florence2",
-            "base_model_id": str(shared_florence.get("base_model_id", "microsoft/Florence-2-base-ft")).strip(),
-            "processor_path": str(shared_florence.get("processor_path", "")).strip(),
-            "adapter_path": str(shared_florence.get("adapter_path", "model_weights/florence/adaptor_florance_baseFT")).strip(),
-            "adapter_enabled": bool(shared_florence.get("adapter_enabled", False)),
-            "device": str(shared_florence.get("device", "auto")).strip() or "auto",
-            "dtype": str(shared_florence.get("dtype", "auto")).strip() or "auto",
-            "trust_remote_code": bool(shared_florence.get("trust_remote_code", True)),
-            "attention_implementation": str(shared_florence.get("attention_implementation", "eager")).strip() or "eager",
-            "max_new_tokens": int(shared_florence.get("max_new_tokens", 128)),
-            "num_beams": int(shared_florence.get("num_beams", 3)),
-            "use_cache": bool(shared_florence.get("use_cache", False)),
-            "local_files_only": bool(shared_florence.get("local_files_only", False)),
-            "lazy_load": bool(shared_florence.get("lazy_load", True)),
-            "fail_if_adapter_missing": bool(shared_florence.get("fail_if_adapter_missing", False)),
+        "florence": {
+            "enabled": florence_enabled,
+            "backend": florence_backend,
+            "base_model_id": base_model_id,
+            "model_id": base_model_id,
+            "processor_path": processor_path,
+            "device": str(_coalesce(florence.get("device"), shared_florence.get("device"), "auto")).strip() or "auto",
+            "dtype": str(_coalesce(florence.get("dtype"), shared_florence.get("dtype"), "auto")).strip() or "auto",
+            "local_files_only": bool(_coalesce(florence.get("local_files_only"), shared_florence.get("local_files_only"), False)),
+            "lazy_load": bool(_coalesce(florence.get("lazy_load"), shared_florence.get("lazy_load"), True)),
+            "trust_remote_code": bool(_coalesce(florence.get("trust_remote_code"), shared_florence.get("trust_remote_code"), True)),
+            "attention_implementation": str(_coalesce(florence.get("attention_implementation"), shared_florence.get("attention_implementation"), "eager")).strip() or "eager",
+            "max_new_tokens": florence_max_new_tokens,
+            "num_beams": florence_num_beams,
+            "use_cache": florence_use_cache,
+            "adapter": {
+                "enabled": bool(_coalesce(florence_adapter.get("enabled"), florence.get("adapter_enabled"), shared_florence.get("adapter_enabled"), False)),
+                "path": str(_coalesce(florence_adapter.get("path"), florence.get("adapter_path"), shared_florence.get("adapter_path"), "model_weights/florence/adaptor_florance_baseFT") or "model_weights/florence/adaptor_florance_baseFT").strip(),
+                "fail_if_missing": bool(_coalesce(florence_adapter.get("fail_if_missing"), florence.get("fail_if_adapter_missing"), shared_florence.get("fail_if_adapter_missing"), False)),
+            },
         },
         "image_size_policy": image_size_policy,
         "evidence_quality": evidence_quality,
@@ -153,38 +344,6 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
                 "require_preferred_resolution": bool(dict(track_evidence.get("early_classification", {}) or {}).get("require_preferred_resolution", True)),
                 "minimum_quality_score": float(dict(track_evidence.get("early_classification", {}) or {}).get("minimum_quality_score", 0.80)),
             },
-        },
-        "body_type": {
-            "enabled": bool(body_type.get("enabled", False)),
-            "backend": str(body_type.get("backend", "florence2")).strip() or "florence2",
-            "run_only_when_vehicle_class": [
-                str(item).strip().upper()
-                for item in body_type.get("run_only_when_vehicle_class", ["CAR"])
-                if str(item).strip()
-            ],
-            "maximum_crops_per_track": max(
-                1,
-                int(body_type.get("maximum_crops_per_track", track_evidence.get("final_crops_per_attribute", 3))),
-            ),
-            "minimum_crop_width": max(1, int(body_type.get("minimum_crop_width", 256))),
-            "minimum_crop_height": max(1, int(body_type.get("minimum_crop_height", 192))),
-            "allowed_labels": [str(item).strip().upper() for item in body_type.get("allowed_labels", []) if str(item).strip()],
-        },
-        "colour": {
-            "enabled": bool(colour.get("enabled", False)),
-            "backend": str(colour.get("backend", "florence2")).strip() or "florence2",
-            "run_only_when_vehicle_class": [
-                str(item).strip().upper()
-                for item in colour.get("run_only_when_vehicle_class", SUPPORTED_VEHICLE_CLASSES)
-                if str(item).strip()
-            ],
-            "maximum_crops_per_track": max(
-                1,
-                int(colour.get("maximum_crops_per_track", track_evidence.get("final_crops_per_attribute", 3))),
-            ),
-            "minimum_crop_width": max(1, int(colour.get("minimum_crop_width", 256))),
-            "minimum_crop_height": max(1, int(colour.get("minimum_crop_height", 192))),
-            "allowed_labels": [str(item).strip().upper() for item in colour.get("allowed_labels", []) if str(item).strip()],
         },
         "ocr_mukul": {
             "enabled": bool(ocr_mukul.get("enabled", False)),
@@ -203,63 +362,107 @@ def normalize_vehicle_enrichment_config(raw_section: Any) -> dict[str, Any]:
                 if str(item).strip()
             ],
         },
-        "vehicle_attributes": {
-            "enabled": bool(vehicle_attributes.get("enabled", False)),
-            "backend": str(vehicle_attributes.get("backend", "base_florence")).strip() or "base_florence",
-            "maximum_crops_per_track": max(1, int(vehicle_attributes.get("maximum_crops_per_track", track_evidence.get("final_crops_per_attribute", 3)))),
+        "enrichment": {
+            "enabled": bool(_coalesce(enrichment.get("enabled"), vehicle_attributes.get("enabled"), False)),
             "reuse_single_response_for_attributes": bool(vehicle_attributes.get("reuse_single_response_for_attributes", True)),
-            "task_token": str(vehicle_attributes.get("task_token", "<VQA>")).strip() or "<VQA>",
-            "prompt": str(vehicle_attributes.get("prompt", "") or ""),
             "colour": {
-                "enabled": bool(vehicle_attribute_colour.get("enabled", False)),
-                "backend": str(vehicle_attribute_colour.get("backend", "base_florence")).strip() or "base_florence",
-                "task_token": str(vehicle_attribute_colour.get("task_token", vehicle_attributes.get("task_token", "<VQA>"))).strip() or "<VQA>",
-                "prompt": str(vehicle_attribute_colour.get("prompt", vehicle_attributes.get("prompt", "")) or ""),
-                "inference_strategy": str(vehicle_attribute_colour.get("inference_strategy", "all_selected")).strip() or "all_selected",
-                "generation": dict(vehicle_attribute_colour.get("generation", {}) or {}),
-            },
-            "body_type": {
-                "enabled": bool(vehicle_attribute_body_type.get("enabled", True)),
-                "backend": str(vehicle_attribute_body_type.get("backend", "base_florence")).strip() or "base_florence",
-                "task_token": str(vehicle_attribute_body_type.get("task_token", BODY_TYPE_TASK_PROMPT)).strip() or BODY_TYPE_TASK_PROMPT,
-                "prompt": str(vehicle_attribute_body_type.get("prompt", BODY_TYPE_PROMPT_TEXT) or BODY_TYPE_PROMPT_TEXT),
-                "generation": dict(vehicle_attribute_body_type.get("generation", {}) or {}),
-                "car_only": bool(vehicle_attribute_body_type.get("car_only", True)),
+                "enabled": bool(_coalesce(enrichment_colour.get("enabled"), vehicle_attribute_colour.get("enabled"), colour.get("enabled"), False)),
+                "backend": _normalize_backend_name(
+                    _coalesce(enrichment_colour.get("backend"), vehicle_attribute_colour.get("backend"), colour.get("backend")),
+                    default="florence",
+                ),
                 "run_only_when_vehicle_class": [
                     str(item).strip().upper()
-                    for item in vehicle_attribute_body_type.get("run_only_when_vehicle_class", ["CAR"])
+                    for item in _coalesce(
+                        enrichment_colour.get("run_only_when_vehicle_class"),
+                        vehicle_attribute_colour.get("run_only_when_vehicle_class"),
+                        colour.get("run_only_when_vehicle_class"),
+                        SUPPORTED_VEHICLE_CLASSES,
+                    )
                     if str(item).strip()
                 ],
-                "maximum_crops_per_track": max(
-                    1, int(vehicle_attribute_body_type.get("maximum_crops_per_track", vehicle_attributes.get("maximum_crops_per_track", track_evidence.get("final_crops_per_attribute", 3))))
+                "maximum_crops_per_track": max(1, int(_coalesce(enrichment_colour.get("maximum_crops_per_track"), vehicle_attribute_colour.get("maximum_crops_per_track"), colour.get("maximum_crops_per_track"), vehicle_attributes.get("maximum_crops_per_track"), track_evidence.get("final_crops_per_attribute"), 3))),
+                "minimum_crop_width": max(1, int(_coalesce(enrichment_colour.get("minimum_crop_width"), colour.get("minimum_crop_width"), 256))),
+                "minimum_crop_height": max(1, int(_coalesce(enrichment_colour.get("minimum_crop_height"), colour.get("minimum_crop_height"), 192))),
+                "allowed_labels": [str(item).strip().upper() for item in _coalesce(enrichment_colour.get("allowed_labels"), colour.get("allowed_labels"), []) if str(item).strip()],
+                "task_token": str(_coalesce(enrichment_colour.get("task_token"), vehicle_attribute_colour.get("task_token"), vehicle_attributes.get("task_token"), "<VQA>")).strip() or "<VQA>",
+                "prompt": str(_coalesce(enrichment_colour.get("prompt"), vehicle_attribute_colour.get("prompt"), vehicle_attributes.get("prompt"), "What colour is the vehicle?") or "What colour is the vehicle?"),
+                "inference_strategy": str(_coalesce(enrichment_colour.get("inference_strategy"), vehicle_attribute_colour.get("inference_strategy"), "all_selected")).strip() or "all_selected",
+                "generation": _normalize_generation_config(
+                    _coalesce(enrichment_colour.get("generation"), vehicle_attribute_colour.get("generation"), {}),
+                    max_new_tokens=int(_coalesce(enrichment_colour.get("max_new_tokens"), vehicle_attribute_colour.get("max_new_tokens"), florence_max_new_tokens, 16)),
+                    num_beams=int(_coalesce(enrichment_colour.get("num_beams"), vehicle_attribute_colour.get("num_beams"), florence_num_beams, 1)),
+                    use_cache=bool(_coalesce(enrichment_colour.get("use_cache"), vehicle_attribute_colour.get("use_cache"), True)),
                 ),
-                "minimum_original_width": max(1, int(vehicle_attribute_body_type.get("minimum_original_width", 120))),
-                "minimum_original_height": max(1, int(vehicle_attribute_body_type.get("minimum_original_height", 100))),
-                "preferred_original_width": max(1, int(vehicle_attribute_body_type.get("preferred_original_width", 240))),
-                "preferred_original_height": max(1, int(vehicle_attribute_body_type.get("preferred_original_height", 160))),
+                "async": {
+                    "enabled": bool(_coalesce(colour_async.get("enabled"), async_colour.get("enabled"), False)),
+                    "queue_size": max(1, int(_coalesce(colour_async.get("queue_size"), async_colour.get("queue_size"), 100))),
+                    "worker_count": max(1, int(_coalesce(colour_async.get("worker_count"), async_colour.get("worker_count"), 1))),
+                    "queue_put_timeout_seconds": float(_coalesce(colour_async.get("queue_put_timeout_seconds"), async_colour.get("queue_put_timeout_seconds"), 0.1)),
+                },
+            },
+            "body_type": {
+                "enabled": bool(_coalesce(enrichment_body_type.get("enabled"), vehicle_attribute_body_type.get("enabled"), body_type.get("enabled"), False)),
+                "backend": _normalize_backend_name(
+                    _coalesce(enrichment_body_type.get("backend"), vehicle_attribute_body_type.get("backend"), body_type.get("backend")),
+                    default="florence",
+                ),
+                "run_only_when_vehicle_class": [
+                    str(item).strip().upper()
+                    for item in _coalesce(enrichment_body_type.get("run_only_when_vehicle_class"), vehicle_attribute_body_type.get("run_only_when_vehicle_class"), body_type.get("run_only_when_vehicle_class"), ["CAR"])
+                    if str(item).strip()
+                ],
+                "maximum_crops_per_track": max(1, int(_coalesce(enrichment_body_type.get("maximum_crops_per_track"), vehicle_attribute_body_type.get("maximum_crops_per_track"), body_type.get("maximum_crops_per_track"), vehicle_attributes.get("maximum_crops_per_track"), track_evidence.get("final_crops_per_attribute"), 3))),
+                "minimum_crop_width": max(1, int(_coalesce(enrichment_body_type.get("minimum_crop_width"), body_type.get("minimum_crop_width"), 256))),
+                "minimum_crop_height": max(1, int(_coalesce(enrichment_body_type.get("minimum_crop_height"), body_type.get("minimum_crop_height"), 192))),
                 "allowed_labels": [
                     str(item).strip().upper()
-                    for item in vehicle_attribute_body_type.get("allowed_labels", BODY_TYPE_ALLOWED_LABELS)
+                    for item in _coalesce(enrichment_body_type.get("allowed_labels"), vehicle_attribute_body_type.get("allowed_labels"), body_type.get("allowed_labels"), BODY_TYPE_ALLOWED_LABELS)
                     if str(item).strip()
                 ],
+                "task_token": str(_coalesce(enrichment_body_type.get("task_token"), vehicle_attribute_body_type.get("task_token"), BODY_TYPE_TASK_PROMPT)).strip() or BODY_TYPE_TASK_PROMPT,
+                "prompt": str(_coalesce(enrichment_body_type.get("prompt"), vehicle_attribute_body_type.get("prompt"), BODY_TYPE_PROMPT_TEXT) or BODY_TYPE_PROMPT_TEXT),
+                "generation": _normalize_generation_config(
+                    _coalesce(enrichment_body_type.get("generation"), vehicle_attribute_body_type.get("generation"), {}),
+                    max_new_tokens=int(_coalesce(enrichment_body_type.get("max_new_tokens"), vehicle_attribute_body_type.get("max_new_tokens"), 16)),
+                    num_beams=int(_coalesce(enrichment_body_type.get("num_beams"), vehicle_attribute_body_type.get("num_beams"), 1)),
+                    use_cache=bool(_coalesce(enrichment_body_type.get("use_cache"), vehicle_attribute_body_type.get("use_cache"), True)),
+                ),
+                "car_only": bool(_coalesce(enrichment_body_type.get("car_only"), vehicle_attribute_body_type.get("car_only"), True)),
+                "minimum_original_width": max(1, int(_coalesce(enrichment_body_type.get("minimum_original_width"), vehicle_attribute_body_type.get("minimum_original_width"), 120))),
+                "minimum_original_height": max(1, int(_coalesce(enrichment_body_type.get("minimum_original_height"), vehicle_attribute_body_type.get("minimum_original_height"), 100))),
+                "preferred_original_width": max(1, int(_coalesce(enrichment_body_type.get("preferred_original_width"), vehicle_attribute_body_type.get("preferred_original_width"), 240))),
+                "preferred_original_height": max(1, int(_coalesce(enrichment_body_type.get("preferred_original_height"), vehicle_attribute_body_type.get("preferred_original_height"), 160))),
             },
-            "florence": dict(vehicle_attributes.get("florence", {}) or {}),
-        },
-        "make_model": {"enabled": bool(make_model.get("enabled", False))},
-        "plate": {
-            "detection_enabled": bool(plate.get("detection_enabled", False)),
-            "colour_enabled": bool(plate.get("colour_enabled", False)),
-            "recognition_enabled": bool(plate.get("recognition_enabled", False)),
-            "detector": dict(plate.get("detector", {}) or {}),
-            "ocr": dict(plate.get("ocr", {}) or {}),
-        },
-        "ocr": {
-            "enabled": bool(ocr.get("enabled", False)),
-            "run_only_when_plate_detected": bool(ocr.get("run_only_when_plate_detected", True)),
+            "make_model": {"enabled": bool(_coalesce(enrichment_make_model.get("enabled"), make_model.get("enabled"), False))},
+            "plate": {
+                "enabled": bool(_coalesce(enrichment_plate.get("enabled"), plate.get("enabled"), False) or _coalesce(enrichment_plate_detector.get("enabled"), plate.get("detection_enabled"), False) or _coalesce(enrichment_plate_colour.get("enabled"), plate.get("colour_enabled"), False) or _coalesce(enrichment_plate_ocr.get("enabled"), plate.get("recognition_enabled"), ocr.get("enabled"), False)),
+                "detector": {
+                    **dict(plate.get("detector", {}) or {}),
+                    **dict(enrichment_plate_detector or {}),
+                    "enabled": bool(_coalesce(enrichment_plate_detector.get("enabled"), plate.get("detection_enabled"), dict(plate.get("detector", {}) or {}).get("enabled"), False)),
+                },
+                "colour": {
+                    **dict(enrichment_plate_colour or {}),
+                    "enabled": bool(_coalesce(enrichment_plate_colour.get("enabled"), plate.get("colour_enabled"), False)),
+                },
+                "ocr": {
+                    **dict(ocr or {}),
+                    **dict(plate.get("ocr", {}) or {}),
+                    **dict(enrichment_plate_ocr or {}),
+                    "enabled": bool(_coalesce(enrichment_plate_ocr.get("enabled"), plate.get("recognition_enabled"), dict(plate.get("ocr", {}) or {}).get("enabled"), ocr.get("enabled"), False)),
+                    "backend": str(_coalesce(enrichment_plate_ocr.get("backend"), dict(plate.get("ocr", {}) or {}).get("backend"), "ocr_mukul_adapter")).strip() or "ocr_mukul_adapter",
+                    "task_token": str(_coalesce(enrichment_plate_ocr.get("task_token"), dict(plate.get("ocr", {}) or {}).get("task_token"), "<OCR>")).strip() or "<OCR>",
+                    "prompt": str(_coalesce(enrichment_plate_ocr.get("prompt"), dict(plate.get("ocr", {}) or {}).get("prompt"), "") or ""),
+                    "run_only_when_plate_detected": bool(_coalesce(enrichment_plate_ocr.get("run_only_when_plate_detected"), ocr.get("run_only_when_plate_detected"), True)),
+                    "florence": dict(_coalesce(enrichment_plate_ocr.get("florence"), dict(plate.get("ocr", {}) or {}).get("florence"), {} ) or {}),
+                },
+            },
         },
     }
-
-
+    normalized.update(_build_legacy_views(normalized))
+    normalized["__normalized__"] = True
+    return normalized
 @dataclass(slots=True, frozen=True)
 class PreparedTrackEnrichment:
     track: LocalTrack
@@ -302,31 +505,49 @@ class VehicleEnrichmentManager:
         self.logger = logger
         self.output_manager = output_manager
         self.config = normalize_vehicle_enrichment_config(config.get("vehicle_enrichment", {}))
+        for warning in list(self.config.get("deprecated_warnings", []) or []):
+            self.logger.warning(warning)
         self.enabled = bool(self.config["enabled"])
+        self.enrichment_config = dict(self.config.get("enrichment", {}) or {})
+        self.florence_config = dict(self.config.get("florence", {}) or {})
+        self.colour_config = dict(self.enrichment_config.get("colour", {}) or {})
+        self.body_type_config = dict(self.enrichment_config.get("body_type", {}) or {})
+        self.make_model_config = dict(self.enrichment_config.get("make_model", {}) or {})
+        self.plate_config = dict(self.enrichment_config.get("plate", {}) or {})
+        self.plate_ocr_config = dict(self.plate_config.get("ocr", {}) or {})
         self.image_size_policy: ImageSizePolicy = normalize_image_size_policy(
             config.get("vehicle_enrichment", {}).get("image_size_policy", {}),
-            fallback_body_type=self.config["body_type"],
-            fallback_colour=self.config["colour"],
+            fallback_body_type=self.body_type_config,
+            fallback_colour=self.colour_config,
             detection=dict(config.get("detection", {}) or {}),
         )
         self.adapter = EvidenceAdapter(self.config, output_manager, logger)
         self.quality_evaluator = EvidenceQualityEvaluator(normalize_quality_config(self.config), self.image_size_policy)
         self.attribute_aggregator = AttributeAggregator()
         shared_florence_backend_config = {
-            key: value
-            for key, value in self.config["shared_florence"].items()
-            if key in FlorenceBackendConfig.__annotations__
+            "enabled": bool(self.florence_config.get("enabled", False)),
+            "backend": str(self.florence_config.get("backend", "florence")),
+            "base_model_id": str(self.florence_config.get("base_model_id") or self.florence_config.get("model_id") or ""),
+            "processor_path": str(self.florence_config.get("processor_path") or self.florence_config.get("base_model_id") or self.florence_config.get("model_id") or ""),
+            "adapter_path": str(dict(self.florence_config.get("adapter", {}) or {}).get("path", "") or ""),
+            "adapter_enabled": bool(dict(self.florence_config.get("adapter", {}) or {}).get("enabled", False)),
+            "device": str(self.florence_config.get("device", "auto")).strip() or "auto",
+            "dtype": str(self.florence_config.get("dtype", "auto")).strip() or "auto",
+            "trust_remote_code": bool(self.florence_config.get("trust_remote_code", True)),
+            "attention_implementation": str(self.florence_config.get("attention_implementation", "eager")).strip() or "eager",
+            "max_new_tokens": int(self.florence_config.get("max_new_tokens", 128)),
+            "num_beams": int(self.florence_config.get("num_beams", 3)),
+            "use_cache": bool(self.florence_config.get("use_cache", False)),
+            "local_files_only": bool(self.florence_config.get("local_files_only", False)),
+            "lazy_load": bool(self.florence_config.get("lazy_load", True)),
         }
         self.florence_backend = FlorenceBackend(FlorenceBackendConfig(**shared_florence_backend_config), logger=logger)
         vehicle_attribute_florence_config = dict(shared_florence_backend_config)
-        vehicle_attribute_florence_config.update(
-            {
-                key: value
-                for key, value in dict(self.config["vehicle_attributes"].get("florence", {}) or {}).items()
-                if key in FlorenceBackendConfig.__annotations__
-            }
-        )
         vehicle_attribute_florence_config["adapter_enabled"] = False
+        vehicle_attribute_florence_config["adapter_path"] = ""
+        vehicle_attribute_florence_config["max_new_tokens"] = int(self.colour_config.get("generation", {}).get("max_new_tokens", vehicle_attribute_florence_config["max_new_tokens"]))
+        vehicle_attribute_florence_config["num_beams"] = int(self.colour_config.get("generation", {}).get("num_beams", vehicle_attribute_florence_config["num_beams"]))
+        vehicle_attribute_florence_config["use_cache"] = bool(self.colour_config.get("generation", {}).get("use_cache", True))
         self.vehicle_attribute_backend = FlorenceBackend(
             FlorenceBackendConfig(**vehicle_attribute_florence_config),
             logger=logger,
@@ -337,7 +558,7 @@ class VehicleEnrichmentManager:
         ocr_shared_config.update(
             {
                 key: value
-                for key, value in dict(self.config["plate"].get("ocr", {}).get("florence", {}) or {}).items()
+                for key, value in dict(self.plate_ocr_config.get("florence", {}) or {}).items()
                 if key in FlorenceBackendConfig.__annotations__
             }
         )
@@ -347,25 +568,43 @@ class VehicleEnrichmentManager:
             adapter_enabled_override=True,
         )
         self.body_type_classifier = VehicleBodyTypeClassifier(
-            self.config["body_type"],
+            self.body_type_config,
             backend=self.florence_backend,
             image_size_policy=self.image_size_policy,
             logger=logger,
         )
         self.colour_classifier = VehicleColourClassifier(
-            self.config["colour"],
+            self.colour_config,
             backend=self.florence_backend,
             image_size_policy=self.image_size_policy,
             logger=logger,
         )
-        self.make_model_classifier = VehicleMakeModelClassifier(self.config["make_model"])
-        self.plate_detector = PlateDetector(self.config["plate"])
-        self.plate_quality_validator = PlateQualityValidator(self.config["plate"])
-        self.plate_colour_classifier = PlateColourClassifier(self.config["plate"])
-        self.plate_ocr_engine = PlateOCREngine(self.config["plate"].get("ocr", self.config["ocr"]), backend=self.ocr_mukul_backend)
-        self.plate_result_aggregator = PlateResultAggregator(self.config["plate"])
+        self.make_model_classifier = VehicleMakeModelClassifier(self.make_model_config)
+        self.plate_detector = PlateDetector(self.plate_config)
+        self.plate_quality_validator = PlateQualityValidator(self.plate_config)
+        self.plate_colour_classifier = PlateColourClassifier(self.plate_config)
+        self.plate_ocr_engine = PlateOCREngine(self.plate_ocr_config, backend=self.ocr_mukul_backend)
+        self.plate_result_aggregator = PlateResultAggregator(self.plate_config)
+        vehicle_attribute_flow_config = {
+            "enabled": bool(self.enrichment_config.get("enabled", False)),
+            "backend": str(self.colour_config.get("backend", "florence")),
+            "maximum_crops_per_track": max(
+                int(self.colour_config.get("maximum_crops_per_track", 3)),
+                int(self.body_type_config.get("maximum_crops_per_track", 3)),
+            ),
+            "reuse_single_response_for_attributes": bool(self.enrichment_config.get("reuse_single_response_for_attributes", False)),
+            "task_token": str(self.colour_config.get("task_token", "<VQA>")),
+            "prompt": str(self.colour_config.get("prompt", "")),
+            "colour": dict(self.colour_config),
+            "body_type": dict(self.body_type_config),
+            "florence": {
+                **shared_florence_backend_config,
+                "adapter_enabled": False,
+                "adapter_path": "",
+            },
+        }
         self.vehicle_attribute_flow = BaseFlorenceVehicleAttributesFlow(
-            self.config["vehicle_attributes"],
+            vehicle_attribute_flow_config,
             backend=self.vehicle_attribute_backend,
             image_size_policy=self.image_size_policy,
             logger=logger,
@@ -373,16 +612,16 @@ class VehicleEnrichmentManager:
         self.ocr_mukul_flow = OCRMukulFlorenceFlow(
             {
                 **self.config["ocr_mukul"],
-                "enabled": bool(self.config["ocr_mukul"]["enabled"] or self.config["florence_mode"] in {"ocr_mukul", "comparison"}),
+                "enabled": bool(self.config["ocr_mukul"]["enabled"] or self.config["execution_mode"] in {"ocr_mukul", "comparison"}),
             },
             backend=self.ocr_mukul_backend,
             image_size_policy=self.image_size_policy,
             logger=logger,
         )
-        self.async_colour_config = dict(self.config.get("async_colour", {}) or {})
+        self.async_colour_config = dict(self.colour_config.get("async", {}) or {})
         self.async_colour_enabled = bool(
             self.async_colour_config.get("enabled", False)
-            and self.config["vehicle_attributes"]["enabled"]
+            and self.enrichment_config.get("enabled", False)
         )
         self.colour_queue_size = int(self.async_colour_config.get("queue_size", 100))
         self.colour_worker_count = int(self.async_colour_config.get("worker_count", 1))
@@ -506,7 +745,7 @@ class VehicleEnrichmentManager:
         payload["colour_inference_calls"] = int(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_colour_inference_calls", 0))
         payload["average_colour_inference_time_ms"] = float(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_average_colour_inference_time_ms", 0.0) or 0.0)
         payload["body_type_average_inference_ms"] = float(self.vehicle_attribute_flow.metrics.get("vehicle_attribute_average_body_inference_time_ms", 0.0) or 0.0)
-        payload["florence_model_instances"] = 1 if self.config["vehicle_attributes"]["enabled"] else 0
+        payload["florence_model_instances"] = 1 if self.enrichment_config.get("enabled", False) else 0
         payload["florence_concurrent_calls_possible"] = False if self.async_colour_enabled else False
         return payload
 
@@ -949,7 +1188,7 @@ class VehicleEnrichmentManager:
             body_type_florence_call_count=attribute_result.body_type_florence_call_count,
             body_type_valid_prediction_count=attribute_result.body_type_valid_prediction_count,
             body_type_failure_reason=attribute_result.body_type_failure_reason,
-            florence_mode=str(self.config["florence_mode"]).strip().lower(),
+            florence_mode=str(self.config["execution_mode"]).strip().lower(),
             adapter_loaded=attribute_result.adapter_loaded,
             selected_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
             crop_level_captions=crop_level_captions,
@@ -1076,14 +1315,14 @@ class VehicleEnrichmentManager:
             evidence_items=selected,
         )
 
-        florence_mode = str(self.config["florence_mode"]).strip().lower()
+        florence_mode = str(self.config["execution_mode"]).strip().lower()
         comparison_payload: dict[str, Any] | None = None
         crop_level_captions: list[dict[str, Any]] = []
         crop_level_body_types: list[dict[str, Any]] = []
         crop_level_colours: list[dict[str, Any]] = []
         caption_inference_count = 0
         adapter_loaded: bool | None = None
-        if self.config["vehicle_attributes"]["enabled"]:
+        if self.enrichment_config.get("enabled", False):
             attribute_result = self.vehicle_attribute_flow.classify(request)
             body_type_result = attribute_result.body_type
             colour_result = attribute_result.colour
@@ -1205,7 +1444,7 @@ class VehicleEnrichmentManager:
         self._metrics["colour_selected_crop_count"] += len(colour_result.predictions)
         if str(track.final_class or "").upper() == "CAR":
             self._metrics["car_tracks_total"] += 1
-            if self.config["vehicle_attributes"]["enabled"]:
+            if self.enrichment_config.get("enabled", False):
                 self._metrics["car_tracks_with_body_type_crop"] += int(attribute_result.body_type_selected_crop_count > 0)
                 self._metrics["car_tracks_sent_to_body_type_florence"] += int(attribute_result.body_type_florence_call_count > 0)
                 self._metrics["car_tracks_with_valid_body_type"] += int(str(body_type_result.label or "").upper() not in {"", "UNKNOWN"})
@@ -1290,7 +1529,7 @@ class VehicleEnrichmentManager:
         plate_aggregate = self.plate_result_aggregator.aggregate(plate_detection_result, plate_quality_result, plate_ocr_result)
         overall_status = (
             ENRICHMENT_STATUS_COMPLETED
-            if self.body_type_classifier.enabled or self.colour_classifier.enabled or self.config["vehicle_attributes"]["enabled"]
+            if self.body_type_classifier.enabled or self.colour_classifier.enabled or self.enrichment_config.get("enabled", False)
             else ENRICHMENT_STATUS_EVIDENCE_READY
         )
 
@@ -1317,12 +1556,12 @@ class VehicleEnrichmentManager:
             colour_selection_tier=colour_selection_tier,
             selected_body_type_crop_paths=[str(item.source_crop_path) for item in body_type_result.predictions if item.source_crop_path],
             selected_colour_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
-            body_type_eligible=attribute_result.body_type_eligible if self.config["vehicle_attributes"]["enabled"] else str(track.final_class or "").upper() == "CAR",
-            body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count if self.config["vehicle_attributes"]["enabled"] else 0,
-            body_type_selected_crop_count=attribute_result.body_type_selected_crop_count if self.config["vehicle_attributes"]["enabled"] else len(body_type_result.predictions),
-            body_type_florence_call_count=attribute_result.body_type_florence_call_count if self.config["vehicle_attributes"]["enabled"] else len(body_type_result.predictions),
-            body_type_valid_prediction_count=attribute_result.body_type_valid_prediction_count if self.config["vehicle_attributes"]["enabled"] else sum(1 for item in body_type_result.predictions if str(item.label or "").upper() not in {"", "UNKNOWN"}),
-            body_type_failure_reason=attribute_result.body_type_failure_reason if self.config["vehicle_attributes"]["enabled"] else (body_type_result.aggregation_reason or body_type_result.reason),
+            body_type_eligible=attribute_result.body_type_eligible if self.enrichment_config.get("enabled", False) else str(track.final_class or "").upper() == "CAR",
+            body_type_candidate_crop_count=attribute_result.body_type_candidate_crop_count if self.enrichment_config.get("enabled", False) else 0,
+            body_type_selected_crop_count=attribute_result.body_type_selected_crop_count if self.enrichment_config.get("enabled", False) else len(body_type_result.predictions),
+            body_type_florence_call_count=attribute_result.body_type_florence_call_count if self.enrichment_config.get("enabled", False) else len(body_type_result.predictions),
+            body_type_valid_prediction_count=attribute_result.body_type_valid_prediction_count if self.enrichment_config.get("enabled", False) else sum(1 for item in body_type_result.predictions if str(item.label or "").upper() not in {"", "UNKNOWN"}),
+            body_type_failure_reason=attribute_result.body_type_failure_reason if self.enrichment_config.get("enabled", False) else (body_type_result.aggregation_reason or body_type_result.reason),
             florence_mode=florence_mode,
             adapter_loaded=adapter_loaded,
             selected_crop_paths=[str(getattr(item, "vehicle_crop_path", "")) for item in selected if getattr(item, "vehicle_crop_path", None)],
@@ -1332,11 +1571,11 @@ class VehicleEnrichmentManager:
             final_body_type_reason=body_type_result.aggregation_reason or body_type_result.reason,
             final_colour_reason=colour_result.aggregation_reason or colour_result.reason,
             caption_inference_count=caption_inference_count,
-            vehicle_attribute_raw_responses=attribute_result.raw_responses if self.config["vehicle_attributes"]["enabled"] else [],
-            vehicle_attribute_selected_crop_paths=[str(item.get("vehicle_crop_path")) for item in (attribute_result.crop_level_rows if self.config["vehicle_attributes"]["enabled"] else [])],
-            vehicle_attribute_inference_count=caption_inference_count if self.config["vehicle_attributes"]["enabled"] else 0,
-            attribute_backend="base_florence" if self.config["vehicle_attributes"]["enabled"] else None,
-            plate_ocr_backend="ocr_mukul_adapter" if bool(self.config["plate"].get("ocr", {}).get("enabled", False)) else None,
+            vehicle_attribute_raw_responses=attribute_result.raw_responses if self.enrichment_config.get("enabled", False) else [],
+            vehicle_attribute_selected_crop_paths=[str(item.get("vehicle_crop_path")) for item in (attribute_result.crop_level_rows if self.enrichment_config.get("enabled", False) else [])],
+            vehicle_attribute_inference_count=caption_inference_count if self.enrichment_config.get("enabled", False) else 0,
+            attribute_backend="base_florence" if self.enrichment_config.get("enabled", False) else None,
+            plate_ocr_backend="ocr_mukul_adapter" if bool(self.plate_ocr_config.get("enabled", False)) else None,
             plate_ocr_attempted=False,
             plate_ocr_raw_response=None,
             plate_ocr_reason=plate_aggregate["reason"],

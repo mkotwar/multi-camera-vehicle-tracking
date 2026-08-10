@@ -1,2 +1,0 @@
-camera_id,local_track_id,vehicle_class,track_start_frame,track_end_frame,track_duration_frames,candidate_crops_seen,candidate_crops_retained,acceptable_crops,preferred_crops,selected_body_type_crops,selected_colour_crops,largest_original_crop_width,largest_original_crop_height,best_quality_score,body_type_status,body_type_label,colour_status,colour_label
-CAM_001,CAM_001:TRACK_1,CAR,0,2,3,3,0,0,0,,,0,0,0.0,disabled,UNKNOWN,disabled,UNKNOWN

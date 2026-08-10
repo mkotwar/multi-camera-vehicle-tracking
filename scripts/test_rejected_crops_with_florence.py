@@ -54,17 +54,42 @@ def load_yaml_config(config_path: Path) -> dict[str, Any]:
 
 def resolve_colour_diagnostic_settings(config: dict[str, Any]) -> dict[str, Any]:
     vehicle_enrichment = dict(config.get("vehicle_enrichment") or {})
+    canonical_florence = dict(vehicle_enrichment.get("florence") or {})
+    canonical_enrichment = dict(vehicle_enrichment.get("enrichment") or {})
+    canonical_colour = dict(canonical_enrichment.get("colour") or {})
     shared = dict(vehicle_enrichment.get("shared_florence") or {})
     vehicle_attributes = dict(vehicle_enrichment.get("vehicle_attributes") or {})
     colour = dict(vehicle_attributes.get("colour") or {})
     florence_override = dict(vehicle_attributes.get("florence") or {})
-    merged_florence = dict(shared)
-    merged_florence.update(florence_override)
-    merged_florence["adapter_enabled"] = False
-    merged_florence["adapter_path"] = ""
-    task_token = str(colour.get("task_token") or vehicle_attributes.get("task_token") or "<VQA>")
-    prompt = str(colour.get("prompt") or vehicle_attributes.get("prompt") or "What colour is the vehicle?")
-    generation = dict(colour.get("generation") or {})
+    if canonical_florence:
+        merged_florence = {
+            "enabled": bool(canonical_florence.get("enabled", True)),
+            "backend": str(canonical_florence.get("backend", "florence")),
+            "base_model_id": str(canonical_florence.get("base_model_id") or canonical_florence.get("model_id") or ""),
+            "processor_path": str(canonical_florence.get("processor_path") or canonical_florence.get("base_model_id") or canonical_florence.get("model_id") or ""),
+            "adapter_path": "",
+            "adapter_enabled": False,
+            "device": str(canonical_florence.get("device", "auto")),
+            "dtype": str(canonical_florence.get("dtype", "auto")),
+            "trust_remote_code": bool(canonical_florence.get("trust_remote_code", True)),
+            "attention_implementation": str(canonical_florence.get("attention_implementation", "eager")),
+            "max_new_tokens": int(canonical_florence.get("max_new_tokens", 16)),
+            "num_beams": int(canonical_florence.get("num_beams", 1)),
+            "use_cache": bool(canonical_florence.get("use_cache", True)),
+            "local_files_only": bool(canonical_florence.get("local_files_only", True)),
+            "lazy_load": bool(canonical_florence.get("lazy_load", True)),
+        }
+        task_token = str(canonical_colour.get("task_token") or "<VQA>")
+        prompt = str(canonical_colour.get("prompt") or "What colour is the vehicle?")
+        generation = dict(canonical_colour.get("generation") or {})
+    else:
+        merged_florence = dict(shared)
+        merged_florence.update(florence_override)
+        merged_florence["adapter_enabled"] = False
+        merged_florence["adapter_path"] = ""
+        task_token = str(colour.get("task_token") or vehicle_attributes.get("task_token") or "<VQA>")
+        prompt = str(colour.get("prompt") or vehicle_attributes.get("prompt") or "What colour is the vehicle?")
+        generation = dict(colour.get("generation") or {})
     if not generation:
         generation = {
             "max_new_tokens": int(merged_florence.get("max_new_tokens", 16)),
@@ -450,7 +475,11 @@ def print_summary(payload: dict[str, Any], track_id: str) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run an eligibility-bypass Florence diagnostic on rejected saved crops.")
     parser.add_argument("--run-dir", required=True, help="Path to an existing run directory containing 04_track_crops/track_crop_manifest.csv")
-    parser.add_argument("--config", default="config.validation_base_colour_only.yaml", help="YAML config to reuse Florence colour settings from.")
+    parser.add_argument(
+        "--config",
+        default="config/archive/config.validation_base_colour_only.yaml",
+        help="YAML config to reuse Florence colour settings from.",
+    )
     parser.add_argument("--track-id", required=True, help="Track id to test all saved crops for, e.g. CAM_001:TRACK_192")
     parser.add_argument("--sample-other-motorcycles", type=int, default=0, help="Number of additional rejected motorcycle tracks to sample.")
     return parser

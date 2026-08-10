@@ -18,8 +18,8 @@ from src.vehicle_enrichment.benchmarking.florence_base_vs_adapter import (
 
 
 def test_base_only_and_adapter_configs_are_correct() -> None:
-    base_cfg = yaml.safe_load(Path("config.validation_florence_base_only.yaml").read_text(encoding="utf-8"))
-    adapter_cfg = yaml.safe_load(Path("config.validation_florence_base_adapter.yaml").read_text(encoding="utf-8"))
+    base_cfg = yaml.safe_load(Path("config/archive/config.validation_florence_base_only.yaml").read_text(encoding="utf-8"))
+    adapter_cfg = yaml.safe_load(Path("config/archive/config.validation_florence_base_adapter.yaml").read_text(encoding="utf-8"))
 
     assert base_cfg["vehicle_enrichment"]["shared_florence"]["adapter_path"] is None
     assert base_cfg["vehicle_enrichment"]["shared_florence"]["adapter_enabled"] is False
