@@ -18,6 +18,18 @@ class RunRepository:
             return None
         return str(runs[0]["run_id"])
 
+    def resolve_run_id(self, run_id: str | None = None) -> str | None:
+        if run_id is None or str(run_id).strip() == "" or str(run_id).strip().lower() == "latest":
+            return self.latest_run_id()
+        candidate = str(run_id).strip()
+        return candidate if self._resolve_run_directory(candidate) is not None else None
+
+    def tracks_json_path(self, run_id: str) -> Path | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None:
+            return None
+        return run_dir / "tracks.json"
+
     def list_runs(self) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
         for run_dir in self._iter_run_directories():
@@ -100,6 +112,7 @@ class RunRepository:
                     track_id=track_id,
                     from_time=from_time,
                     to_time=to_time,
+                    include_evidence=False,
                 )
             )
         rows.sort(key=lambda item: (str(item.get("run_id", "")), str(item.get("camera_id", "")), str(item.get("track_id", ""))), reverse=True)
@@ -108,7 +121,7 @@ class RunRepository:
     def get_track(self, *, camera_id: str, track_id: str, run_id: str | None = None) -> dict[str, Any] | None:
         run_ids = self._resolve_run_ids(run_id)
         for candidate_run_id in run_ids:
-            for item in self._load_run_tracks(run_id=candidate_run_id):
+            for item in self._load_run_tracks(run_id=candidate_run_id, include_evidence=True):
                 if str(item.get("camera_id")) != camera_id:
                     continue
                 if str(item.get("track_id")) == track_id or str(item.get("local_track_id")) == track_id:
@@ -116,16 +129,18 @@ class RunRepository:
         return None
 
     def get_track_evidence(self, *, camera_id: str, track_id: str, run_id: str | None = None) -> list[dict[str, Any]]:
-        track = self.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
-        if track is None:
-            return []
-        return list(track.get("evidence", []) or [])
+        run_ids = self._resolve_run_ids(run_id)
+        for candidate_run_id in run_ids:
+            track = self.get_track(camera_id=camera_id, track_id=track_id, run_id=candidate_run_id)
+            if track is not None:
+                return list(track.get("evidence", []) or [])
+        return []
 
     def list_cameras(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
         resolved_run_id = self._resolve_single_run_id(run_id)
         if resolved_run_id is None:
             return []
-        tracks = self._load_run_tracks(run_id=resolved_run_id)
+        tracks = self._load_run_tracks(run_id=resolved_run_id, include_evidence=False)
         by_camera: dict[str, dict[str, Any]] = {}
         for item in tracks:
             camera_id = str(item.get("camera_id", "") or "")
@@ -210,6 +225,7 @@ class RunRepository:
         track_id: str | None = None,
         from_time: float | None = None,
         to_time: float | None = None,
+        include_evidence: bool = False,
     ) -> list[dict[str, Any]]:
         run_dir = self._resolve_run_directory(run_id)
         if run_dir is None:
@@ -235,7 +251,11 @@ class RunRepository:
             vehicle_class_value = enrichment.get("vehicle_class") or item.get("final_class")
             first_seen_seconds = self._coerce_float(item.get("first_timestamp_seconds"))
             last_seen_seconds = self._coerce_float(item.get("last_timestamp_seconds"))
-            evidence_rows = [self._normalize_evidence_item(run_id=run_id, payload=row) for row in list(enrichment.get("evidence_used", []) or [])]
+            evidence_rows = (
+                [self._normalize_evidence_item(run_id=run_id, payload=row) for row in list(enrichment.get("evidence_used", []) or [])]
+                if include_evidence
+                else []
+            )
             record = {
                 "run_id": run_id,
                 "camera_id": item.get("camera_id"),
@@ -260,8 +280,6 @@ class RunRepository:
                 "best_crop_parts": self._path_to_media_reference(run_id=run_id, path_value=self._best_crop_from_enrichment(enrichment)),
                 "available_crop_paths": list(enrichment.get("selected_crop_paths", []) or []),
                 "colour_resolution": self._build_colour_resolution(colour_payload),
-                "raw_track": item,
-                "raw_enrichment": enrichment,
             }
             if camera_id and str(record["camera_id"]) != camera_id:
                 continue

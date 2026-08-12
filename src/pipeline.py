@@ -170,12 +170,37 @@ def _validate_capture_zone_profile(profile: dict[str, Any], context: str) -> dic
     return normalized
 
 
+def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
+    if raw_tracking_roi is None:
+        raw_tracking_roi = {}
+    if not isinstance(raw_tracking_roi, dict):
+        raise ConfigurationError("tracking_roi must be a mapping.")
+    normalized = {
+        "enabled": bool(raw_tracking_roi.get("enabled", False)),
+        "top_fraction": float(raw_tracking_roi.get("top_fraction", 0.0)),
+        "bottom_fraction": float(raw_tracking_roi.get("bottom_fraction", 0.0)),
+        "anchor": str(raw_tracking_roi.get("anchor", "bottom_center")).strip() or "bottom_center",
+    }
+    if normalized["anchor"] != "bottom_center":
+        raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+    if not 0.0 <= normalized["top_fraction"] < 1.0:
+        raise ConfigurationError("tracking_roi.top_fraction must satisfy 0 <= top_fraction < 1.")
+    if not 0.0 <= normalized["bottom_fraction"] < 1.0:
+        raise ConfigurationError("tracking_roi.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
+    if normalized["top_fraction"] + normalized["bottom_fraction"] >= 1.0:
+        raise ConfigurationError("tracking_roi top_fraction + bottom_fraction must be less than 1.")
+    normalized["bottom_limit_fraction"] = 1.0 - normalized["bottom_fraction"]
+    return normalized
+
+
 def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     project = raw_config.get("project")
+    logging_section = raw_config.get("logging")
     input_section = raw_config.get("input")
     ingestion = raw_config.get("ingestion")
     detection = raw_config.get("detection")
     tracking = raw_config.get("tracking")
+    tracking_roi = raw_config.get("tracking_roi")
     evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
@@ -191,6 +216,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Missing or invalid 'detection' section.")
     if not isinstance(tracking, dict):
         raise ConfigurationError("Missing or invalid 'tracking' section.")
+    normalized_tracking_roi = _normalize_tracking_roi_config(tracking_roi)
     if evidence is not None and not isinstance(evidence, dict):
         raise ConfigurationError("Invalid 'evidence' section.")
     if not isinstance(visualization, dict):
@@ -201,6 +227,13 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Invalid 'debug_outputs' section.")
     if vehicle_enrichment is not None and not isinstance(vehicle_enrichment, dict):
         raise ConfigurationError("Invalid 'vehicle_enrichment' section.")
+    if logging_section is None:
+        logging_section = {}
+    if not isinstance(logging_section, dict):
+        raise ConfigurationError("Invalid 'logging' section.")
+    progress_every_frames = int(logging_section.get("progress_every_frames", 100))
+    if progress_every_frames < 1:
+        raise ConfigurationError("logging.progress_every_frames must be at least 1.")
 
     cameras = input_section.get("cameras")
     if not isinstance(cameras, list):
@@ -471,6 +504,9 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             "environment": str(project.get("environment", "development")).strip() or "development",
             "log_level": str(project.get("log_level", "INFO")).strip() or "INFO",
         },
+        "logging": {
+            "progress_every_frames": progress_every_frames,
+        },
         "input": {
             "cameras": normalized_cameras,
             "max_frames_per_camera": max_frames_per_camera,
@@ -524,6 +560,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
                 if str(item).strip()
             ],
         },
+        "tracking_roi": normalized_tracking_roi,
         "lifecycle": {
             "minimum_observations": lifecycle_minimum_observations,
             "maximum_lost_frames": lifecycle_maximum_lost_frames,
@@ -790,6 +827,10 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         detections_by_class: dict[str, int] = {}
         bbox_quality_diagnostics: list[dict[str, Any]] = []
         raw_detections = 0
+        raw_yolo_detections = 0
+        bbox_quality_accepted_detections = 0
+        roi_eligible_detections = 0
+        roi_filtered_detections = 0
         accepted_detections = 0
         rejected_detections = 0
         rejected_by_reason: dict[str, int] = {}
@@ -800,6 +841,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         saved_detected_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         saved_tracked_frames_by_camera: dict[str, int] = {camera_id: 0 for camera_id in frames_by_camera}
         enrichment_results = []
+        progress_every_frames = int(validated_config.get("logging", {}).get("progress_every_frames", 100))
         detection_batch_config = dict(validated_config["detection"].get("batch", {}) or {})
         detection_batch_enabled = bool(detection_batch_config.get("enabled", False))
         detection_batch_max_size = int(detection_batch_config.get("max_size", 1) or 1)
@@ -847,7 +889,17 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 metadata.processed_frames += 1
                 detections_by_camera[packet.camera_id] += len(result.detections)
                 tracked_observations_by_camera[packet.camera_id] += len(result.tracked_detections)
+                raw_yolo_detections += int(getattr(result, "raw_yolo_detection_count", len(result.bbox_quality_diagnostics)))
                 raw_detections += len(result.bbox_quality_diagnostics)
+                bbox_quality_accepted_detections += int(
+                    getattr(
+                        result,
+                        "bbox_quality_accepted_detection_count",
+                        sum(1 for item in result.bbox_quality_diagnostics if item.accepted_by_bbox_quality),
+                    )
+                )
+                roi_eligible_detections += int(getattr(result, "roi_eligible_detection_count", len(result.detections)))
+                roi_filtered_detections += int(getattr(result, "roi_filtered_detection_count", 0))
                 accepted_detections += len(result.detections)
                 bbox_quality_diagnostics.extend(asdict(item) for item in result.bbox_quality_diagnostics)
                 for detection_item in result.detections:
@@ -953,7 +1005,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                     len(result.tracked_detections),
                     len(batch_packets),
                 )
-                if frames_by_camera[packet.camera_id] % 10 == 0:
+                if frames_by_camera[packet.camera_id] % progress_every_frames == 0:
                     logger.info(
                         "%s processed_frames=%s detections=%s tracked=%s",
                         packet.camera_id,
@@ -1052,8 +1104,13 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "detection_batch_size_configured": detection_batch_max_size if detection_batch_enabled else 1,
             "detection_batch_wait_ms_configured": detection_batch_max_wait_ms if detection_batch_enabled else 0.0,
             "isolation_mode": validated_config["tracking"]["isolation_mode"],
+            "tracking_roi": validated_config["tracking_roi"],
             "processed_frames_by_camera": frames_by_camera,
             "detections_by_camera": detections_by_camera,
+            "raw_yolo_detections": raw_yolo_detections,
+            "bbox_quality_accepted_detections": bbox_quality_accepted_detections,
+            "roi_eligible_detections": roi_eligible_detections,
+            "roi_filtered_detections": roi_filtered_detections,
             "tracked_observations_by_camera": tracked_observations_by_camera,
             "detections_by_class": detections_by_class,
             "unique_native_track_ids_by_camera": {camera_id: sorted(values) for camera_id, values in unique_native_track_ids_by_camera.items()},
@@ -1331,6 +1388,10 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         output_manager.save_bbox_quality_metrics(
             {
                 "raw_detections": raw_detections,
+                "raw_yolo_detections": raw_yolo_detections,
+                "bbox_quality_accepted_detections": bbox_quality_accepted_detections,
+                "roi_eligible_detections": roi_eligible_detections,
+                "roi_filtered_detections": roi_filtered_detections,
                 "accepted_detections": accepted_detections,
                 "rejected_detections": rejected_detections,
                 "rejected_by_reason": rejected_by_reason,
@@ -1376,6 +1437,11 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "frames_by_camera": metrics["frames_by_camera"],
                 "frames_by_worker": metrics["frames_by_worker"],
                 "detections_by_camera": detections_by_camera,
+                "raw_yolo_detections": raw_yolo_detections,
+                "bbox_quality_accepted_detections": bbox_quality_accepted_detections,
+                "roi_eligible_detections": roi_eligible_detections,
+                "roi_filtered_detections": roi_filtered_detections,
+                "tracking_roi": validated_config["tracking_roi"],
                 "tracked_observations_by_camera": tracked_observations_by_camera,
                 "saved_raw_frames_by_camera": metrics["saved_raw_frames_by_camera"],
                 "saved_detected_frames_by_camera": saved_detected_frames_by_camera,
@@ -1460,6 +1526,17 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             },
         )
         logger.info(
+            "Run summary run_id=%s processed_frames=%s completed_tracks=%s discarded_tracks=%s queue_full_events=%s colour_completed=%s failures=%s runtime_seconds=%.3f",
+            output_manager.run_id,
+            metadata.processed_frames,
+            metadata.completed_tracks,
+            sum(int(value) for value in lifecycle_metrics["tracks_discarded_by_camera"].values()),
+            metrics["queue_full_events"],
+            int(vehicle_enrichment_manager.metrics.get("colour_tracks_processed", 0) or 0),
+            metadata.error_count,
+            float(metrics.get("duration_seconds", 0.0)),
+        )
+        logger.debug(
             "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s track_crop_manifest=%s capture_zone_index=%s capture_zone_metrics=%s motorcycle_geometry_report=%s vehicle_pipeline_trace=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
             tracks_path,
             observations_path,

@@ -71,6 +71,18 @@ class BBoxQualityProfile:
     edge_mode: str
 
 
+@dataclass(slots=True, frozen=True)
+class TrackingROIConfig:
+    enabled: bool
+    top_fraction: float
+    bottom_fraction: float
+    anchor: str
+
+    @property
+    def bottom_limit_fraction(self) -> float:
+        return 1.0 - self.bottom_fraction
+
+
 @dataclass(slots=True)
 class DetectorTrackerResult:
     detections: list[Detection]
@@ -86,6 +98,10 @@ class DetectorTrackerResult:
     result_routing_ms: float = 0.0
     tracker_update_ms: float = 0.0
     total_detection_ms: float = 0.0
+    raw_yolo_detection_count: int = 0
+    bbox_quality_accepted_detection_count: int = 0
+    roi_eligible_detection_count: int = 0
+    roi_filtered_detection_count: int = 0
 
 
 class VehicleDetectorTracker:
@@ -174,6 +190,7 @@ class VehicleDetectorTracker:
         self.show_rejected_boxes = bool(visualization_config.get("show_rejected_boxes", False))
         self.capture_zone_visualization_enabled = bool(dict(visualization_config.get("capture_zone", {}) or {}).get("enabled", False))
         self.capture_zone_config = dict(dict(self.config.get("evidence", {}) or {}).get("capture_zone", {}) or {})
+        self.tracking_roi = self._parse_tracking_roi_config(dict(self.config.get("tracking_roi", {}) or {}))
         self._model_loader = model_loader or YOLO
         self._tracker_factory = tracker_factory or self._create_tracker
         self._model: Any | None = None
@@ -201,6 +218,10 @@ class VehicleDetectorTracker:
             "yolo_frames_processed": 0,
             "yolo_inference_time_total_ms": 0.0,
             "yolo_inference_time_per_batch_ms": [],
+            "raw_yolo_detections": 0,
+            "bbox_quality_accepted_detections": 0,
+            "roi_eligible_detections": 0,
+            "roi_filtered_detections": 0,
             "preprocess_times_ms": [],
             "model_inference_stage_times_ms": [],
             "postprocess_times_ms": [],
@@ -278,8 +299,14 @@ class VehicleDetectorTracker:
                 raw_result,
                 inference_wall_time_ms=per_frame_inference_time_ms,
             )
+            roi_eligible_detections = self.filter_detections_by_tracking_roi(packet, accepted_detections)
+            roi_filtered_detection_count = len(accepted_detections) - len(roi_eligible_detections)
+            self._metrics["raw_yolo_detections"] += len(raw_detections)
+            self._metrics["bbox_quality_accepted_detections"] += len(accepted_detections)
+            self._metrics["roi_eligible_detections"] += len(roi_eligible_detections)
+            self._metrics["roi_filtered_detections"] += roi_filtered_detection_count
             tracker_started_at = time.perf_counter()
-            tracked_detections = self.track_detections(packet, accepted_detections, raw_result=raw_result)
+            tracked_detections = self.track_detections(packet, roi_eligible_detections, raw_result=raw_result)
             tracker_update_ms = (time.perf_counter() - tracker_started_at) * 1000.0
             self._metrics["inference_times_ms"].append(per_frame_inference_time_ms)
             self._metrics["preprocess_times_ms"].append(stage_timings["preprocess_ms"])
@@ -295,7 +322,7 @@ class VehicleDetectorTracker:
                 packet.camera_id,
                 packet.frame_number,
                 len(raw_detections),
-                len(accepted_detections),
+                len(roi_eligible_detections),
                 rejected_detection_count,
                 len(tracked_detections),
                 [item.tracker_id for item in tracked_detections],
@@ -305,7 +332,7 @@ class VehicleDetectorTracker:
             )
             results.append(
                 DetectorTrackerResult(
-                    detections=accepted_detections,
+                    detections=roi_eligible_detections,
                     tracked_detections=tracked_detections,
                     bbox_quality_diagnostics=bbox_quality_diagnostics,
                     detected_frame=self.annotate_detected_frame(packet.frame, accepted_detections, bbox_quality_diagnostics),
@@ -318,6 +345,10 @@ class VehicleDetectorTracker:
                     result_routing_ms=stage_timings["result_routing_ms"],
                     tracker_update_ms=tracker_update_ms,
                     total_detection_ms=stage_timings["total_detection_ms"],
+                    raw_yolo_detection_count=len(raw_detections),
+                    bbox_quality_accepted_detection_count=len(accepted_detections),
+                    roi_eligible_detection_count=len(roi_eligible_detections),
+                    roi_filtered_detection_count=roi_filtered_detection_count,
                 )
             )
         return results
@@ -397,7 +428,7 @@ class VehicleDetectorTracker:
                 iou=self.iou_threshold,
                 imgsz=self.image_size,
                 device=self.runtime_device_info.yolo_device,
-                half=self.runtime_device_info.yolo_half,
+                quantize=self.runtime_device_info.yolo_quantize,
                 agnostic_nms=self.agnostic_nms,
                 verbose=False,
             )[0]
@@ -415,7 +446,7 @@ class VehicleDetectorTracker:
                         conf=self.confidence_threshold,
                         imgsz=self.image_size,
                         device=self.runtime_device_info.yolo_device,
-                        half=self.runtime_device_info.yolo_half,
+                        quantize=self.runtime_device_info.yolo_quantize,
                         verbose=False,
                     )
                 else:
@@ -424,7 +455,7 @@ class VehicleDetectorTracker:
                         conf=self.confidence_threshold,
                         imgsz=self.image_size,
                         device=self.runtime_device_info.yolo_device,
-                        half=self.runtime_device_info.yolo_half,
+                        quantize=self.runtime_device_info.yolo_quantize,
                         verbose=False,
                     )
             else:
@@ -434,7 +465,7 @@ class VehicleDetectorTracker:
                     iou=self.iou_threshold,
                     imgsz=self.image_size,
                     device=self.runtime_device_info.yolo_device,
-                    half=self.runtime_device_info.yolo_half,
+                    quantize=self.runtime_device_info.yolo_quantize,
                     agnostic_nms=self.agnostic_nms,
                     verbose=False,
                 )
@@ -493,6 +524,23 @@ class VehicleDetectorTracker:
             if diagnostic.accepted_by_bbox_quality:
                 accepted_detections.append(detection)
         return accepted_detections, diagnostics
+
+    def filter_detections_by_tracking_roi(self, packet: FramePacket, detections: list[Detection]) -> list[Detection]:
+        if not self.tracking_roi.enabled:
+            return list(detections)
+        return [detection for detection in detections if self.is_detection_inside_tracking_roi(packet, detection)]
+
+    def is_detection_inside_tracking_roi(self, packet: FramePacket, detection: Detection) -> bool:
+        if not self.tracking_roi.enabled:
+            return True
+        if self.tracking_roi.anchor != "bottom_center":
+            raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+        frame_height = int(packet.source_frame_height or packet.frame.shape[0])
+        roi_top = int(frame_height * self.tracking_roi.top_fraction)
+        roi_bottom = int(frame_height * self.tracking_roi.bottom_limit_fraction)
+        _x1, _y1, _x2, y2 = detection.bbox_xyxy
+        anchor_y = float(y2)
+        return float(roi_top) <= anchor_y <= float(roi_bottom)
 
     def track_detections(self, packet: FramePacket, detections: list[Detection], raw_result: Any | None = None) -> list[TrackedDetection]:
         if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK:
@@ -564,6 +612,7 @@ class VehicleDetectorTracker:
 
     def annotate_tracked_frame(self, frame: np.ndarray, camera_id: str, tracked_detections: list[TrackedDetection]) -> np.ndarray:
         annotated = frame.copy()
+        self._draw_tracking_roi_overlay(annotated)
         self._draw_capture_zone_overlay(annotated, camera_id, tracked_detections)
         for tracked in tracked_detections:
             x1, y1, x2, y2 = [int(round(value)) for value in tracked.bbox_xyxy]
@@ -594,6 +643,20 @@ class VehicleDetectorTracker:
             trigger_x = int(round((tracked.bbox_xyxy[0] + tracked.bbox_xyxy[2]) / 2.0))
             trigger_y = int(round(tracked.bbox_xyxy[3]))
             cv2.circle(frame, (trigger_x, trigger_y), 4, (0, 90, 255), -1)
+
+    def _draw_tracking_roi_overlay(self, frame: np.ndarray) -> None:
+        if not self.tracking_roi.enabled:
+            return
+        height, width = frame.shape[:2]
+        roi_top = int(height * self.tracking_roi.top_fraction)
+        roi_bottom = int(height * self.tracking_roi.bottom_limit_fraction)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, roi_top), (width - 1, roi_bottom), (60, 180, 255), -1)
+        cv2.addWeighted(overlay, 0.08, frame, 0.92, 0.0, frame)
+        cv2.line(frame, (0, roi_top), (width - 1, roi_top), (60, 180, 255), 2)
+        cv2.line(frame, (0, roi_bottom), (width - 1, roi_bottom), (60, 180, 255), 2)
+        cv2.putText(frame, f"ROI START - {self.tracking_roi.top_fraction:.0%}", (12, max(24, roi_top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
+        cv2.putText(frame, f"ROI END - {self.tracking_roi.bottom_limit_fraction:.0%}", (12, min(height - 8, roi_bottom + 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
 
     def build_detected_label(self, detection: Detection) -> str:
         return f"{self._normalize_class_name(detection.class_name).upper()} {detection.confidence:.2f}"
@@ -641,6 +704,27 @@ class VehicleDetectorTracker:
             self.dtype,
             self.allowed_classes,
             self.bbox_quality_enabled,
+        )
+
+    @staticmethod
+    def _parse_tracking_roi_config(payload: dict[str, Any]) -> TrackingROIConfig:
+        enabled = bool(payload.get("enabled", False))
+        top_fraction = float(payload.get("top_fraction", 0.0))
+        bottom_fraction = float(payload.get("bottom_fraction", 0.0))
+        anchor = str(payload.get("anchor", "bottom_center")).strip() or "bottom_center"
+        if anchor != "bottom_center":
+            raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+        if not 0.0 <= top_fraction < 1.0:
+            raise ConfigurationError("tracking_roi.top_fraction must satisfy 0 <= top_fraction < 1.")
+        if not 0.0 <= bottom_fraction < 1.0:
+            raise ConfigurationError("tracking_roi.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
+        if top_fraction + bottom_fraction >= 1.0:
+            raise ConfigurationError("tracking_roi top_fraction + bottom_fraction must be less than 1.")
+        return TrackingROIConfig(
+            enabled=enabled,
+            top_fraction=top_fraction,
+            bottom_fraction=bottom_fraction,
+            anchor=anchor,
         )
 
     def _resolve_model_path(self, raw_path: Any) -> Path:
@@ -985,7 +1069,7 @@ class VehicleDetectorTracker:
                     conf=self.confidence_threshold,
                     imgsz=self.image_size,
                     device=self.runtime_device_info.yolo_device,
-                    half=self.runtime_device_info.yolo_half,
+                    quantize=self.runtime_device_info.yolo_quantize,
                     verbose=False,
                 )[0]
             return self._model.predict(
@@ -993,7 +1077,7 @@ class VehicleDetectorTracker:
                 conf=self.confidence_threshold,
                 imgsz=self.image_size,
                 device=self.runtime_device_info.yolo_device,
-                half=self.runtime_device_info.yolo_half,
+                quantize=self.runtime_device_info.yolo_quantize,
                 verbose=False,
             )[0]
         except Exception as exc:

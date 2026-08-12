@@ -191,7 +191,7 @@ def run_profile_inference(
             "iou": tracker.iou_threshold,
             "imgsz": tracker.image_size,
             "device": tracker.runtime_device_info.yolo_device,
-            "half": tracker.runtime_device_info.yolo_half,
+            "quantize": tracker.runtime_device_info.yolo_quantize,
             "agnostic_nms": tracker.agnostic_nms,
             "verbose": False,
         }
@@ -204,7 +204,7 @@ def run_profile_inference(
             "iou": tracker.iou_threshold,
             "imgsz": tracker.image_size,
             "device": tracker.runtime_device_info.yolo_device,
-            "half": tracker.runtime_device_info.yolo_half,
+            "quantize": tracker.runtime_device_info.yolo_quantize,
             "verbose": False,
         }
         return tracker._model.predict(**predict_kwargs)[0], predict_kwargs  # noqa: SLF001
@@ -214,7 +214,7 @@ def run_profile_inference(
             "conf": tracker.confidence_threshold,
             "imgsz": tracker.image_size,
             "device": tracker.runtime_device_info.yolo_device,
-            "half": tracker.runtime_device_info.yolo_half,
+            "quantize": tracker.runtime_device_info.yolo_quantize,
             "verbose": False,
         }
         model = tracker._model  # noqa: SLF001
@@ -225,7 +225,7 @@ def run_profile_inference(
             "conf": tracker.confidence_threshold,
             "imgsz": tracker.image_size,
             "device": tracker.runtime_device_info.yolo_device,
-            "half": tracker.runtime_device_info.yolo_half,
+            "quantize": tracker.runtime_device_info.yolo_quantize,
             "verbose": False,
         }
         return model.predict(**predict_kwargs)[0], predict_kwargs

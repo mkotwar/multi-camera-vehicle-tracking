@@ -39,7 +39,7 @@ detection:
   iou_threshold: 0.45
   image_size: 1024
   agnostic_nms: false
-  allowed_class_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  allowed_class_ids: [0, 1, 2, 3, 4]
   bbox_quality:
     enabled: false
     minimum_width_pixels: 60

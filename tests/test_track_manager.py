@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,25 @@ def test_confidence_sums_class_counts_and_weighted_winner_are_correct() -> None:
     assert track.class_confidence_sums["car"] == pytest.approx(2.25)
     assert track.final_class == "car"
     assert track.final_class_reason == FINAL_CLASS_WEIGHTED_MAJORITY
+
+
+def test_mixed_raw_class_logs_once_and_summarizes_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    logger = logging.getLogger("track-manager-mixed-class-test")
+    logger.handlers.clear()
+    logger.propagate = True
+    logger.setLevel(logging.DEBUG)
+    manager = TrackManager(_config(), logger)
+
+    with caplog.at_level(logging.DEBUG):
+        manager.update_frame("CAM_001", 0, [_tracked(frame_number=0, raw_class_name="car", confidence=0.80)])
+        manager.update_frame("CAM_001", 1, [_tracked(frame_number=1, raw_class_name="truck", confidence=0.75)])
+        manager.update_frame("CAM_001", 2, [_tracked(frame_number=2, raw_class_name="truck", confidence=0.70)])
+        manager.update_frame("CAM_001", 3, [_tracked(frame_number=3, raw_class_name="bus", confidence=0.65)])
+        manager.flush_camera("CAM_001")
+
+    assert caplog.text.count("track mixed raw classes detected") == 1
+    assert "track mixed raw classes summary" in caplog.text
+    assert "track has mixed raw classes" not in caplog.text
 
 
 def test_low_winner_ratio_insufficient_observations_and_tied_result_return_unknown() -> None:

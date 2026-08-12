@@ -358,6 +358,28 @@ def test_validate_config_accepts_null_max_frames_per_camera(tmp_path: Path) -> N
     validated = _validate_config(_load_raw_config(config_path), config_path)
 
     assert validated["input"]["max_frames_per_camera"] is None
+    assert validated["logging"]["progress_every_frames"] == 100
+
+
+def test_validate_config_accepts_progress_logging_interval(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=4)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=4,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["logging"] = {"progress_every_frames": 2}
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    validated = _validate_config(_load_raw_config(config_path), config_path)
+
+    assert validated["logging"]["progress_every_frames"] == 2
 
 
 def test_validate_config_rejects_invalid_max_frames_per_camera_values(tmp_path: Path) -> None:
@@ -399,6 +421,31 @@ def test_validate_config_rejects_invalid_capture_zone_ratios(tmp_path: Path) -> 
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
     with pytest.raises(Exception, match="capture_zone"):
+        _validate_config(_load_raw_config(config_path), config_path)
+
+
+def test_validate_config_rejects_invalid_tracking_roi_fractions(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config_invalid_tracking_roi.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["tracking_roi"] = {
+        "enabled": True,
+        "top_fraction": 0.70,
+        "bottom_fraction": 0.35,
+        "anchor": "bottom_center",
+    }
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(Exception, match="tracking_roi"):
         _validate_config(_load_raw_config(config_path), config_path)
 
 

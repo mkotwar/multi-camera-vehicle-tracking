@@ -91,6 +91,8 @@ class MultiCameraIngestionManager:
         self._scheduler_index = 0
         self._last_scheduled_camera_id: str | None = None
         self._current_same_camera_streak = 0
+        self._queue_full_log_interval_seconds = 10.0
+        self._queue_full_warning_state: dict[str, dict[str, Any]] = {}
         self.metrics: dict[str, Any] = {
             "configured_camera_count": len(self.input_config.get("cameras", []) or []),
             "enabled_camera_count": len(self.enabled_cameras),
@@ -180,6 +182,7 @@ class MultiCameraIngestionManager:
             started = datetime.fromisoformat(started_at)
             completed = datetime.fromisoformat(completed_at)
             self.metrics["duration_seconds"] = max(0.0, (completed - started).total_seconds())
+        self._log_unrecovered_queue_full_events()
 
     def all_workers_stopped(self) -> bool:
         return all(not thread.is_alive() for thread in self.worker_threads) and not self.scheduler_thread.is_alive()
@@ -376,17 +379,99 @@ class MultiCameraIngestionManager:
                         int(self.metrics["maximum_observed_queue_size"]),
                         queue_size,
                     )
+                self._record_queue_recovered(packet.camera_id)
                 return True
             except queue.Full:
                 with self._metrics_lock:
                     self.metrics["queue_full_events"] += 1
-                self.logger.warning(
-                    "Frame queue full camera=%s frame=%s queue_size=%s",
-                    packet.camera_id,
-                    packet.frame_number,
-                    self.frame_queue.qsize(),
-                )
+                    queue_full_events = int(self.metrics["queue_full_events"])
+                self._record_queue_full(packet, queue_full_events)
         return False
+
+    def _record_queue_full(self, packet: FramePacket, queue_full_events: int) -> None:
+        now = time.monotonic()
+        queue_size = self.frame_queue.qsize()
+        with self._metrics_lock:
+            state = self._queue_full_warning_state.setdefault(
+                packet.camera_id,
+                {
+                    "active": False,
+                    "started_at": now,
+                    "last_logged_at": 0.0,
+                    "events": 0,
+                    "suppressed": 0,
+                    "last_queue_size": queue_size,
+                },
+            )
+            if not bool(state["active"]):
+                state["active"] = True
+                state["started_at"] = now
+                state["events"] = 0
+                state["suppressed"] = 0
+            state["events"] = int(state["events"]) + 1
+            state["last_queue_size"] = queue_size
+            should_log = float(state["last_logged_at"]) == 0.0 or now - float(state["last_logged_at"]) >= self._queue_full_log_interval_seconds
+            if should_log:
+                suppressed = int(state["suppressed"])
+                state["suppressed"] = 0
+                state["last_logged_at"] = now
+            else:
+                state["suppressed"] = int(state["suppressed"]) + 1
+                suppressed = 0
+        if should_log:
+            self.logger.warning(
+                "Frame queue full camera=%s queue_size=%s queue_full_events=%s suppressed_since_last=%s",
+                packet.camera_id,
+                queue_size,
+                queue_full_events,
+                suppressed,
+            )
+
+    def _record_queue_recovered(self, camera_id: str) -> None:
+        now = time.monotonic()
+        with self._metrics_lock:
+            state = self._queue_full_warning_state.get(camera_id)
+            if not state or not bool(state["active"]):
+                return
+            events = int(state["events"])
+            suppressed = int(state["suppressed"])
+            stall_seconds = max(0.0, now - float(state["started_at"]))
+            state["active"] = False
+            state["events"] = 0
+            state["suppressed"] = 0
+            state["last_logged_at"] = 0.0
+        self.logger.info(
+            "Frame queue recovered camera=%s queue_full_events=%s suppressed_warnings=%s stall_seconds=%.1f",
+            camera_id,
+            events,
+            suppressed,
+            stall_seconds,
+        )
+
+    def _log_unrecovered_queue_full_events(self) -> None:
+        summaries: list[tuple[str, int, int, float]] = []
+        now = time.monotonic()
+        with self._metrics_lock:
+            for camera_id, state in self._queue_full_warning_state.items():
+                if not bool(state.get("active")):
+                    continue
+                summaries.append(
+                    (
+                        camera_id,
+                        int(state.get("events", 0)),
+                        int(state.get("suppressed", 0)),
+                        max(0.0, now - float(state.get("started_at", now))),
+                    )
+                )
+                state["active"] = False
+        for camera_id, events, suppressed, stall_seconds in summaries:
+            self.logger.info(
+                "Frame queue stopped while full camera=%s queue_full_events=%s suppressed_warnings=%s stall_seconds=%.1f",
+                camera_id,
+                events,
+                suppressed,
+                stall_seconds,
+            )
 
     def _mark_camera_completed(self, camera_id: str) -> None:
         with self._scheduler_condition:

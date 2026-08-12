@@ -266,6 +266,43 @@ def test_bounded_queue_timeout_does_not_deadlock_and_all_workers_stop_and_releas
     assert manager.get_metrics()["per_camera_buffer_size"] == 2
 
 
+def test_queue_full_warning_is_rate_limited_and_recovery_is_summarized(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    video_a = _create_test_video(tmp_path / "a.mp4", frame_count=1)
+    logger = logging.getLogger("ingestion-queue-full-test")
+    logger.handlers.clear()
+    logger.propagate = True
+    logger.setLevel(logging.DEBUG)
+    manager = MultiCameraIngestionManager(
+        _build_config(
+            [{"camera_id": "CAM_001", "source_type": "video", "source": str(video_a), "enabled": True}],
+            frame_queue_size=1,
+        ),
+        logger,
+    )
+    packet = FramePacket(
+        camera_id="CAM_001",
+        frame_number=98,
+        timestamp_seconds=1.0,
+        source_fps=30.0,
+        frame=np.zeros((16, 16, 3), dtype=np.uint8),
+        source_frame_width=16,
+        source_frame_height=16,
+        worker_id=0,
+        captured_at="2026-08-07T00:00:00+00:00",
+        source_type="video",
+    )
+    manager._queue_full_log_interval_seconds = 60.0
+
+    with caplog.at_level(logging.INFO):
+        manager._record_queue_full(packet, queue_full_events=1)
+        manager._record_queue_full(packet, queue_full_events=2)
+        manager._record_queue_full(packet, queue_full_events=3)
+        manager._record_queue_recovered("CAM_001")
+
+    assert caplog.text.count("Frame queue full camera=CAM_001") == 1
+    assert "Frame queue recovered camera=CAM_001 queue_full_events=3 suppressed_warnings=2" in caplog.text
+
+
 def test_null_max_frames_per_camera_allows_full_video_processing(tmp_path: Path) -> None:
     video_a = _create_test_video(tmp_path / "a.mp4", frame_count=6)
     manager = MultiCameraIngestionManager(

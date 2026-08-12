@@ -30,6 +30,7 @@ from .schemas import (
     VehicleColourResult,
 )
 from .shared.florence_backend import FlorenceBackend
+from .taxonomy import SUPPORTED_VEHICLE_CLASSES
 
 
 @dataclass(slots=True, frozen=True)
@@ -73,6 +74,11 @@ class BaseFlorenceVehicleAttributesFlow:
         self.body_type_enabled = bool(body_type_section.get("enabled", True))
         self.colour_task_token = str(colour_section.get("task_token", self.task_token)).strip() or self.task_token
         self.colour_prompt = str(colour_section.get("prompt", self.prompt) or "")
+        self.colour_vehicle_classes = {
+            str(item).strip().upper()
+            for item in colour_section.get("run_only_when_vehicle_class", SUPPORTED_VEHICLE_CLASSES)
+            if str(item).strip()
+        }
         self.colour_inference_strategy = str(colour_section.get("inference_strategy", "all_selected")).strip().lower() or "all_selected"
         if self.colour_inference_strategy not in {"all_selected", "adaptive_fallback"}:
             raise ValueError("vehicle_enrichment.vehicle_attributes.colour.inference_strategy must be all_selected or adaptive_fallback.")
@@ -120,6 +126,7 @@ class BaseFlorenceVehicleAttributesFlow:
             "vehicle_attribute_skipped_missing_crop": 0,
             "vehicle_attribute_tracks_with_fallback_selected": 0,
             "vehicle_attribute_tracks_with_zero_florence_calls": 0,
+            "vehicle_attribute_colour_ineligible_tracks": 0,
             "vehicle_attribute_non_car_body_type_skips": 0,
             "vehicle_attribute_body_type_no_usable_crop_skips": 0,
             "colour_tracks_processed": 0,
@@ -155,12 +162,14 @@ class BaseFlorenceVehicleAttributesFlow:
                 body_type_valid_prediction_count=0,
                 body_type_failure_reason="disabled",
             )
+        colour_eligible = self._colour_eligible(request.vehicle_class)
         self._metrics["gpu_memory_before_attribute_load_mb"] = float(self.backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
-        self.backend.load()
-        self._metrics["vehicle_attribute_base_loads"] += 1
-        self._metrics["gpu_memory_after_attribute_load_mb"] = float(self.backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
-        if self.backend.adapter_active:
-            raise RuntimeError("Vehicle attribute flow must use base Florence without the OCR_MUKUL adapter.")
+        if colour_eligible or self.body_type_enabled:
+            self.backend.load()
+            self._metrics["vehicle_attribute_base_loads"] += 1
+            self._metrics["gpu_memory_after_attribute_load_mb"] = float(self.backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
+            if self.backend.adapter_active:
+                raise RuntimeError("Vehicle attribute flow must use base Florence without the OCR_MUKUL adapter.")
 
         selected_items = list(request.evidence_items[: self.maximum_crops_per_track])
         if any(str(getattr(item, "colour_selection_tier", "") or "") == "low_resolution_fallback" for item in selected_items):
@@ -173,52 +182,60 @@ class BaseFlorenceVehicleAttributesFlow:
         for item in selected_items:
             self._ensure_crop_row(crop_rows_by_key, request, item)
         colour_resolved_rank: int | None = None
-        for index, item in enumerate(selected_items, start=1):
-            try:
-                colour_payload = self._infer_single_crop(
-                    item,
-                    task_token=self.colour_task_token,
-                    prompt=self.colour_prompt,
-                    generation=self.colour_generation,
-                )
-            except Exception as exc:
-                colour_predictions.append(self._error_prediction(item, "vehicle_colour", str(exc)))
-                self._metrics["vehicle_attribute_skipped_missing_crop"] += int("could not be read" in str(exc).lower() or "does not exist" in str(exc).lower())
+        if not colour_eligible:
+            self._metrics["vehicle_attribute_colour_ineligible_tracks"] += 1
+            for item in selected_items:
                 row = crop_rows_by_key[(str(item.vehicle_crop_path), int(item.frame_number))]
                 row["colour_status"] = "skipped"
-                row["colour_reason"] = "missing_crop"
-                row["crop_available"] = False
-                row["crop_skip_reason"] = "missing_crop"
-                continue
-            parsed = parse_caption_attributes(str(colour_payload["post_processed_response"]))
-            raw_responses.append(str(colour_payload["raw_generated_text"]))
-            colour_status, colour_reason = assess_response_quality(
-                str(colour_payload["raw_generated_text"]),
-                parsed,
-                attribute_task="colour",
-                prompt=self.colour_prompt,
-            )
-            colour_prediction = self._prediction_from_parsed(item, parsed, colour_payload, "vehicle_colour", status=colour_status, reason=colour_reason)
-            colour_predictions.append(colour_prediction)
-            self._metrics["vehicle_attribute_inference_calls"] += 1
-            self._metrics["vehicle_attribute_colour_inference_calls"] += 1
-            self._metrics["colour_florence_calls_total"] += 1
-            self._metrics["vehicle_attribute_total_colour_inference_ms"] += float(colour_payload["inference_time_ms"])
-            local_inference_count += 1
-            self._count_response_reason(colour_reason)
-            row = crop_rows_by_key[(str(item.vehicle_crop_path), int(item.frame_number))]
-            row["colour_task_token"] = self.colour_task_token
-            row["colour_prompt"] = self.colour_prompt
-            row["colour_effective_processor_text"] = f"{self.colour_task_token}{self.colour_prompt}"
-            row["colour_raw_response"] = colour_payload["raw_generated_text"]
-            row["colour_post_processed_response"] = colour_payload["post_processed_response"]
-            row["parsed_colour"] = colour_prediction.label
-            row["colour_status"] = colour_status
-            row["colour_reason"] = colour_prediction.reason
-            row["colour_inference_time_ms"] = colour_payload["inference_time_ms"]
-            if self.colour_inference_strategy == "adaptive_fallback" and self._is_valid_colour_prediction(colour_prediction):
-                colour_resolved_rank = index
-                break
+                row["colour_reason"] = "vehicle_class_not_eligible"
+                row["crop_skip_reason"] = "vehicle_class_not_eligible"
+        else:
+            for index, item in enumerate(selected_items, start=1):
+                try:
+                    colour_payload = self._infer_single_crop(
+                        item,
+                        task_token=self.colour_task_token,
+                        prompt=self.colour_prompt,
+                        generation=self.colour_generation,
+                    )
+                except Exception as exc:
+                    colour_predictions.append(self._error_prediction(item, "vehicle_colour", str(exc)))
+                    self._metrics["vehicle_attribute_skipped_missing_crop"] += int("could not be read" in str(exc).lower() or "does not exist" in str(exc).lower())
+                    row = crop_rows_by_key[(str(item.vehicle_crop_path), int(item.frame_number))]
+                    row["colour_status"] = "skipped"
+                    row["colour_reason"] = "missing_crop"
+                    row["crop_available"] = False
+                    row["crop_skip_reason"] = "missing_crop"
+                    continue
+                parsed = parse_caption_attributes(str(colour_payload["post_processed_response"]))
+                raw_responses.append(str(colour_payload["raw_generated_text"]))
+                colour_status, colour_reason = assess_response_quality(
+                    str(colour_payload["raw_generated_text"]),
+                    parsed,
+                    attribute_task="colour",
+                    prompt=self.colour_prompt,
+                )
+                colour_prediction = self._prediction_from_parsed(item, parsed, colour_payload, "vehicle_colour", status=colour_status, reason=colour_reason)
+                colour_predictions.append(colour_prediction)
+                self._metrics["vehicle_attribute_inference_calls"] += 1
+                self._metrics["vehicle_attribute_colour_inference_calls"] += 1
+                self._metrics["colour_florence_calls_total"] += 1
+                self._metrics["vehicle_attribute_total_colour_inference_ms"] += float(colour_payload["inference_time_ms"])
+                local_inference_count += 1
+                self._count_response_reason(colour_reason)
+                row = crop_rows_by_key[(str(item.vehicle_crop_path), int(item.frame_number))]
+                row["colour_task_token"] = self.colour_task_token
+                row["colour_prompt"] = self.colour_prompt
+                row["colour_effective_processor_text"] = f"{self.colour_task_token}{self.colour_prompt}"
+                row["colour_raw_response"] = colour_payload["raw_generated_text"]
+                row["colour_post_processed_response"] = colour_payload["post_processed_response"]
+                row["parsed_colour"] = colour_prediction.label
+                row["colour_status"] = colour_status
+                row["colour_reason"] = colour_prediction.reason
+                row["colour_inference_time_ms"] = colour_payload["inference_time_ms"]
+                if self.colour_inference_strategy == "adaptive_fallback" and self._is_valid_colour_prediction(colour_prediction):
+                    colour_resolved_rank = index
+                    break
 
         if self.colour_inference_strategy == "adaptive_fallback" and colour_resolved_rank is not None:
             for item in selected_items[colour_resolved_rank:]:
@@ -284,7 +301,9 @@ class BaseFlorenceVehicleAttributesFlow:
                 )
         else:
             body_label, body_reason, body_agreement, body_weight = VEHICLE_BODY_TYPE_UNKNOWN, "disabled", None, 0.0
-        if self.colour_inference_strategy == "adaptive_fallback":
+        if not colour_eligible:
+            colour_label, colour_reason, colour_agreement, colour_weight = VEHICLE_COLOUR_UNKNOWN, "vehicle_class_not_eligible", None, 0.0
+        elif self.colour_inference_strategy == "adaptive_fallback":
             colour_label, colour_reason, colour_agreement, colour_weight = self._adaptive_colour_result(colour_predictions)
         else:
             colour_label, colour_reason, colour_agreement, colour_weight = aggregate_predictions(
@@ -357,10 +376,11 @@ class BaseFlorenceVehicleAttributesFlow:
             colour=VehicleColourResult(
                 label=colour_label,
                 predictions=colour_predictions,
-                status="completed",
+                status="completed" if colour_eligible else "skipped",
                 source="base_florence",
                 model=self.backend.model_identifier,
                 adapter_active=False,
+                reason=None if colour_eligible else colour_reason,
                 aggregation_reason=colour_reason,
                 agreement_score=colour_agreement,
                 accumulated_quality_weight=colour_weight,
@@ -627,6 +647,14 @@ class BaseFlorenceVehicleAttributesFlow:
                 continue
             selected.append(item)
         return selected if selected else ordered[: self.body_type_maximum_crops_per_track]
+
+    def _colour_eligible(self, vehicle_class: str) -> bool:
+        normalized = str(vehicle_class or "UNKNOWN").strip().upper()
+        if not self.colour_enabled:
+            return False
+        if normalized == VEHICLE_COLOUR_UNKNOWN:
+            return False
+        return normalized in self.colour_vehicle_classes
 
     def _ensure_crop_row(self, rows: dict[tuple[str, int], dict[str, Any]], request: TrackEnrichmentRequest, item: Any) -> None:
         key = (str(item.vehicle_crop_path), int(item.frame_number))

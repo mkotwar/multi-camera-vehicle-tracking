@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 from .models import ConfigurationError
@@ -9,10 +10,20 @@ from .models import ConfigurationError
 VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
+def configure_warning_presentation() -> None:
+    warnings.filterwarnings(
+        "once",
+        message=r".*ByteTrack.*deprecated since v0\.28\.0.*",
+        category=FutureWarning,
+        append=False,
+    )
+
+
 def setup_logging(run_directory: Path, log_level: str = "INFO") -> logging.Logger:
     normalized_level = str(log_level).upper()
     if normalized_level not in VALID_LOG_LEVELS:
         raise ConfigurationError(f"Invalid log level: {log_level}")
+    configure_warning_presentation()
 
     run_directory.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("pipeline")

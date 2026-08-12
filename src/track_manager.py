@@ -55,6 +55,7 @@ class TrackManager:
         self._completed_tracks: list[LocalTrack] = []
         self._discarded_tracks: list[LocalTrack] = []
         self._last_frame_by_camera: dict[str, int] = {}
+        self._mixed_class_logged_tracks: set[str] = set()
         self._metrics: dict[str, Any] = {
             "tracks_created_by_camera": {},
             "tracks_completed_by_camera": {},
@@ -236,7 +237,7 @@ class TrackManager:
         self._promote_if_ready(track)
         self._metrics["tracks_created_by_camera"][detection.camera_id] = self._metrics["tracks_created_by_camera"].get(detection.camera_id, 0) + 1
         self._metrics["observations_by_camera"][detection.camera_id] = self._metrics["observations_by_camera"].get(detection.camera_id, 0) + 1
-        self.logger.info(
+        self.logger.debug(
             "track created camera=%s native_tracker_id=%s local_track_id=%s status=%s",
             detection.camera_id,
             detection.tracker_id,
@@ -267,8 +268,13 @@ class TrackManager:
         track.class_counts[class_name] = track.class_counts.get(class_name, 0) + 1
         track.class_confidence_sums[class_name] = track.class_confidence_sums.get(class_name, 0.0) + float(detection.confidence)
         self._metrics["observations_by_camera"][detection.camera_id] = self._metrics["observations_by_camera"].get(detection.camera_id, 0) + 1
-        if len(track.class_counts) > 1:
-            self.logger.warning("track has mixed raw classes local_track_id=%s classes=%s", track.local_track_id, sorted(track.class_counts))
+        if len(track.class_counts) > 1 and track.local_track_id not in self._mixed_class_logged_tracks:
+            self._mixed_class_logged_tracks.add(track.local_track_id)
+            self.logger.debug(
+                "track mixed raw classes detected local_track_id=%s class_counts=%s",
+                track.local_track_id,
+                dict(sorted(track.class_counts.items())),
+            )
         self._promote_if_ready(track)
         self.logger.debug(
             "track updated camera=%s frame=%s native_tracker_id=%s local_track_id=%s status=%s->%s lost_frames=%s observations=%s",
@@ -333,7 +339,7 @@ class TrackManager:
                 self._metrics["end_of_stream_completed_count"] += 1
             if completion_reason == COMPLETION_REASON_LOST_TIMEOUT:
                 self._metrics["lost_timeout_completed_count"] += 1
-            self.logger.info(
+            self.logger.debug(
                 "track completed camera=%s local_track_id=%s observations=%s final_class=%s reason=%s completion_reason=%s",
                 track.camera_id,
                 track.local_track_id,
@@ -347,7 +353,7 @@ class TrackManager:
             track.completion_reason = COMPLETION_REASON_INSUFFICIENT_OBSERVATIONS if completion_reason != COMPLETION_REASON_END_OF_STREAM else completion_reason
             self._discarded_tracks.append(track)
             self._metrics["tracks_discarded_by_camera"][track.camera_id] = self._metrics["tracks_discarded_by_camera"].get(track.camera_id, 0) + 1
-            self.logger.info(
+            self.logger.debug(
                 "track discarded camera=%s local_track_id=%s observations=%s final_class=%s reason=%s completion_reason=%s",
                 track.camera_id,
                 track.local_track_id,
@@ -358,8 +364,16 @@ class TrackManager:
             )
         self._metrics["final_class_counts"][track.final_class] = self._metrics["final_class_counts"].get(track.final_class, 0) + 1
         self._metrics["final_class_reason_counts"][track.final_class_reason] = self._metrics["final_class_reason_counts"].get(track.final_class_reason, 0) + 1
+        if len(track.class_counts) > 1:
+            self.logger.debug(
+                "track mixed raw classes summary local_track_id=%s class_counts=%s final_class=%s reason=%s",
+                track.local_track_id,
+                dict(sorted(track.class_counts.items())),
+                track.final_class,
+                track.final_class_reason,
+            )
         if track.final_class == self.unknown_class_name:
-            self.logger.warning(
+            self.logger.debug(
                 "final class returned UNKNOWN local_track_id=%s reason=%s",
                 track.local_track_id,
                 track.final_class_reason,

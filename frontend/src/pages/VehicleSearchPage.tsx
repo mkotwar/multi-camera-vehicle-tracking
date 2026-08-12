@@ -1,10 +1,13 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useSearchParams } from "react-router-dom";
+import { ApiError } from "../api/client";
 import { fetchFilterOptions } from "../api/filters";
 import { fetchTracks } from "../api/tracks";
+import { searchVehicles } from "../api/vehicleSearch";
 import type { FilterOptions } from "../types/filters";
 import type { TrackRecord } from "../types/track";
+import type { VehicleSearchResponse } from "../types/vehicleSearch";
 import { formatVideoTime, parseVideoTime } from "../utils/time";
 
 type Filters = {
@@ -49,6 +52,10 @@ export function VehicleSearchPage() {
   const [options, setOptions] = useState<FilterOptions>({ runs: ["latest"], cameras: [], vehicle_classes: [], colours: [] });
   const [currentPage, setCurrentPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  const [nlQuery, setNlQuery] = useState("");
+  const [nlResult, setNlResult] = useState<VehicleSearchResponse | null>(null);
+  const [nlError, setNlError] = useState<string | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
 
   const load = async (next = filters) => {
     setError(null);
@@ -85,6 +92,23 @@ export function VehicleSearchPage() {
     void load();
   };
 
+  const onNaturalLanguageSearch = async (event: FormEvent) => {
+    event.preventDefault();
+    const query = nlQuery.trim();
+    if (!query || isSearching) return;
+    setIsSearching(true);
+    setNlError(null);
+    setNlResult(null);
+    try {
+      const result = await searchVehicles({ query, run_id: filters.run_id || "latest" });
+      setNlResult(result);
+    } catch (searchError) {
+      setNlError(describeVehicleSearchError(searchError));
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
   const onClear = () => {
     setFilters(DEFAULT_FILTERS);
     void fetchFilterOptions(DEFAULT_FILTERS.run_id).then(setOptions);
@@ -104,6 +128,24 @@ export function VehicleSearchPage() {
             <p className="muted">Filter real tracks from saved runs or the current runtime.</p>
           </div>
         </div>
+
+        <form className="nl-search-form" onSubmit={onNaturalLanguageSearch}>
+          <label>
+            <span>Natural-language search</span>
+            <input
+              value={nlQuery}
+              onChange={(event) => setNlQuery(event.target.value)}
+              placeholder='Search vehicles, e.g. "Show white cars between 5 and 10 seconds"'
+              aria-label="Natural-language vehicle search"
+            />
+          </label>
+          <button type="submit" disabled={isSearching || !nlQuery.trim()} aria-label="Run natural-language vehicle search">
+            {isSearching ? "Searching..." : "Search"}
+          </button>
+        </form>
+
+        {nlError ? <div className="empty-state search-error">{nlError}</div> : null}
+        {nlResult ? <VehicleSearchResult result={nlResult} /> : null}
 
         <form className="filter-grid enhanced-filters" onSubmit={onSubmit}>
           <label>
@@ -217,4 +259,59 @@ export function VehicleSearchPage() {
       </section>
     </section>
   );
+}
+
+function VehicleSearchResult({ result }: { result: VehicleSearchResponse }) {
+  const total = typeof result.analytics_result.total === "number" ? result.analytics_result.total : null;
+  const vehicleIds = result.analytics_result.vehicle_ids ?? [];
+  const classesPresent = result.analytics_result.vehicle_classes_present ?? [];
+  const coloursPresent = result.analytics_result.colours_present ?? [];
+  return (
+    <section className="nl-search-result" aria-label="Vehicle search result">
+      <p className="search-answer">{result.response}</p>
+      {total !== null ? <strong>Matches: {total}</strong> : null}
+      {vehicleIds.length > 0 ? (
+        <div className="search-id-list">
+          {vehicleIds.map((vehicleId) => (
+            <code key={vehicleId}>{vehicleId}</code>
+          ))}
+        </div>
+      ) : null}
+      {classesPresent.length > 0 ? <p className="muted">Classes: {classesPresent.join(", ")}</p> : null}
+      {coloursPresent.length > 0 ? <p className="muted">Colours: {coloursPresent.join(", ")}</p> : null}
+      <details className="parsed-query-details">
+        <summary>Parsed query</summary>
+        <dl>
+          <div><dt>Intent</dt><dd>{result.parsed_query.intent}</dd></div>
+          <div><dt>Class</dt><dd>{result.parsed_query.vehicle_class ?? "Any"}</dd></div>
+          <div><dt>Colour</dt><dd>{result.parsed_query.colour ?? "Any"}</dd></div>
+          <div><dt>Start</dt><dd>{formatOptionalNumber(result.parsed_query.start_time)}</dd></div>
+          <div><dt>End</dt><dd>{formatOptionalNumber(result.parsed_query.end_time)}</dd></div>
+          <div><dt>Camera</dt><dd>{result.parsed_query.camera_id ?? "Any"}</dd></div>
+          <div><dt>Run</dt><dd>{result.run_id}</dd></div>
+        </dl>
+      </details>
+    </section>
+  );
+}
+
+function formatOptionalNumber(value: number | null): string {
+  return typeof value === "number" ? value.toFixed(1) : "Any";
+}
+
+function describeVehicleSearchError(error: unknown): string {
+  if (error instanceof ApiError) {
+    const detail = error.detail as { detail?: unknown } | null;
+    const payload = typeof detail?.detail === "object" && detail.detail !== null ? detail.detail as { error?: string; detail?: string } : null;
+    if (error.status === 400 && payload?.error === "query_not_understood") {
+      return payload.detail || "I couldn't understand that query. Try specifying a vehicle type, colour, or time range.";
+    }
+    if (error.status === 404) {
+      return "Run not found.";
+    }
+    if (error.status >= 500) {
+      return "Vehicle search is temporarily unavailable.";
+    }
+  }
+  return error instanceof Error ? error.message : "Vehicle search failed.";
 }

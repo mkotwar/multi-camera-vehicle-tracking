@@ -156,8 +156,9 @@ def _config(
     detection_backend: str = "legacy_clean",
     tracking_backend: str = "supervision_bytetrack",
     image_size: int | None = None,
+    tracking_roi: dict | None = None,
 ) -> dict:
-    return {
+    config = {
         "detection": {
             "backend": detection_backend,
             "model_path": model_path,
@@ -184,6 +185,9 @@ def _config(
             "show_rejected_boxes": show_rejected_boxes,
         },
     }
+    if tracking_roi is not None:
+        config["tracking_roi"] = tracking_roi
+    return config
 
 
 def _build_tracker(
@@ -196,6 +200,7 @@ def _build_tracker(
     detection_backend: str = "legacy_clean",
     tracking_backend: str = "supervision_bytetrack",
     image_size: int | None = None,
+    tracking_roi: dict | None = None,
 ):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
@@ -217,12 +222,24 @@ def _build_tracker(
             detection_backend=detection_backend,
             tracking_backend=tracking_backend,
             image_size=image_size,
+            tracking_roi=tracking_roi,
         ),
         _logger(),
         model_loader=lambda _: model,
         tracker_factory=tracker_factory,
     )
     return detector_tracker, model, created_trackers
+
+
+def _roi_config(**overrides) -> dict:
+    config = {
+        "enabled": True,
+        "top_fraction": 0.40,
+        "bottom_fraction": 0.35,
+        "anchor": "bottom_center",
+    }
+    config.update(overrides)
+    return config
 
 
 def _build_profiled_tracker(tmp_path: Path, *, bbox_quality: dict):
@@ -392,7 +409,7 @@ def test_resolved_device_is_passed_to_yolo_inference(monkeypatch, tmp_path: Path
     )
     tracker.process_frame(_frame_packet())
     assert model.predict_calls[0]["device"] == 0
-    assert model.predict_calls[0]["half"] is True
+    assert model.predict_calls[0]["quantize"] == 16
 
 
 def test_allowed_classes_are_filtered_and_empty_results_do_not_crash(tmp_path: Path) -> None:
@@ -466,6 +483,77 @@ def test_normal_vehicle_bbox_is_accepted(tmp_path: Path) -> None:
     assert result.bbox_quality_diagnostics[0].accepted_by_bbox_quality is True
     assert result.bbox_quality_diagnostics[0].rejection_reason is None
     assert len(created_trackers[0].calls[0].xyxy) == 1
+
+
+@pytest.mark.parametrize(
+    ("y2", "expected_eligible"),
+    [
+        (287.0, False),
+        (288.0, True),
+        (360.0, True),
+        (468.0, True),
+        (469.0, False),
+    ],
+)
+def test_tracking_roi_uses_bottom_center_vertical_boundaries(tmp_path: Path, y2: float, expected_eligible: bool) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_roi_config(),
+    )
+    model.next_result = FakeResult(xyxy=[[100, y2 - 40, 200, y2]], cls=[0], conf=[0.9])
+    result = detector_tracker.process_frame(_frame_packet(width=1280, height=720))
+    assert len(result.detections) == (1 if expected_eligible else 0)
+    assert result.roi_eligible_detection_count == (1 if expected_eligible else 0)
+    assert result.roi_filtered_detection_count == (0 if expected_eligible else 1)
+    assert len(created_trackers[0].calls[0].xyxy) == (1 if expected_eligible else 0)
+
+
+def test_tracking_roi_disabled_preserves_all_accepted_detections(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_roi_config(enabled=False),
+    )
+    model.next_result = FakeResult(
+        xyxy=[[100, 10, 200, 100], [100, 300, 200, 360], [100, 650, 200, 710]],
+        cls=[0, 0, 0],
+        conf=[0.9, 0.9, 0.9],
+    )
+    result = detector_tracker.process_frame(_frame_packet(width=1280, height=720))
+    assert len(result.detections) == 3
+    assert result.roi_eligible_detection_count == 3
+    assert result.roi_filtered_detection_count == 0
+    assert len(created_trackers[0].calls[0].xyxy) == 3
+
+
+@pytest.mark.parametrize(
+    ("height", "inside_y2", "above_y2", "below_y2"),
+    [
+        (720, 360.0, 287.0, 469.0),
+        (1080, 540.0, 431.0, 703.0),
+    ],
+)
+def test_tracking_roi_scales_with_frame_resolution(tmp_path: Path, height: int, inside_y2: float, above_y2: float, below_y2: float) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_roi_config(),
+    )
+    model.next_result = FakeResult(
+        xyxy=[
+            [100, above_y2 - 30, 200, above_y2],
+            [100, inside_y2 - 30, 200, inside_y2],
+            [100, below_y2 - 30, 200, below_y2],
+        ],
+        cls=[0, 0, 0],
+        conf=[0.9, 0.9, 0.9],
+    )
+    result = detector_tracker.process_frame(_frame_packet(width=1280, height=height))
+    assert len(result.detections) == 1
+    assert result.detections[0].bbox_xyxy[3] == pytest.approx(inside_y2)
+    assert result.roi_filtered_detection_count == 2
+    assert created_trackers[0].calls[0].xyxy.tolist() == [[100.0, inside_y2 - 30, 200.0, inside_y2]]
 
 
 @pytest.mark.parametrize(

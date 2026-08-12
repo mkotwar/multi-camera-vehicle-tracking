@@ -128,6 +128,109 @@ def _build_run(tmp_path: Path) -> str:
     return run_id
 
 
+def _build_vehicle_search_run(tmp_path: Path) -> str:
+    run_id = "20260812_113742"
+    run_dir = tmp_path / run_id
+    _write_json(run_dir / "summary.json", {"run_id": run_id, "status": "COMPLETED", "processed_frames": 600})
+    _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 1})
+    car_ids = {
+        "TRACK_1": "BLACK",
+        "TRACK_2": "SILVER",
+        "TRACK_3": "BLACK",
+        "TRACK_4": "BLACK",
+        "TRACK_5": "BLACK",
+        "TRACK_11": "BLACK",
+        "TRACK_13": "WHITE",
+        "TRACK_19": "WHITE",
+        "TRACK_26": "WHITE",
+        "TRACK_28": "WHITE",
+        "TRACK_30": "BLACK",
+        "TRACK_33": "WHITE",
+        "TRACK_34": "BLACK",
+        "TRACK_35": "BLACK",
+        "TRACK_42": "WHITE",
+        "TRACK_43": "BLACK",
+        "TRACK_46": "BLACK",
+    }
+    motorcycle_ids = {
+        "TRACK_7": "WHITE",
+        "TRACK_6": "BLACK",
+        "TRACK_10": "RED",
+        "TRACK_9": "RED",
+        "TRACK_14": "BLACK",
+        "TRACK_18": "BLACK",
+        "TRACK_17": "BLACK",
+        "TRACK_24": "RED",
+        "TRACK_25": "BLACK",
+        "TRACK_23": "BLACK",
+        "TRACK_27": "BLACK",
+        "TRACK_31": "BLACK",
+        "TRACK_32": "BLACK",
+        "TRACK_38": "BLACK",
+        "TRACK_39": "BLUE",
+        "TRACK_40": "RED",
+        "TRACK_36": "BLACK",
+        "TRACK_45": "BLACK",
+    }
+    between_ids = {"TRACK_14", "TRACK_16", "TRACK_15", "TRACK_18", "TRACK_17", "TRACK_19", "TRACK_24", "TRACK_25", "TRACK_23"}
+    tracks = []
+    enrichments = []
+
+    def add(track_id: str, vehicle_class: str, colour: str) -> None:
+        in_window = track_id in between_ids
+        crop = run_dir / "05_florence_selected_crops" / "CAM_001" / track_id / "frame_000006_MIDDLE.jpg"
+        crop.parent.mkdir(parents=True, exist_ok=True)
+        crop.write_bytes(f"{track_id} crop".encode("utf-8"))
+        tracks.append(
+            {
+                "local_track_id": f"CAM_001:{track_id}",
+                "camera_id": "CAM_001",
+                "status": "COMPLETED",
+                "final_class": vehicle_class,
+                "first_timestamp_seconds": 6.0 if in_window else 20.0,
+                "last_timestamp_seconds": 8.0 if in_window else 25.0,
+                "observation_count": 10,
+                "vehicle_enrichment": {
+                    "vehicle_colour": {
+                        "label": colour,
+                        "status": "completed" if colour != "UNKNOWN" else "skipped",
+                    }
+                },
+            }
+        )
+        enrichments.append(
+            {
+                "local_track_id": f"CAM_001:{track_id}",
+                "camera_id": "CAM_001",
+                "vehicle_class": vehicle_class.upper(),
+                "vehicle_colour": {"label": colour, "status": "completed"},
+                "evidence_used": [
+                    {
+                        "frame_number": 6,
+                        "timestamp_seconds": 6.0 if in_window else 20.0,
+                        "vehicle_crop_path": str(crop),
+                        "evidence_role": "MIDDLE",
+                        "selected_for_colour": True,
+                    }
+                ],
+                "selected_crop_paths": [str(crop)],
+                "status": "completed",
+            }
+        )
+
+    for track_id, colour in car_ids.items():
+        add(track_id, "car", colour)
+    for track_id, colour in motorcycle_ids.items():
+        add(track_id, "motorcycle", colour)
+    add("TRACK_16", "truck", "WHITE")
+    add("TRACK_15", "unknown", "UNKNOWN")
+    for track_id in ["TRACK_29", "TRACK_37", "TRACK_41", "TRACK_44"]:
+        add(track_id, "3wheeler", "GREEN")
+    _write_json(run_dir / "tracks.json", tracks)
+    _write_json(run_dir / "vehicle_enrichment.json", enrichments)
+    return run_id
+
+
 def test_api_app_filter_options_and_track_filters(tmp_path: Path) -> None:
     run_id = _build_run(tmp_path)
     client = TestClient(create_app(outputs_root=tmp_path))
@@ -197,3 +300,462 @@ def test_api_app_saved_run_camera_and_system_fallback(tmp_path: Path) -> None:
     system_payload = system_response.json()
     assert system_payload["pipeline_status"] == "completed"
     assert system_payload["yolo_image_size"] == 1024
+
+
+def test_api_vehicle_search_known_run_queries(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    all_response = client.post("/api/vehicle-search", json={"query": "How many vehicles are there?", "run_id": run_id})
+    assert all_response.status_code == 200
+    assert all_response.json()["run_id"] == run_id
+    assert all_response.json()["analytics_result"]["total"] == 41
+
+    white_car_response = client.post("/api/vehicle-search", json={"query": "How many white cars are there?", "run_id": run_id})
+    assert white_car_response.status_code == 200
+    assert white_car_response.json()["parsed_query"]["vehicle_class"] == "CAR"
+    assert white_car_response.json()["parsed_query"]["colour"] == "WHITE"
+    assert white_car_response.json()["analytics_result"]["total"] == 6
+
+    car_window_response = client.post("/api/vehicle-search", json={"query": "Show cars between 5 and 10 seconds", "run_id": run_id})
+    assert car_window_response.status_code == 200
+    assert car_window_response.json()["analytics_result"]["total"] == 1
+    assert car_window_response.json()["analytics_result"]["vehicle_ids"] == ["CAM_001:TRACK_19"]
+
+    black_motorcycle_response = client.post(
+        "/api/vehicle-search",
+        json={"query": "Show black motorcycles between 5 and 10 seconds", "run_id": run_id},
+    )
+    assert black_motorcycle_response.status_code == 200
+    assert black_motorcycle_response.json()["analytics_result"]["total"] == 5
+    assert black_motorcycle_response.json()["analytics_result"]["vehicle_ids"] == [
+        "CAM_001:TRACK_14",
+        "CAM_001:TRACK_18",
+        "CAM_001:TRACK_17",
+        "CAM_001:TRACK_25",
+        "CAM_001:TRACK_23",
+    ]
+
+
+def test_api_vehicle_search_latest_invalid_and_unknown_run(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    latest_response = client.post("/api/vehicle-search", json={"query": "How many white cars are there?", "run_id": "latest"})
+    assert latest_response.status_code == 200
+    assert latest_response.json()["run_id"] == run_id
+    assert latest_response.json()["analytics_result"]["total"] == 6
+
+    invalid_response = client.post("/api/vehicle-search", json={"query": "show dark vehicles", "run_id": run_id})
+    assert invalid_response.status_code == 400
+    assert invalid_response.json()["detail"]["error"] == "query_not_understood"
+
+    unknown_run_response = client.post("/api/vehicle-search", json={"query": "How many vehicles are there?", "run_id": "missing"})
+    assert unknown_run_response.status_code == 404
+    assert unknown_run_response.json()["detail"]["error"] == "run_not_found"
+
+
+def test_api_vehicle_search_missing_tracks_json_is_data_error(tmp_path: Path) -> None:
+    run_id = "20260812_120000"
+    _write_json(tmp_path / run_id / "summary.json", {"run_id": run_id, "status": "COMPLETED"})
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.post("/api/vehicle-search", json={"query": "How many vehicles are there?", "run_id": run_id})
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "tracks_json_missing"
+
+
+def test_api_video_chat_count_multi_class_colour_and_time_queries(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    car_response = client.post("/api/video-chat", json={"message": "How many cars were there?", "run_id": run_id, "session_id": "chat-a"})
+    assert car_response.status_code == 200
+    assert car_response.json()["parsed_query"]["intent"] == "COUNT"
+    assert car_response.json()["analytics_result"]["total"] == 17
+    assert car_response.json()["evidence"] == []
+
+    multi_response = client.post("/api/video-chat", json={"message": "How many cars and motorcycles were there?", "run_id": run_id, "session_id": "chat-b"})
+    assert multi_response.status_code == 200
+    assert multi_response.json()["analytics_result"]["total"] == 35
+
+    colour_response = client.post("/api/video-chat", json={"message": "How many black motorcycles were there?", "run_id": run_id, "session_id": "chat-c"})
+    assert colour_response.status_code == 200
+    assert colour_response.json()["analytics_result"]["total"] == 12
+
+    time_response = client.post("/api/video-chat", json={"message": "Show black motorcycles between 5 and 10 seconds", "run_id": run_id, "session_id": "chat-d"})
+    assert time_response.status_code == 200
+    assert time_response.json()["analytics_result"]["total"] == 5
+    assert len(time_response.json()["evidence"]) == 5
+
+
+def test_api_video_chat_unknown_vehicle_filters_unknown_class(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.post("/api/video-chat", json={"message": "unknown vehicle", "run_id": run_id, "session_id": "unknown-class"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["parsed_query"]["intent"] == "LIST"
+    assert payload["parsed_query"]["include_classes"] == ["UNKNOWN"]
+    assert payload["analytics_result"]["total"] == 1
+    assert payload["matching_vehicle_ids"] == ["CAM_001:TRACK_15"]
+    assert [item["vehicle_id"] for item in payload["evidence"]] == ["CAM_001:TRACK_15"]
+    assert "41" not in payload["answer"]
+
+
+def test_api_video_chat_list_with_evidence_summary_compare_and_missing_evidence(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    list_response = client.post("/api/video-chat", json={"message": "Show me the white cars.", "run_id": run_id, "session_id": "chat-e"})
+    assert list_response.status_code == 200
+    payload = list_response.json()
+    assert payload["analytics_result"]["total"] == 6
+    assert [item["vehicle_id"] for item in payload["evidence"]] == [
+        "CAM_001:TRACK_13",
+        "CAM_001:TRACK_19",
+        "CAM_001:TRACK_26",
+        "CAM_001:TRACK_28",
+        "CAM_001:TRACK_33",
+        "CAM_001:TRACK_42",
+    ]
+    assert payload["evidence"][0]["image_url"].startswith("/api/media/florence_selected_crops/")
+    assert payload["evidence"][0]["track_detail_url"] == f"/tracks/CAM_001/TRACK_13?run_id={run_id}"
+
+    summary_response = client.post("/api/video-chat", json={"message": "Give me a traffic summary.", "run_id": run_id, "session_id": "chat-f"})
+    assert summary_response.status_code == 200
+    assert summary_response.json()["analytics_result"]["total_unique_vehicles"] == 41
+
+    compare_response = client.post("/api/video-chat", json={"message": "Were there more cars than motorcycles?", "run_id": run_id, "session_id": "chat-g"})
+    assert compare_response.status_code == 200
+    assert compare_response.json()["analytics_result"]["left_total"] == 17
+    assert compare_response.json()["analytics_result"]["right_total"] == 18
+    assert compare_response.json()["answer"].startswith("No.")
+
+    crop = tmp_path / run_id / "05_florence_selected_crops" / "CAM_001" / "TRACK_13" / "frame_000006_MIDDLE.jpg"
+    crop.unlink()
+    missing_response = client.post("/api/video-chat", json={"message": "Show me the white cars.", "run_id": run_id, "session_id": "chat-h"})
+    assert missing_response.status_code == 200
+    assert missing_response.json()["evidence"][0]["vehicle_id"] == "CAM_001:TRACK_13"
+    assert missing_response.json()["evidence"][0]["image_url"] is None
+
+
+def test_api_video_chat_conversational_follow_up_show_them_and_invalid_query(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    first = client.post("/api/video-chat", json={"message": "How many motorcycles were there?", "run_id": run_id, "session_id": "chat-context"})
+    assert first.status_code == 200
+    assert first.json()["analytics_result"]["total"] == 18
+
+    follow_up = client.post("/api/video-chat", json={"message": "How many of those were black?", "run_id": run_id, "session_id": "chat-context"})
+    assert follow_up.status_code == 200
+    assert follow_up.json()["context_used"] is True
+    assert follow_up.json()["parsed_query"]["include_classes"] == ["MOTORCYCLE"]
+    assert follow_up.json()["parsed_query"]["include_colours"] == ["BLACK"]
+    assert follow_up.json()["analytics_result"]["total"] == 12
+
+    show_them = client.post("/api/video-chat", json={"message": "Show them", "run_id": run_id, "session_id": "chat-context"})
+    assert show_them.status_code == 200
+    assert show_them.json()["context_used"] is True
+    assert show_them.json()["analytics_result"]["total"] == 12
+    assert len(show_them.json()["evidence"]) == 6
+
+    invalid = client.post("/api/video-chat", json={"message": "show dark vehicles", "run_id": run_id, "session_id": "chat-invalid"})
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"]["error"] == "query_not_understood"
+
+
+def test_api_video_chat_temporal_class_comparison_queries(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    cars_response = client.post("/api/video-chat", json={"message": "when are cars more than bikes?", "run_id": run_id, "session_id": "interval-a"})
+    assert cars_response.status_code == 200
+    cars_payload = cars_response.json()
+    assert cars_payload["parsed_query"]["intent"] == "FIND_INTERVALS"
+    assert cars_payload["analytics_result"]["left_class"] == "CAR"
+    assert cars_payload["analytics_result"]["right_class"] == "MOTORCYCLE"
+    assert cars_payload["analytics_result"]["operator"] == ">"
+    assert cars_payload["analytics_result"]["intervals"]
+
+    bikes_response = client.post("/api/video-chat", json={"message": "when are bikes more than cars?", "run_id": run_id, "session_id": "interval-b"})
+    assert bikes_response.status_code == 200
+    bikes_payload = bikes_response.json()
+    assert bikes_payload["parsed_query"]["intent"] == "FIND_INTERVALS"
+    assert bikes_payload["analytics_result"]["left_class"] == "MOTORCYCLE"
+    assert bikes_payload["analytics_result"]["right_class"] == "CAR"
+    assert bikes_payload["analytics_result"]["operator"] == ">"
+    assert bikes_payload["analytics_result"]["intervals"]
+
+
+def test_api_video_chat_group_colours_uses_natural_deterministic_answer(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.post("/api/video-chat", json={"message": "What colours were the motorcycles?", "run_id": run_id, "session_id": "group-colours"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["parsed_query"]["intent"] == "GROUP"
+    assert payload["parsed_query"]["include_classes"] == ["MOTORCYCLE"]
+    assert payload["parsed_query"]["group_by"] == "colour"
+    assert payload["analytics_result"]["by_colour"]["BLACK"] == 12
+    assert payload["matching_vehicle_ids"] == payload["analytics_result"]["vehicle_ids"]
+    assert len(payload["matching_vehicle_ids"]) == 18
+    assert payload["answer"] == "The 18 motorcycles were:\n\nBlack: 12\nRed: 4\nWhite: 1\nBlue: 1\n\nBlack was the most common motorcycle colour."
+
+
+def test_api_video_chat_filtered_group_colours_show_them_paginates_previous_ids(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+    session_id = "filtered-group-show-them"
+
+    group = client.post("/api/video-chat", json={"message": "give me the colours of motorcycles", "run_id": run_id, "session_id": session_id})
+    assert group.status_code == 200
+    group_payload = group.json()
+    motorcycle_ids = group_payload["matching_vehicle_ids"]
+    assert group_payload["parsed_query"]["intent"] == "GROUP"
+    assert group_payload["parsed_query"]["include_classes"] == ["MOTORCYCLE"]
+    assert group_payload["parsed_query"]["group_by"] == "colour"
+    assert group_payload["analytics_result"]["total"] == 18
+    assert group_payload["analytics_result"]["by_colour"]["BLACK"] == 12
+    assert group_payload["analytics_result"]["by_colour"]["RED"] == 4
+    assert group_payload["analytics_result"]["by_colour"]["WHITE"] == 1
+    assert group_payload["analytics_result"]["by_colour"]["BLUE"] == 1
+    assert len(motorcycle_ids) == 18
+    assert group_payload["matching_vehicle_ids_count"] == 18
+    assert group_payload["context_saved_vehicle_ids_count"] == 18
+
+    first_page = client.post("/api/video-chat", json={"message": "Show them", "run_id": run_id, "session_id": session_id})
+    assert first_page.status_code == 200
+    first_payload = first_page.json()
+    first_ids = [item["vehicle_id"] for item in first_payload["evidence"]]
+    assert first_payload["context_used"] is True
+    assert first_payload["evidence_page"]["matching_total"] == 18
+    assert first_payload["evidence_page"]["evidence_returned_count"] == 6
+    assert all(item["vehicle_class"] == "MOTORCYCLE" for item in first_payload["evidence"])
+    assert set(first_ids).issubset(motorcycle_ids)
+
+    second_page = client.post("/api/video-chat", json={"message": "Show more", "run_id": run_id, "session_id": session_id})
+    assert second_page.status_code == 200
+    second_payload = second_page.json()
+    second_ids = [item["vehicle_id"] for item in second_payload["evidence"]]
+    assert len(second_ids) == 6
+    assert second_payload["evidence_page"]["evidence_offset"] == 6
+    assert all(item["vehicle_class"] == "MOTORCYCLE" for item in second_payload["evidence"])
+
+    third_page = client.post("/api/video-chat", json={"message": "Show more", "run_id": run_id, "session_id": session_id})
+    assert third_page.status_code == 200
+    third_payload = third_page.json()
+    third_ids = [item["vehicle_id"] for item in third_payload["evidence"]]
+    assert len(third_ids) == 6
+    assert third_payload["evidence_page"]["evidence_offset"] == 12
+    assert third_payload["evidence_page"]["evidence_remaining_count"] == 0
+    assert all(item["vehicle_class"] == "MOTORCYCLE" for item in third_payload["evidence"])
+    combined = first_ids + second_ids + third_ids
+    assert len(combined) == 18
+    assert len(set(combined)) == 18
+    assert combined == motorcycle_ids
+
+
+def test_api_video_chat_group_colour_variants_preserve_explicit_class_filters(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    motorcycle = client.post("/api/video-chat", json={"message": "motorcycle colour breakdown", "run_id": run_id, "session_id": "group-motorcycle"})
+    assert motorcycle.status_code == 200
+    assert motorcycle.json()["parsed_query"]["include_classes"] == ["MOTORCYCLE"]
+    assert motorcycle.json()["analytics_result"]["total"] == 18
+
+    cars = client.post("/api/video-chat", json={"message": "what colours were the cars?", "run_id": run_id, "session_id": "group-cars"})
+    assert cars.status_code == 200
+    cars_payload = cars.json()
+    assert cars_payload["parsed_query"]["include_classes"] == ["CAR"]
+    assert cars_payload["parsed_query"]["group_by"] == "colour"
+    assert cars_payload["analytics_result"]["total"] == 17
+    assert cars_payload["analytics_result"]["by_colour"]["BLACK"] == 10
+    assert cars_payload["analytics_result"]["by_colour"]["WHITE"] == 6
+    assert cars_payload["analytics_result"]["by_colour"]["SILVER"] == 1
+
+    three_wheelers = client.post("/api/video-chat", json={"message": "what colours were the three wheelers?", "run_id": run_id, "session_id": "group-3w"})
+    assert three_wheelers.status_code == 200
+    three_payload = three_wheelers.json()
+    assert three_payload["parsed_query"]["include_classes"] == ["3WHEELER"]
+    assert three_payload["parsed_query"]["group_by"] == "colour"
+    assert three_payload["analytics_result"]["total"] == 4
+    assert three_payload["analytics_result"]["by_colour"]["GREEN"] == 4
+
+    global_colours = client.post("/api/video-chat", json={"message": "what colours are present?", "run_id": run_id, "session_id": "global-colours"})
+    assert global_colours.status_code == 200
+    assert global_colours.json()["parsed_query"]["intent"] == "UNIQUE_COLOURS"
+
+    black_classes = client.post("/api/video-chat", json={"message": "what vehicle classes were black?", "run_id": run_id, "session_id": "black-classes"})
+    assert black_classes.status_code == 200
+    black_payload = black_classes.json()
+    assert black_payload["parsed_query"]["intent"] == "GROUP"
+    assert black_payload["parsed_query"]["group_by"] == "class"
+    assert black_payload["parsed_query"]["include_colours"] == ["BLACK"]
+    assert black_payload["analytics_result"]["total"] == 22
+
+
+def test_api_video_chat_evidence_pagination_next_exhausted_reset_and_missing_evidence(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+    session_id = "evidence-pages"
+
+    first = client.post("/api/video-chat", json={"message": "How many motorcycles were there?", "run_id": run_id, "session_id": session_id})
+    assert first.status_code == 200
+    assert first.json()["analytics_result"]["total"] == 18
+    black = client.post("/api/video-chat", json={"message": "Which of those were black?", "run_id": run_id, "session_id": session_id})
+    assert black.status_code == 200
+    assert black.json()["analytics_result"]["total"] == 12
+
+    first_page = client.post("/api/video-chat", json={"message": "show evidence", "run_id": run_id, "session_id": session_id})
+    assert first_page.status_code == 200
+    first_payload = first_page.json()
+    first_ids = [item["vehicle_id"] for item in first_payload["evidence"]]
+    assert len(first_ids) == 6
+    assert first_payload["evidence_page"]["matching_total"] == 12
+    assert first_payload["evidence_page"]["evidence_returned_count"] == 6
+    assert first_payload["evidence_page"]["evidence_offset"] == 0
+    assert first_payload["evidence_page"]["evidence_remaining_count"] == 6
+
+    second_page = client.post("/api/video-chat", json={"message": "show the other 6", "run_id": run_id, "session_id": session_id})
+    assert second_page.status_code == 200
+    second_payload = second_page.json()
+    second_ids = [item["vehicle_id"] for item in second_payload["evidence"]]
+    assert len(second_ids) == 6
+    assert second_payload["evidence_page"]["evidence_offset"] == 6
+    assert second_payload["evidence_page"]["evidence_remaining_count"] == 0
+    assert set(first_ids).isdisjoint(second_ids)
+    assert first_ids + second_ids == black.json()["matching_vehicle_ids"]
+
+    exhausted = client.post("/api/video-chat", json={"message": "show more", "run_id": run_id, "session_id": session_id})
+    assert exhausted.status_code == 200
+    assert exhausted.json()["evidence"] == []
+    assert "already been shown" in exhausted.json()["answer"]
+
+    crop = tmp_path / run_id / "05_florence_selected_crops" / "CAM_001" / "TRACK_13" / "frame_000006_MIDDLE.jpg"
+    crop.unlink()
+    reset = client.post("/api/video-chat", json={"message": "show white cars", "run_id": run_id, "session_id": session_id})
+    assert reset.status_code == 200
+    reset_payload = reset.json()
+    assert reset_payload["analytics_result"]["total"] == 6
+    assert reset_payload["evidence_page"]["evidence_offset"] == 0
+    assert reset_payload["evidence"][0]["vehicle_id"] == "CAM_001:TRACK_13"
+    assert reset_payload["evidence"][0]["image_url"] is None
+
+
+def test_api_video_chat_greeting_and_class_wise_queries_do_not_leak_context(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+    session_id = "context-leak"
+
+    hello = client.post("/api/video-chat", json={"message": "hello", "run_id": run_id, "session_id": session_id})
+    assert hello.status_code == 200
+    hello_payload = hello.json()
+    assert hello_payload["parsed_query"]["intent"] == "GENERAL_CHAT"
+    assert hello_payload["analytics_result"] == {}
+    assert hello_payload["matching_vehicle_ids"] == []
+    assert "41 vehicles were observed" not in hello_payload["answer"]
+
+    class_wise = client.post("/api/video-chat", json={"message": "give the numbers class wise", "run_id": run_id, "session_id": session_id})
+    assert class_wise.status_code == 200
+    class_payload = class_wise.json()
+    assert class_payload["parsed_query"]["intent"] == "GROUP"
+    assert class_payload["parsed_query"]["group_by"] == "class"
+    assert class_payload["parsed_query"]["include_colours"] == []
+    assert class_payload["context_used"] is False
+    assert class_payload["analytics_result"]["total"] == 41
+    assert class_payload["analytics_result"]["by_class"]["MOTORCYCLE"] == 18
+    assert class_payload["analytics_result"]["by_class"]["CAR"] == 17
+    assert class_payload["analytics_result"]["by_class"]["3WHEELER"] == 4
+    assert class_payload["analytics_result"]["by_class"]["TRUCK"] == 1
+    assert class_payload["analytics_result"]["by_class"]["UNKNOWN"] == 1
+    assert "Motorcycles: 18" in class_payload["answer"]
+    assert "Cars: 17" in class_payload["answer"]
+    assert "Three-wheelers: 4" in class_payload["answer"]
+    assert "Truck: 1" in class_payload["answer"]
+    assert "Unknown: 1" in class_payload["answer"]
+    assert "Total: 41 vehicles." in class_payload["answer"]
+
+    all_class_wise = client.post("/api/video-chat", json={"message": "i want all the vehicles class wise", "run_id": run_id, "session_id": session_id})
+    assert all_class_wise.status_code == 200
+    all_class_payload = all_class_wise.json()
+    assert all_class_payload["analytics_result"]["total"] == 41
+    assert all_class_payload["analytics_result"]["by_class"] == class_payload["analytics_result"]["by_class"]
+    assert "22 black vehicles" not in all_class_payload["answer"].lower()
+
+
+def test_api_video_chat_follow_up_uses_context_but_new_group_queries_reset_it(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+    session_id = "context-reset"
+
+    black = client.post("/api/video-chat", json={"message": "show black motorcycles", "run_id": run_id, "session_id": session_id})
+    assert black.status_code == 200
+    assert black.json()["analytics_result"]["total"] == 12
+
+    red_follow_up = client.post("/api/video-chat", json={"message": "how many of those were red?", "run_id": run_id, "session_id": session_id})
+    assert red_follow_up.status_code == 200
+    red_payload = red_follow_up.json()
+    assert red_payload["context_used"] is True
+    assert red_payload["analytics_result"]["total"] == 0
+
+    class_wise = client.post("/api/video-chat", json={"message": "give all vehicles class wise", "run_id": run_id, "session_id": session_id})
+    assert class_wise.status_code == 200
+    assert class_wise.json()["context_used"] is False
+    assert class_wise.json()["analytics_result"]["total"] == 41
+    assert class_wise.json()["parsed_query"]["include_colours"] == []
+
+    colours = client.post("/api/video-chat", json={"message": "what colours are present?", "run_id": run_id, "session_id": session_id})
+    assert colours.status_code == 200
+    colours_payload = colours.json()
+    assert colours_payload["context_used"] is False
+    assert colours_payload["parsed_query"]["intent"] == "UNIQUE_COLOURS"
+    assert set(colours_payload["analytics_result"]["colours_present"]) >= {"BLACK", "WHITE", "GREEN", "RED", "SILVER", "BLUE", "UNKNOWN"}
+
+
+def test_api_video_chat_colour_wise_query_is_global_without_context_leak(tmp_path: Path) -> None:
+    run_id = _build_vehicle_search_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+    session_id = "colour-wise"
+
+    previous = client.post("/api/video-chat", json={"message": "show black motorcycles", "run_id": run_id, "session_id": session_id})
+    assert previous.status_code == 200
+    response = client.post("/api/video-chat", json={"message": "give vehicle numbers colour wise", "run_id": run_id, "session_id": session_id})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["context_used"] is False
+    assert payload["parsed_query"]["intent"] == "GROUP"
+    assert payload["parsed_query"]["group_by"] == "colour"
+    assert payload["parsed_query"]["include_classes"] == []
+    assert payload["analytics_result"]["total"] == 41
+    assert payload["analytics_result"]["by_colour"]["BLACK"] == 22
+    assert payload["analytics_result"]["by_colour"]["WHITE"] == 8
+    assert payload["analytics_result"]["by_colour"]["GREEN"] == 4
+    assert payload["analytics_result"]["by_colour"]["RED"] == 4
+    assert payload["analytics_result"]["by_colour"]["SILVER"] == 1
+    assert payload["analytics_result"]["by_colour"]["BLUE"] == 1
+    assert payload["analytics_result"]["by_colour"]["UNKNOWN"] == 1
+
+
+def test_api_health_tracks_and_latest_regression(tmp_path: Path) -> None:
+    run_id = _build_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    health_response = client.get("/api/health")
+    assert health_response.status_code == 200
+    assert health_response.json()["status"] == "ok"
+
+    tracks_response = client.get("/api/tracks", params={"run_id": run_id})
+    assert tracks_response.status_code == 200
+    assert len(tracks_response.json()) == 2
+
+    runs_response = client.get("/api/runs")
+    assert runs_response.status_code == 200
+    assert runs_response.json()[0]["run_id"] == run_id

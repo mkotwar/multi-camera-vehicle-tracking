@@ -4,6 +4,7 @@ import { DashboardPage } from "./pages/DashboardPage";
 import { RunsPage } from "./pages/RunsPage";
 import { SystemPage } from "./pages/SystemPage";
 import { TrackDetailPage } from "./pages/TrackDetailPage";
+import { VideoChatPage } from "./pages/VideoChatPage";
 import { VehicleSearchPage } from "./pages/VehicleSearchPage";
 
 export default function App() {
@@ -12,6 +13,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/vehicles" element={<VehicleSearchPage />} />
+        <Route path="/video-chat" element={<VideoChatPage />} />
         <Route path="/tracks" element={<VehicleSearchPage />} />
         <Route path="/tracks/:cameraId/:trackId" element={<TrackDetailPage />} />
         <Route path="/runs" element={<RunsPage />} />

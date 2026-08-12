@@ -3,6 +3,9 @@ project:
   environment: development
   log_level: INFO
 
+logging:
+  progress_every_frames: 100
+
 input:
   cameras:
     - camera_id: CAM_001
@@ -49,9 +52,6 @@ detection:
     - 2
     - 3
     - 4
-    - 5
-    - 6
-    - 7
 
   bbox_quality:
     enabled: false
@@ -199,7 +199,7 @@ vehicle_enrichment:
         use_cache: true
         early_stopping: false
       async:
-        enabled: false
+        enabled: true
         queue_size: 100
         worker_count: 1
         queue_put_timeout_seconds: 0.1

@@ -1,6 +1,6 @@
 project:
   name: multicamera_vehicle_tracking
-  environment: production
+  environment: validation
   log_level: INFO
 
 input:
@@ -13,20 +13,20 @@ input:
       source_type: video
       source: "D:/old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4"
       enabled: false
-  max_frames_per_camera: 100
+  max_frames_per_camera: 600
 
 ingestion:
-  worker_count: 7
+  worker_count: 3
   target_read_fps: 10.0
-  frame_queue_size: 200
+  frame_queue_size: 50
   queue_put_timeout_seconds: 2.0
   queue_get_timeout_seconds: 1.0
   stop_on_camera_error: false
   round_robin: true
   raw_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 10
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
     image_format: jpg
     jpeg_quality: 90
 
@@ -106,25 +106,46 @@ visualization:
   show_rejected_boxes: false
   detected_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
   tracked_frames:
     enabled: true
-    save_every_n_frames: 10
-    max_saved_frames_per_camera: 20
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
 
 output:
-  root_directory: outputs/runs
+  root_directory: ../outputs/runs
   save_run_config: true
 
 vehicle_enrichment:
   enabled: true
   trigger: track_completed
-  florence_mode: current
   fail_open: true
   best_crops_per_track: 3
   write_separate_output: true
   extend_tracks_json: true
+  image_size_policy:
+    florence:
+      default:
+        minimum_original_width: 192
+        minimum_original_height: 144
+        preferred_original_width: 320
+        preferred_original_height: 240
+      class_specific:
+        motorcycle:
+          minimum_original_width: 120
+          minimum_original_height: 120
+        3wheeler:
+          minimum_original_width: 140
+          minimum_original_height: 120
+        car:
+          minimum_original_width: 160
+          minimum_original_height: 120
+      eligibility_dimensions_source: original_crop
+      preserve_aspect_ratio: true
+      pad_to_square: true
+      square_padding_value: 114
+      reject_upscaled_eligibility: true
   evidence:
     source: existing_track_evidence
     save_vehicle_crops: true
@@ -141,92 +162,78 @@ vehicle_enrichment:
       border_weight: 0.05
       clipping_weight: 0.05
       brightness_weight: 0.05
-  shared_florence:
+  florence:
     enabled: true
-    backend: florence2
-    base_model_id: "D:/project/models/Florence-2-base-ft"
+    backend: florence
+    model_id: "D:/project/models/Florence-2-base-ft"
     processor_path: "D:/project/models/Florence-2-base-ft"
-    adapter_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT"
-    adapter_enabled: false
     device: auto
     dtype: auto
     trust_remote_code: true
-    local_files_only: true
     attention_implementation: eager
-    max_new_tokens: 128
-    num_beams: 3
+    max_new_tokens: 64
+    num_beams: 1
     use_cache: false
+    local_files_only: true
     lazy_load: true
-  vehicle_attributes:
+    adapter:
+      enabled: false
+      path: ""
+      fail_if_missing: false
+  enrichment:
     enabled: true
-    backend: base_florence
-    maximum_crops_per_track: 3
-    reuse_single_response_for_attributes: false
-    task_token: "<VQA>"
-    prompt: "What colour is the vehicle?"
-    florence:
-      base_model_id: "D:/project/models/Florence-2-base-ft"
-      processor_path: "D:/project/models/Florence-2-base-ft"
-      adapter_enabled: false
-      adapter_path: ""
-      fail_if_adapter_missing: false
-      device: auto
-      dtype: auto
-      local_files_only: true
-      lazy_load: true
-      max_new_tokens: 16
-      num_beams: 1
-      use_cache: true
     colour:
       enabled: true
-      backend: base_florence
+      backend: florence
+      maximum_crops_per_track: 3
       task_token: "<VQA>"
       prompt: "What colour is the vehicle?"
+      inference_strategy: adaptive_fallback
       generation:
         max_new_tokens: 16
         num_beams: 1
         do_sample: false
         use_cache: true
         early_stopping: false
+      async:
+        enabled: false
+        queue_size: 100
+        worker_count: 1
+        queue_put_timeout_seconds: 0.1
     body_type:
       enabled: false
-      backend: base_florence
+      backend: florence
+      car_only: true
+      run_only_when_vehicle_class: [CAR]
+      maximum_crops_per_track: 3
+      minimum_original_width: 120
+      minimum_original_height: 100
+      preferred_original_width: 240
+      preferred_original_height: 160
+      allowed_labels: [SEDAN, HATCHBACK, SUV, MPV, UNKNOWN]
       task_token: "<VQA>"
-      prompt: ""
+      prompt: |-
+        What type of car is shown in this image?
+        Answer with one word only:
+        sedan, hatchback, suv, or mpv.
       generation:
         max_new_tokens: 16
         num_beams: 1
         do_sample: false
         use_cache: true
         early_stopping: false
-  body_type:
-    enabled: false
-  colour:
-    enabled: false
-  make_model:
-    enabled: false
-  plate:
-    detection_enabled: false
-    colour_enabled: false
-    recognition_enabled: false
-    detector:
+    make_model:
       enabled: false
-      model_path: ""
-    ocr:
+    plate:
       enabled: false
-      backend: ocr_mukul_adapter
-      task_token: "<OCR>"
-      prompt: ""
-      florence:
-        base_model_id: "D:/project/models/Florence-2-base-ft"
-        processor_path: "D:/project/models/Florence-2-base-ft"
-        adapter_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT"
-        adapter_enabled: true
-        fail_if_adapter_missing: true
-        device: auto
-        dtype: auto
-        local_files_only: true
-        lazy_load: true
-  ocr:
-    enabled: false
-    run_only_when_plate_detected: true
+      detector:
+        enabled: false
+        model_path: ""
+      colour:
+        enabled: false
+      ocr:
+        enabled: false
+        backend: ocr_mukul_adapter
+        task_token: "<OCR>"
+        prompt: ""
+        run_only_when_plate_detected: false

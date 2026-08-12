@@ -47,6 +47,10 @@ class RuntimeDevice:
     def yolo_half(self) -> bool:
         return self.device.type == "cuda" and self.dtype == torch.float16
 
+    @property
+    def yolo_quantize(self) -> int | None:
+        return 16 if self.yolo_half else None
+
 
 def dtype_name(value: Any) -> str:
     raw = str(value)

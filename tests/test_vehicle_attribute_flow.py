@@ -214,6 +214,68 @@ def test_vehicle_attribute_flow_uses_low_resolution_fallback_crop(tmp_path: Path
     assert result.crop_level_rows[0]["selection_tier"] == "low_resolution_fallback"
 
 
+def test_vehicle_attribute_flow_runs_colour_for_all_supported_vehicle_classes(tmp_path: Path) -> None:
+    for vehicle_class in ["CAR", "MOTORCYCLE", "BUS", "TRUCK", "3WHEELER"]:
+        backend = _FakeBackend(["green"])
+        request = _request(tmp_path)
+        request.vehicle_class = vehicle_class
+        flow = BaseFlorenceVehicleAttributesFlow(
+            {
+                "enabled": True,
+                "maximum_crops_per_track": 3,
+                "colour": {"enabled": True, "task_token": "<VQA>", "prompt": "What colour is the vehicle?"},
+                "body_type": {"enabled": False},
+            },
+            backend=backend,
+            image_size_policy=normalize_image_size_policy(
+                {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+                fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+                fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+                detection={},
+            ),
+            logger=__import__("logging").getLogger(__name__),
+        )
+
+        result = flow.classify(request)
+
+        assert result.colour.status == "completed"
+        assert result.colour.label == "GREEN"
+        assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 1
+
+
+def test_vehicle_attribute_flow_skips_colour_for_unknown_vehicle_class(tmp_path: Path) -> None:
+    backend = _FakeBackend(["black"])
+    request = _request(tmp_path)
+    request.vehicle_class = "UNKNOWN"
+    flow = BaseFlorenceVehicleAttributesFlow(
+        {
+            "enabled": True,
+            "maximum_crops_per_track": 3,
+            "colour": {"enabled": True, "task_token": "<VQA>", "prompt": "What colour is the vehicle?"},
+            "body_type": {"enabled": False},
+        },
+        backend=backend,
+        image_size_policy=normalize_image_size_policy(
+            {"florence": {"minimum_original_width": 100, "minimum_original_height": 80, "preferred_original_width": 320, "preferred_original_height": 240, "pad_to_square": True}},
+            fallback_body_type={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            fallback_colour={"minimum_crop_width": 100, "minimum_crop_height": 80},
+            detection={},
+        ),
+        logger=__import__("logging").getLogger(__name__),
+    )
+
+    result = flow.classify(request)
+
+    assert backend.load_calls == 0
+    assert backend.calls == []
+    assert result.colour.status == "skipped"
+    assert result.colour.label == "UNKNOWN"
+    assert result.colour.reason == "vehicle_class_not_eligible"
+    assert result.crop_level_rows[0]["colour_reason"] == "vehicle_class_not_eligible"
+    assert flow.metrics["vehicle_attribute_colour_inference_calls"] == 0
+    assert flow.metrics["vehicle_attribute_colour_ineligible_tracks"] == 1
+
+
 def test_vehicle_attribute_flow_skips_non_car_body_type(tmp_path: Path) -> None:
     backend = _FakeBackend(["black"])
     request = _request(tmp_path)

@@ -892,7 +892,7 @@ class VehicleEnrichmentManager:
                 started_monotonic=started_monotonic,
                 errors=[],
             )
-        self.logger.info(
+        self.logger.debug(
             "Evidence zone enrichment source camera=%s track=%s source=%s selected=%s",
             track.camera_id,
             track.local_track_id,
@@ -1251,7 +1251,7 @@ class VehicleEnrichmentManager:
                 started_monotonic=started_monotonic,
                 errors=[],
             )
-        self.logger.info(
+        self.logger.debug(
             "Evidence zone enrichment source camera=%s track=%s source=%s selected=%s",
             track.camera_id,
             track.local_track_id,

@@ -3,8 +3,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, Field
+
+from .ollama_qwen_provider import build_chat_llm_provider_from_env
 from .run_repository import RunRepository
 from .runtime_state import get_runtime_state_manager
+from .video_chat import handle_video_chat
+from .vehicle_nlp import VehicleQueryParseError, search_vehicle_data
+
+
+class VehicleSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    run_id: str | None = "latest"
+
+
+class VideoChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    run_id: str | None = "latest"
+    session_id: str | None = None
 
 
 def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
@@ -18,6 +34,8 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
 
     repository = RunRepository(outputs_root)
     runtime_state = get_runtime_state_manager()
+    chat_sessions: dict[str, dict[str, Any]] = {}
+    chat_llm_provider = build_chat_llm_provider_from_env()
     app = FastAPI(title="Multi-Camera Vehicle Tracking API", version="1.0.0")
     app.add_middleware(
         CORSMiddleware,
@@ -228,6 +246,54 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         if not evidence:
             raise HTTPException(status_code=404, detail="Track evidence not found")
         return [_serialize_evidence_item(item) for item in evidence]
+
+    @app.post("/api/vehicle-search")
+    def vehicle_search(request: VehicleSearchRequest) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(request.run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": "Run not found"})
+        tracks_path = repository.tracks_json_path(resolved_run_id)
+        if tracks_path is None or not tracks_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {resolved_run_id}"},
+            )
+        try:
+            payload = search_vehicle_data(query=request.query, tracks_path=tracks_path)
+        except VehicleQueryParseError as exc:
+            raise HTTPException(status_code=400, detail={"error": "query_not_understood", "detail": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail={"error": "vehicle_search_failed", "detail": str(exc)}) from exc
+        return {"run_id": resolved_run_id, **payload}
+
+    @app.post("/api/video-chat")
+    def video_chat(request: VideoChatRequest) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(request.run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": "Run not found"})
+        tracks_path = repository.tracks_json_path(resolved_run_id)
+        if tracks_path is None or not tracks_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {resolved_run_id}"},
+            )
+        session_id = str(request.session_id or "default").strip() or "default"
+        context = chat_sessions.get(session_id, {})
+        try:
+            payload = handle_video_chat(
+                message=request.message,
+                run_id=resolved_run_id,
+                tracks_path=str(tracks_path),
+                repository=repository,
+                session_context=context,
+                llm_provider=chat_llm_provider,
+            )
+        except VehicleQueryParseError as exc:
+            raise HTTPException(status_code=400, detail={"error": "query_not_understood", "detail": str(exc)}) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail={"error": "video_chat_failed", "detail": str(exc)}) from exc
+        chat_sessions[session_id] = dict(payload.pop("next_context", {}) or {})
+        return {"run_id": resolved_run_id, "session_id": session_id, **payload}
 
     @app.get("/api/filter-options")
     def get_filter_options(run_id: str | None = None) -> dict[str, Any]:

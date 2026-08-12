@@ -3,9 +3,10 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VehicleSearchPage } from "./VehicleSearchPage";
 
-const { fetchFilterOptions, fetchTracks } = vi.hoisted(() => ({
+const { fetchFilterOptions, fetchTracks, searchVehicles } = vi.hoisted(() => ({
   fetchFilterOptions: vi.fn(),
   fetchTracks: vi.fn(),
+  searchVehicles: vi.fn(),
 }));
 
 vi.mock("../api/filters", () => ({
@@ -16,6 +17,23 @@ vi.mock("../api/tracks", () => ({
   fetchTracks,
 }));
 
+vi.mock("../api/vehicleSearch", () => ({
+  searchVehicles,
+}));
+
+vi.mock("../api/client", () => ({
+  ApiError: class ApiError extends Error {
+    status: number;
+    detail: unknown;
+
+    constructor(status: number, detail: unknown) {
+      super(`Request failed: ${status}`);
+      this.status = status;
+      this.detail = detail;
+    }
+  },
+}));
+
 describe("VehicleSearchPage", () => {
   afterEach(() => {
     cleanup();
@@ -24,6 +42,7 @@ describe("VehicleSearchPage", () => {
   beforeEach(() => {
     fetchFilterOptions.mockReset();
     fetchTracks.mockReset();
+    searchVehicles.mockReset();
     fetchFilterOptions.mockResolvedValue({
       runs: ["latest", "20260808_182124"],
       cameras: ["CAM_001"],
@@ -44,6 +63,25 @@ describe("VehicleSearchPage", () => {
         status: "COMPLETED",
       },
     ]);
+    searchVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      original_query: "How many white cars are there?",
+      parsed_query: {
+        intent: "COUNT",
+        vehicle_class: "CAR",
+        colour: "WHITE",
+        start_time: null,
+        end_time: null,
+        camera_id: null,
+      },
+      analytics_result: {
+        total: 6,
+        by_class: { CAR: 6 },
+        by_colour: { WHITE: 6 },
+        vehicle_ids: ["CAM_001:TRACK_13", "CAM_001:TRACK_19"],
+      },
+      response: "There are 6 white cars.",
+    });
   });
 
   it("renders full supported class and colour options", async () => {
@@ -81,5 +119,148 @@ describe("VehicleSearchPage", () => {
 
     expect(query.get("vehicle_class")).toBe("BUS");
     expect(query.get("colour")).toBe("BLUE");
+  });
+
+  it("sends the natural-language request with the selected run id", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText("Run"), { target: { value: "20260808_182124" } });
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "How many white cars are there?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run natural-language vehicle search" }));
+
+    await waitFor(() => expect(searchVehicles).toHaveBeenCalledTimes(1));
+    expect(searchVehicles).toHaveBeenCalledWith({
+      query: "How many white cars are there?",
+      run_id: "20260808_182124",
+    });
+  });
+
+  it("shows a loading state while natural-language search is in flight", async () => {
+    let resolveSearch: (value: unknown) => void = () => undefined;
+    searchVehicles.mockReturnValue(new Promise((resolve) => { resolveSearch = resolve; }));
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "How many vehicles are there?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run natural-language vehicle search" }));
+
+    expect(screen.getByRole("button", { name: "Run natural-language vehicle search" })).toBeDisabled();
+    resolveSearch({
+      run_id: "latest",
+      original_query: "How many vehicles are there?",
+      parsed_query: { intent: "COUNT", vehicle_class: null, colour: null, start_time: null, end_time: null, camera_id: null },
+      analytics_result: { total: 41, vehicle_ids: [] },
+      response: "There are 41 vehicles.",
+    });
+    await waitFor(() => expect(screen.getByText("There are 41 vehicles.")).toBeInTheDocument());
+  });
+
+  it("renders count search responses and parsed query details", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "How many white cars are there?" } });
+    fireEvent.submit(screen.getByLabelText("Natural-language vehicle search").closest("form")!);
+
+    await waitFor(() => expect(screen.getByText("There are 6 white cars.")).toBeInTheDocument());
+    expect(screen.getByText("Matches: 6")).toBeInTheDocument();
+    expect(screen.getByText("CAM_001:TRACK_13")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Parsed query"));
+    expect(screen.getByText("COUNT")).toBeInTheDocument();
+    expect(screen.getAllByText("CAR").length).toBeGreaterThan(0);
+  });
+
+  it("renders list responses with vehicle ids", async () => {
+    searchVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      original_query: "Show black motorcycles between 5 and 10 seconds",
+      parsed_query: { intent: "LIST", vehicle_class: "MOTORCYCLE", colour: "BLACK", start_time: 5, end_time: 10, camera_id: null },
+      analytics_result: {
+        total: 5,
+        vehicle_ids: ["CAM_001:TRACK_14", "CAM_001:TRACK_18", "CAM_001:TRACK_17", "CAM_001:TRACK_25", "CAM_001:TRACK_23"],
+      },
+      response: "5 black motorcycles between 5.0 and 10.0 seconds were observed.",
+    });
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "Show black motorcycles between 5 and 10 seconds" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run natural-language vehicle search" }));
+
+    await waitFor(() => expect(screen.getByText("5 black motorcycles between 5.0 and 10.0 seconds were observed.")).toBeInTheDocument());
+    expect(screen.getByText("CAM_001:TRACK_23")).toBeInTheDocument();
+  });
+
+  it("renders zero-result responses as a normal result", async () => {
+    searchVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      original_query: "Show white cars between 5 and 10 seconds",
+      parsed_query: { intent: "LIST", vehicle_class: "CAR", colour: "WHITE", start_time: 5, end_time: 10, camera_id: null },
+      analytics_result: { total: 0, vehicle_ids: [] },
+      response: "No white cars were observed between 5.0 and 10.0 seconds.",
+    });
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "Show white cars between 5 and 10 seconds" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run natural-language vehicle search" }));
+
+    await waitFor(() => expect(screen.getByText("No white cars were observed between 5.0 and 10.0 seconds.")).toBeInTheDocument());
+    expect(screen.getByText("Matches: 0")).toBeInTheDocument();
+  });
+
+  it("renders invalid query errors from the backend", async () => {
+    searchVehicles.mockRejectedValue(new Error("I couldn't understand that query. Try specifying a vehicle type, colour, or time range."));
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "show dark vehicles" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run natural-language vehicle search" }));
+
+    await waitFor(() => expect(screen.getByText("I couldn't understand that query. Try specifying a vehicle type, colour, or time range.")).toBeInTheDocument());
+  });
+
+  it("submits natural-language search with the Enter key", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Natural-language vehicle search"), { target: { value: "How many vehicles are there?" } });
+    fireEvent.keyDown(screen.getByLabelText("Natural-language vehicle search"), { key: "Enter", code: "Enter" });
+    fireEvent.submit(screen.getByLabelText("Natural-language vehicle search").closest("form")!);
+
+    await waitFor(() => expect(searchVehicles).toHaveBeenCalledWith({
+      query: "How many vehicles are there?",
+      run_id: "latest",
+    }));
   });
 });
