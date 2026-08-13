@@ -47,7 +47,12 @@ export function RunsPage() {
                   <td>{run.processed_frames ?? "Unavailable"}</td>
                   <td>{formatRelativeDate(run.start_time)}</td>
                   <td>{formatVideoTime(run.duration_seconds)}</td>
-                  <td><Link to={`/vehicles?run_id=${encodeURIComponent(run.run_id)}`}>Open vehicles</Link></td>
+                  <td>
+                    <div className="run-actions">
+                      <Link to={`/vehicles?run_id=${encodeURIComponent(run.run_id)}`}>Vehicles</Link>
+                      <Link to={`/runs/${encodeURIComponent(run.run_id)}/reconciliation`}>Reconciliation</Link>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>

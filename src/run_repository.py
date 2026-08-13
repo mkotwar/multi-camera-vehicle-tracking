@@ -89,6 +89,46 @@ class RunRepository:
             },
         }
 
+    def get_track_reconciliation(self, run_id: str) -> dict[str, Any] | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None:
+            return None
+        experiment_dir = run_dir / "track_reconciliation_test"
+        result = self._read_json(experiment_dir / "track_reconciliation_test.json", default=None)
+        if not isinstance(result, dict):
+            return {
+                "run_id": run_id,
+                "available": False,
+                "message": "Reconciliation test has not been run for this run.",
+                "metrics": {},
+                "config": {},
+                "tracks": [],
+                "accepted_associations": [],
+                "manual_validation": [],
+                "visual_evidence": [],
+                "paths": {},
+            }
+        associations = self._read_csv_rows(experiment_dir / "association_table.csv")
+        manual_validation = self._read_csv_rows(experiment_dir / "manual_validation.csv")
+        visual_evidence = self._build_reconciliation_visual_evidence(run_id=run_id, experiment_dir=experiment_dir)
+        return {
+            "run_id": run_id,
+            "available": True,
+            "message": None,
+            "metrics": result.get("metrics", {}),
+            "config": result.get("config", {}),
+            "tracks": result.get("tracks", []),
+            "accepted_associations": result.get("accepted_associations", associations),
+            "manual_validation": manual_validation,
+            "visual_evidence": visual_evidence,
+            "paths": {
+                "result_json": str(experiment_dir / "track_reconciliation_test.json"),
+                "association_table": str(experiment_dir / "association_table.csv"),
+                "manual_validation": str(experiment_dir / "manual_validation.csv"),
+                "report": str(experiment_dir / "report.md"),
+            },
+        }
+
     def list_tracks(
         self,
         *,
@@ -338,6 +378,7 @@ class RunRepository:
             "tracked_frames": run_dir / "tracked_frames",
             "detected_frames": run_dir / "detected_frames",
             "raw_frames": run_dir / "raw_frames",
+            "track_reconciliation_visual": run_dir / "track_reconciliation_test" / "visual_evidence",
         }
         return mapping.get(category)
 
@@ -348,6 +389,15 @@ class RunRepository:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return default
+
+    def _read_csv_rows(self, path: Path) -> list[dict[str, str]]:
+        if not path.exists():
+            return []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                return list(csv.DictReader(handle))
+        except Exception:
+            return []
 
     def _read_yaml_text(self, path: Path) -> str | None:
         if not path.exists():
@@ -435,6 +485,7 @@ class RunRepository:
             "tracked_frames": run_dir / "tracked_frames",
             "detected_frames": run_dir / "detected_frames",
             "raw_frames": run_dir / "raw_frames",
+            "track_reconciliation_visual": run_dir / "track_reconciliation_test" / "visual_evidence",
         }
         for category, root in category_roots.items():
             try:
@@ -464,6 +515,37 @@ class RunRepository:
         if candidate.exists():
             return [camera_id, candidate.name]
         return None
+
+    def _build_reconciliation_visual_evidence(self, *, run_id: str, experiment_dir: Path) -> list[dict[str, Any]]:
+        root = experiment_dir / "visual_evidence"
+        if not root.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for result_dir in sorted([item for item in root.iterdir() if item.is_dir()]):
+            for pair_dir in sorted([item for item in result_dir.iterdir() if item.is_dir()]):
+                contact = pair_dir / "before_after_contact_sheet.jpg"
+                before = next((item for item in (pair_dir / "before_occlusion").glob("*.jpg")), None) if (pair_dir / "before_occlusion").exists() else None
+                after = next((item for item in (pair_dir / "after_occlusion").glob("*.jpg")), None) if (pair_dir / "after_occlusion").exists() else None
+                rows.append(
+                    {
+                        "result": result_dir.name,
+                        "pair_key": pair_dir.name,
+                        "contact_sheet_url": self._reconciliation_media_url(run_id, root, contact),
+                        "before_url": self._reconciliation_media_url(run_id, root, before),
+                        "after_url": self._reconciliation_media_url(run_id, root, after),
+                    }
+                )
+        return rows
+
+    def _reconciliation_media_url(self, run_id: str, root: Path, path: Path | None) -> str | None:
+        if path is None or not path.exists():
+            return None
+        try:
+            relative = path.relative_to(root.resolve())
+        except ValueError:
+            return None
+        parts = "/".join(relative.parts)
+        return f"/api/media/track_reconciliation_visual/{run_id}/{parts}"
 
 
 def read_csv_rows(path: str | Path) -> list[dict[str, str]]:

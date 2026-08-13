@@ -1,0 +1,30 @@
+track_reconciliation:
+  enabled: true
+  max_gap_seconds: 2.0
+  minimum_observations: 3
+  history_points: 5
+  future_points: 5
+  minimum_motion_pixels: 8.0
+  position_sigma_pixels: 120.0
+  base_feasible_distance_pixels: 90.0
+  speed_distance_multiplier: 2.5
+  frame_diagonal_multiplier: 0.08
+  behind_projection_tolerance_pixels: 35.0
+  direction_reject_cosine: -0.35
+  weights:
+    motion: 0.20
+    position: 0.35
+    direction: 0.20
+    colour: 0.15
+    class: 0.10
+  match_threshold: 0.72
+  minimum_margin: 0.12
+  colour_compatible_pairs:
+    - [BLACK, GREY]
+    - [WHITE, SILVER]
+    - [GREY, SILVER]
+  debug_visuals:
+    enabled: true
+    source: tracked_frames
+    include_accepted: true
+    include_ambiguous: true

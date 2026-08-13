@@ -759,3 +759,98 @@ def test_api_health_tracks_and_latest_regression(tmp_path: Path) -> None:
     runs_response = client.get("/api/runs")
     assert runs_response.status_code == 200
     assert runs_response.json()[0]["run_id"] == run_id
+
+
+def test_api_track_reconciliation_available_missing_and_tracks_json_untouched(tmp_path: Path) -> None:
+    run_id = _build_run(tmp_path)
+    run_dir = tmp_path / run_id
+    tracks_before = (run_dir / "tracks.json").read_text(encoding="utf-8")
+    reconciliation_dir = run_dir / "track_reconciliation_test"
+    visual_dir = reconciliation_dir / "visual_evidence" / "accepted" / "CAM_001_TRACK_1__CAM_002_TRACK_2"
+    visual_dir.mkdir(parents=True)
+    (visual_dir / "before_after_contact_sheet.jpg").write_bytes(b"contact")
+    _write_json(
+        reconciliation_dir / "track_reconciliation_test.json",
+        {
+            "metrics": {
+                "raw_bytetrack_unique_tracks": 2,
+                "reconciled_vehicle_identities": 1,
+                "track_fragments_merged": 1,
+                "accepted_matches": 1,
+                "ambiguous_matches": 0,
+            },
+            "config": {"enabled": True},
+            "tracks": [
+                {
+                    "local_track_id": "CAM_001:TRACK_1",
+                    "camera_id": "CAM_001",
+                    "status": "COMPLETED",
+                    "vehicle_id": "VEHICLE_001",
+                    "reconciliation": {"matched": False, "result": "unmatched"},
+                },
+                {
+                    "local_track_id": "CAM_002:TRACK_2",
+                    "camera_id": "CAM_002",
+                    "status": "COMPLETED",
+                    "vehicle_id": "VEHICLE_001",
+                    "reconciliation": {
+                        "matched": True,
+                        "previous_track_id": "CAM_001:TRACK_1",
+                        "score": 0.7478,
+                        "second_best_score": 0.12,
+                        "time_gap_frames": 28,
+                        "time_gap_seconds": 0.93,
+                        "result": "accepted",
+                    },
+                },
+            ],
+            "accepted_associations": [
+                {
+                    "old_track": "CAM_001:TRACK_1",
+                    "new_track": "CAM_002:TRACK_2",
+                    "vehicle_id": "VEHICLE_001",
+                    "gap_frames": 28,
+                    "gap_seconds": 0.93,
+                    "score": 0.7478,
+                    "second_best_score": 0.12,
+                    "colour": "WHITE",
+                    "class": "CAR",
+                    "result": "ACCEPTED",
+                }
+            ],
+        },
+    )
+    (reconciliation_dir / "association_table.csv").write_text(
+        "old_track,new_track,vehicle_id,gap_frames,gap_seconds,score,second_best_score,colour,class,result\n"
+        "CAM_001:TRACK_1,CAM_002:TRACK_2,VEHICLE_001,28,0.93,0.7478,0.12,WHITE,CAR,ACCEPTED\n",
+        encoding="utf-8",
+    )
+    (reconciliation_dir / "manual_validation.csv").write_text(
+        "old_track,new_track,vehicle_id,score,manual_label,reviewer_notes\n"
+        "CAM_001:TRACK_1,CAM_002:TRACK_2,VEHICLE_001,0.7478,UNCERTAIN,\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.get(f"/api/runs/{run_id}/reconciliation")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["metrics"]["raw_bytetrack_unique_tracks"] == 2
+    assert payload["metrics"]["reconciled_vehicle_identities"] == 1
+    assert payload["tracks"][0]["vehicle_id"] == "VEHICLE_001"
+    assert payload["tracks"][1]["vehicle_id"] == "VEHICLE_001"
+    assert payload["accepted_associations"][0]["old_track"] == "CAM_001:TRACK_1"
+    assert payload["manual_validation"][0]["manual_label"] == "UNCERTAIN"
+    assert payload["visual_evidence"][0]["contact_sheet_url"].endswith(
+        "/api/media/track_reconciliation_visual/20260808_182124/accepted/CAM_001_TRACK_1__CAM_002_TRACK_2/before_after_contact_sheet.jpg"
+    )
+    assert (run_dir / "tracks.json").read_text(encoding="utf-8") == tracks_before
+
+    missing_run_id = "20260808_190000"
+    _write_json(tmp_path / missing_run_id / "summary.json", {"run_id": missing_run_id, "status": "COMPLETED"})
+    missing_response = client.get(f"/api/runs/{missing_run_id}/reconciliation")
+    assert missing_response.status_code == 200
+    assert missing_response.json()["available"] is False
+    assert missing_response.json()["message"] == "Reconciliation test has not been run for this run."

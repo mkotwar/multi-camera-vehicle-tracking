@@ -333,6 +333,23 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
             raise HTTPException(status_code=404, detail="Run not found")
         return payload
 
+    def _get_track_reconciliation_payload(run_id: str) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = repository.get_track_reconciliation(resolved_run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return payload
+
+    @app.get("/api/runs/{run_id}/track-reconciliation")
+    def get_track_reconciliation(run_id: str) -> dict[str, Any]:
+        return _get_track_reconciliation_payload(run_id)
+
+    @app.get("/api/runs/{run_id}/reconciliation")
+    def get_reconciliation(run_id: str) -> dict[str, Any]:
+        return _get_track_reconciliation_payload(run_id)
+
     @app.get("/api/system/status")
     def get_system_status() -> dict[str, Any]:
         current = runtime_state.get_system_status()

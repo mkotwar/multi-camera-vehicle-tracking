@@ -78,7 +78,17 @@ export type ChatMessage = {
   id: string;
   role: ChatRole;
   text: string;
+  timestamp: string;
   evidence?: VehicleEvidence[];
   evidence_page?: EvidencePage;
   debug?: Pick<VideoChatResponse, "original_query" | "parser_used" | "llm_attempted" | "llm_accepted" | "llm_rejection_reason" | "llm_raw_structured_output" | "normalized_llm_output" | "message_type" | "context_was_available" | "context_reference" | "filters_before_context" | "filters_after_context" | "explicit_filters_detected" | "filters_before_validation" | "filters_after_validation" | "group_by" | "matching_vehicle_ids_count" | "context_saved_vehicle_ids_count" | "parsed_query" | "analytics_result" | "matching_vehicle_ids" | "context_used">;
+};
+
+export type PersistedVideoChatSession = {
+  version: 1;
+  session_id: string;
+  run_id: string;
+  created_at: string;
+  updated_at: string;
+  messages: ChatMessage[];
 };

@@ -3,9 +3,11 @@ import { Link } from "react-router-dom";
 import { useSearchParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { fetchFilterOptions } from "../api/filters";
+import { fetchTrackReconciliation } from "../api/runs";
 import { fetchTracks } from "../api/tracks";
 import { searchVehicles } from "../api/vehicleSearch";
 import type { FilterOptions } from "../types/filters";
+import type { ReconciliationAssociation, ReconciliationTrack, TrackReconciliationResult } from "../types/run";
 import type { TrackRecord } from "../types/track";
 import type { VehicleSearchResponse } from "../types/vehicleSearch";
 import { formatVideoTime, parseVideoTime } from "../utils/time";
@@ -31,6 +33,100 @@ const DEFAULT_FILTERS: Filters = {
 };
 
 const PAGE_SIZE = 25;
+type TrackingViewMode = "raw" | "reconciled";
+
+type ReconciledVehicleRow = {
+  vehicle_id: string;
+  camera_id: string;
+  vehicle_class: string;
+  colour: string;
+  fragments: ReconciliationTrack[];
+  accepted?: ReconciliationAssociation;
+  recovered: boolean;
+  first_seen_seconds: number | null;
+  last_seen_seconds: number | null;
+  gap_frames?: number | string | null;
+  gap_seconds?: number | string | null;
+  score?: number | string | null;
+  second_best_score?: number | string | null;
+  result: string;
+};
+
+function formatNumber(value: unknown): string {
+  if (value === null || value === undefined || value === "") {
+    return "0";
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toLocaleString() : String(value);
+}
+
+function formatScore(value: unknown): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(3) : "Unavailable";
+}
+
+function formatSeconds(value: unknown): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${numeric.toFixed(2)}s` : "Unavailable";
+}
+
+function shortTrackId(value: string): string {
+  const parts = value.split(":");
+  return parts[parts.length - 1] || value;
+}
+
+function trackColour(track: ReconciliationTrack): string {
+  return String(track.vehicle_enrichment?.vehicle_colour?.label ?? "UNKNOWN").toUpperCase();
+}
+
+function trackClass(track: ReconciliationTrack): string {
+  return String(track.vehicle_enrichment?.vehicle_class ?? track.final_class ?? "UNKNOWN").toUpperCase();
+}
+
+function buildReconciledRows(reconciliation: TrackReconciliationResult | null): ReconciledVehicleRow[] {
+  if (!reconciliation?.available) return [];
+  const completed = (reconciliation.tracks ?? []).filter((track) => String(track.status ?? "").toUpperCase() === "COMPLETED");
+  const byVehicle = new Map<string, ReconciliationTrack[]>();
+  for (const track of completed) {
+    const vehicleId = String(track.vehicle_id || track.local_track_id);
+    const group = byVehicle.get(vehicleId) ?? [];
+    group.push(track);
+    byVehicle.set(vehicleId, group);
+  }
+  const acceptedByVehicle = new Map<string, ReconciliationAssociation>();
+  for (const association of reconciliation.accepted_associations ?? []) {
+    acceptedByVehicle.set(association.vehicle_id, association);
+  }
+  return [...byVehicle.entries()]
+    .map(([vehicleId, fragments]) => {
+      const sortedFragments = [...fragments].sort((left, right) => Number(left.first_frame ?? 0) - Number(right.first_frame ?? 0));
+      const accepted = acceptedByVehicle.get(vehicleId);
+      const matchedFragment = sortedFragments.find((fragment) => fragment.reconciliation?.matched);
+      const recovered = sortedFragments.length > 1 || Boolean(accepted || matchedFragment);
+      return {
+        vehicle_id: vehicleId,
+        camera_id: String(sortedFragments[0]?.camera_id ?? ""),
+        vehicle_class: trackClass(sortedFragments[0]),
+        colour: trackColour(sortedFragments[0]),
+        fragments: sortedFragments,
+        accepted,
+        recovered,
+        first_seen_seconds: nullableNumber(sortedFragments[0]?.first_timestamp_seconds),
+        last_seen_seconds: nullableNumber(sortedFragments[sortedFragments.length - 1]?.last_timestamp_seconds),
+        gap_frames: accepted?.gap_frames ?? matchedFragment?.reconciliation?.time_gap_frames,
+        gap_seconds: accepted?.gap_seconds ?? matchedFragment?.reconciliation?.time_gap_seconds,
+        score: accepted?.score ?? matchedFragment?.reconciliation?.score,
+        second_best_score: accepted?.second_best_score ?? matchedFragment?.reconciliation?.second_best_score,
+        result: recovered ? "RECOVERED" : "ORIGINAL",
+      };
+    })
+    .sort((left, right) => Number(left.fragments[0]?.first_frame ?? 0) - Number(right.fragments[0]?.first_frame ?? 0));
+}
+
+function nullableNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
 
 function getActiveChips(filters: Filters): string[] {
   return [
@@ -56,6 +152,9 @@ export function VehicleSearchPage() {
   const [nlResult, setNlResult] = useState<VehicleSearchResponse | null>(null);
   const [nlError, setNlError] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  const [trackingView, setTrackingView] = useState<TrackingViewMode>("raw");
+  const [reconciliation, setReconciliation] = useState<TrackReconciliationResult | null>(null);
+  const [reconciliationError, setReconciliationError] = useState<string | null>(null);
 
   const load = async (next = filters) => {
     setError(null);
@@ -87,6 +186,26 @@ export function VehicleSearchPage() {
     void fetchFilterOptions(filters.run_id).then(setOptions);
   }, [filters.run_id]);
 
+  useEffect(() => {
+    if (trackingView !== "reconciled") return;
+    let active = true;
+    setReconciliationError(null);
+    void fetchTrackReconciliation(filters.run_id || "latest")
+      .then((payload) => {
+        if (!active) return;
+        setReconciliation(payload);
+        setCurrentPage(1);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setReconciliation(null);
+        setReconciliationError(loadError instanceof Error ? loadError.message : "Failed to load reconciliation output.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [filters.run_id, trackingView]);
+
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     void load();
@@ -117,6 +236,9 @@ export function VehicleSearchPage() {
 
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const pagedRows = useMemo(() => rows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [currentPage, rows]);
+  const reconciledRows = useMemo(() => buildReconciledRows(reconciliation), [reconciliation]);
+  const reconciledTotalPages = Math.max(1, Math.ceil(reconciledRows.length / PAGE_SIZE));
+  const pagedReconciledRows = useMemo(() => reconciledRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [currentPage, reconciledRows]);
   const activeChips = getActiveChips(filters);
 
   return (
@@ -202,6 +324,22 @@ export function VehicleSearchPage() {
         ) : null}
 
         <div className="table-toolbar">
+          <div>
+            <strong>Tracking View</strong>
+            <span className="muted"> Raw tracks are production data. Reconciled vehicles are experiment-only.</span>
+          </div>
+          <div className="grid-controls" role="group" aria-label="Tracking View">
+            <button type="button" className={`chip-button ${trackingView === "raw" ? "active" : ""}`} onClick={() => { setTrackingView("raw"); setCurrentPage(1); }}>
+              Raw Tracks
+            </button>
+            <button type="button" className={`chip-button ${trackingView === "reconciled" ? "active" : ""}`} onClick={() => { setTrackingView("reconciled"); setCurrentPage(1); }}>
+              Reconciled Vehicles
+            </button>
+          </div>
+        </div>
+
+        <div hidden={trackingView !== "raw"}>
+        <div className="table-toolbar">
           <strong>{rows.length} vehicles found</strong>
           <span className="muted">Run context: {filters.run_id === "latest" ? "Latest" : filters.run_id || "All Runs"}</span>
         </div>
@@ -256,8 +394,190 @@ export function VehicleSearchPage() {
             </div>
           </>
         )}
+        </div>
+
+        {trackingView === "reconciled" ? (
+          <ReconciledVehiclesView
+            reconciliation={reconciliation}
+            error={reconciliationError}
+            rows={pagedReconciledRows}
+            allRowsCount={reconciledRows.length}
+            currentPage={currentPage}
+            totalPages={reconciledTotalPages}
+            setCurrentPage={setCurrentPage}
+          />
+        ) : null}
       </section>
     </section>
+  );
+}
+
+function ReconciledVehiclesView({
+  reconciliation,
+  error,
+  rows,
+  allRowsCount,
+  currentPage,
+  totalPages,
+  setCurrentPage,
+}: {
+  reconciliation: TrackReconciliationResult | null;
+  error: string | null;
+  rows: ReconciledVehicleRow[];
+  allRowsCount: number;
+  currentPage: number;
+  totalPages: number;
+  setCurrentPage: (updater: (page: number) => number) => void;
+}) {
+  if (error) {
+    return <div className="empty-state">{error}</div>;
+  }
+  if (reconciliation === null) {
+    return <div className="empty-state">Loading reconciliation output...</div>;
+  }
+  if (!reconciliation.available) {
+    return (
+      <div className="empty-state">
+        <p>{reconciliation.message || "Reconciliation test not available for this run."}</p>
+        <code>{"python scripts/run_track_reconciliation_test.py --run-dir outputs\\runs\\<RUN_ID> --config config\\track_reconciliation_test.yaml"}</code>
+      </div>
+    );
+  }
+  const metrics = reconciliation.metrics ?? {};
+  return (
+    <>
+      <div className="summary-grid reconciliation-summary">
+        <MetricCard label="Raw ByteTrack Tracks" value={metrics.raw_bytetrack_unique_tracks} />
+        <MetricCard label="Reconciled Vehicles" value={metrics.reconciled_vehicle_identities} />
+        <MetricCard label="Recovered Fragments" value={metrics.track_fragments_merged ?? metrics.potential_duplicate_tracks_removed} />
+        <MetricCard label="Accepted Matches" value={metrics.accepted_matches} />
+        <MetricCard label="Ambiguous Matches" value={metrics.ambiguous_matches} />
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="empty-state">No reconciled vehicles found in this experiment output.</div>
+      ) : (
+        <>
+          <div className="table-wrapper">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Vehicle ID</th>
+                  <th>Track Fragments</th>
+                  <th>Class</th>
+                  <th>Colour</th>
+                  <th>Occlusion Recovery</th>
+                  <th>Gap</th>
+                  <th>Score</th>
+                  <th>Second Best</th>
+                  <th>Status</th>
+                  <th>Evidence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={row.vehicle_id}>
+                    <td><span className="status">{row.vehicle_id}</span></td>
+                    <td>
+                      <div className="search-id-list">
+                        {row.fragments.map((fragment) => <code key={fragment.local_track_id}>{shortTrackId(fragment.local_track_id)}</code>)}
+                      </div>
+                      <span className="muted">{row.fragments.map((fragment) => shortTrackId(fragment.local_track_id)).join(" -> ")}</span>
+                    </td>
+                    <td>{row.vehicle_class}</td>
+                    <td><span className="colour-badge">{row.colour}</span></td>
+                    <td>{row.recovered ? "YES" : "NO"}</td>
+                    <td>{row.recovered ? `${formatNumber(row.gap_frames)} frames / ${formatSeconds(row.gap_seconds)}` : "-"}</td>
+                    <td>{row.recovered ? formatScore(row.score) : "-"}</td>
+                    <td>{row.recovered ? formatScore(row.second_best_score) : "-"}</td>
+                    <td>{row.result}</td>
+                    <td>{row.recovered ? <Link to={`/runs/${encodeURIComponent(reconciliation.run_id)}/reconciliation`}>View Evidence</Link> : "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <Pagination allRowsCount={allRowsCount} currentPage={currentPage} totalPages={totalPages} setCurrentPage={setCurrentPage} />
+        </>
+      )}
+
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <h3>Accepted Associations</h3>
+            <p className="muted">Read-only test associations from the reconciliation output.</p>
+          </div>
+        </div>
+        {reconciliation.accepted_associations.length === 0 ? (
+          <div className="empty-state">No accepted associations.</div>
+        ) : (
+          <div className="table-wrapper">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Old Track</th>
+                  <th>New Track</th>
+                  <th>Vehicle ID</th>
+                  <th>Class</th>
+                  <th>Colour</th>
+                  <th>Gap</th>
+                  <th>Score</th>
+                  <th>Second Best</th>
+                  <th>Result</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reconciliation.accepted_associations.map((item) => (
+                  <tr key={`${item.old_track}->${item.new_track}`}>
+                    <td>{shortTrackId(item.old_track)}</td>
+                    <td>{shortTrackId(item.new_track)}</td>
+                    <td>{item.vehicle_id}</td>
+                    <td>{item.class ?? "UNKNOWN"}</td>
+                    <td>{item.colour ?? "UNKNOWN"}</td>
+                    <td>{formatSeconds(item.gap_seconds)}</td>
+                    <td>{formatScore(item.score)}</td>
+                    <td>{formatScore(item.second_best_score)}</td>
+                    <td>{item.result ?? "RECOVERED"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
+function Pagination({
+  allRowsCount,
+  currentPage,
+  totalPages,
+  setCurrentPage,
+}: {
+  allRowsCount: number;
+  currentPage: number;
+  totalPages: number;
+  setCurrentPage: (updater: (page: number) => number) => void;
+}) {
+  return (
+    <div className="pagination-bar">
+      <span>Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, allRowsCount)} of {allRowsCount}</span>
+      <div className="pagination-actions">
+        <button type="button" className="secondary-button" disabled={currentPage <= 1} onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}>Previous</button>
+        <span>Page {currentPage} / {totalPages}</span>
+        <button type="button" className="secondary-button" disabled={currentPage >= totalPages} onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}>Next</button>
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div className="card summary-card">
+      <span className="summary-label">{label}</span>
+      <strong className="summary-value">{formatNumber(value)}</strong>
+    </div>
   );
 }
 

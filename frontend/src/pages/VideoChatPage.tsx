@@ -1,10 +1,17 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { fetchRuns } from "../api/runs";
 import { sendVideoChatMessage } from "../api/videoChat";
+import { TrackDetailPanel, type TrackSelection } from "../components/track/TrackDetailPanel";
 import type { RunSummary } from "../types/run";
 import type { ChatMessage, EvidencePage, VideoChatResponse, VehicleEvidence } from "../types/videoChat";
+import {
+  getOrCreateVideoChatSessionForRun,
+  loadActiveVideoChatRunId,
+  replaceVideoChatSessionForRun,
+  saveActiveVideoChatRunId,
+  saveVideoChatSessionForRun,
+} from "../utils/videoChatPersistence";
 import { formatVideoTime } from "../utils/time";
 
 const PROMPT_SUGGESTIONS = [
@@ -15,14 +22,15 @@ const PROMPT_SUGGESTIONS = [
 ];
 
 export function VideoChatPage() {
+  const [chatSession, setChatSession] = useState(() => getOrCreateVideoChatSessionForRun(loadActiveVideoChatRunId() ?? "latest"));
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [runId, setRunId] = useState("latest");
-  const [sessionId] = useState(() => `video-chat-${Date.now()}`);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [runId, setRunId] = useState(chatSession.run_id);
+  const [messages, setMessages] = useState<ChatMessage[]>(chatSession.messages);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userIsReading, setUserIsReading] = useState(false);
+  const [selectedTrack, setSelectedTrack] = useState<TrackSelection | null>(null);
   const chatHistoryRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -30,8 +38,8 @@ export function VideoChatPage() {
     void fetchRuns()
       .then((items) => {
         setRuns(items);
-        if (items[0]?.run_id) {
-          setRunId(items[0].run_id);
+        if (items[0]?.run_id && messages.length === 0 && chatSession.run_id === "latest") {
+          loadRunSession(items[0].run_id);
         }
       })
       .catch(() => setRuns([]));
@@ -57,14 +65,15 @@ export function VideoChatPage() {
     event?.preventDefault();
     const text = (override ?? input).trim();
     if (!text || isSending) return;
-    const userMessage: ChatMessage = { id: `user-${Date.now()}`, role: "user", text };
-    setMessages((current) => [...current, userMessage]);
+    const sessionId = chatSession.session_id;
+    const userMessage: ChatMessage = { id: makeMessageId("user"), role: "user", text, timestamp: new Date().toISOString() };
+    persistMessages((current) => [...current, userMessage]);
     setInput("");
     setError(null);
     setIsSending(true);
     try {
       const response = await sendVideoChatMessage({ message: text, run_id: runId, session_id: sessionId });
-      setMessages((current) => [...current, responseToMessage(response)]);
+      persistMessages((current) => [...current, responseToMessage(response)]);
     } catch (chatError) {
       setError(describeChatError(chatError));
     } finally {
@@ -79,6 +88,49 @@ export function VideoChatPage() {
   const showMoreEvidence = () => {
     void submitMessage(undefined, "Show more");
   };
+
+  const selectTrack = (track: TrackSelection) => {
+    setSelectedTrack(track);
+  };
+
+  const startNewChat = (nextRunId = runId) => {
+    const nextSession = replaceVideoChatSessionForRun(nextRunId);
+    setChatSession(nextSession);
+    setRunId(nextRunId);
+    setMessages([]);
+    setSelectedTrack(null);
+    setInput("");
+    setError(null);
+    setUserIsReading(false);
+  };
+
+  const changeRun = (nextRunId: string) => {
+    loadRunSession(nextRunId);
+  };
+
+  function loadRunSession(nextRunId: string) {
+    const nextSession = getOrCreateVideoChatSessionForRun(nextRunId);
+    setChatSession(nextSession);
+    setRunId(nextRunId);
+    setMessages(nextSession.messages);
+    setSelectedTrack(null);
+    setError(null);
+    setUserIsReading(false);
+    saveActiveVideoChatRunId(nextRunId);
+    if (nextSession.messages.length === 0) {
+      saveVideoChatSessionForRun(nextSession);
+    }
+  }
+
+  function persistMessages(updater: (current: ChatMessage[]) => ChatMessage[]) {
+    setMessages((current) => {
+      const nextMessages = updater(current);
+      const nextSession = { ...chatSession, run_id: runId, messages: nextMessages };
+      setChatSession(nextSession);
+      saveVideoChatSessionForRun(nextSession);
+      return nextMessages;
+    });
+  }
 
   const runBadges = [
     { label: "Run", value: selectedRun?.run_id ?? runId },
@@ -113,7 +165,7 @@ export function VideoChatPage() {
           <div className="chat-panel-toolbar">
             <label>
               <span>Run / video</span>
-              <select value={runId} onChange={(event) => setRunId(event.target.value)} aria-label="Video chat run">
+              <select value={runId} onChange={(event) => changeRun(event.target.value)} aria-label="Video chat run">
                 {runs.length === 0 ? <option value="latest">Latest</option> : null}
                 {runs.map((run) => (
                   <option key={run.run_id} value={run.run_id}>
@@ -123,6 +175,9 @@ export function VideoChatPage() {
               </select>
             </label>
             <span className="status status-completed">{selectedRun?.status ?? "Latest"}</span>
+            <button type="button" className="secondary-button compact-action" onClick={() => startNewChat()}>
+              New Chat
+            </button>
           </div>
 
           <div ref={chatHistoryRef} className="chat-history" aria-label="Video analytics chat history" onScroll={handleScroll}>
@@ -133,6 +188,8 @@ export function VideoChatPage() {
                 message={message}
                 onShowEvidence={askForEvidence}
                 onShowMore={showMoreEvidence}
+                onSelectTrack={selectTrack}
+                selectedTrack={selectedTrack}
               />
             ))}
             {isSending ? <TypingState /> : null}
@@ -153,6 +210,7 @@ export function VideoChatPage() {
           selectedRun={selectedRun}
           runId={runId}
           latestMessage={latestAssistantMessage}
+          selectedTrack={selectedTrack}
         />
       </section>
     </section>
@@ -161,9 +219,10 @@ export function VideoChatPage() {
 
 function responseToMessage(response: VideoChatResponse): ChatMessage {
   return {
-    id: `assistant-${Date.now()}`,
+    id: makeMessageId("assistant"),
     role: "assistant",
     text: response.answer,
+    timestamp: new Date().toISOString(),
     evidence: response.evidence,
     evidence_page: response.evidence_page,
     debug: {
@@ -193,6 +252,10 @@ function responseToMessage(response: VideoChatResponse): ChatMessage {
   };
 }
 
+function makeMessageId(role: ChatMessage["role"]) {
+  return `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function ChatEmptyState({ onPrompt }: { onPrompt: (event?: FormEvent, override?: string) => void }) {
   return (
     <section className="chat-empty-state">
@@ -216,10 +279,14 @@ function ChatMessageCard({
   message,
   onShowEvidence,
   onShowMore,
+  onSelectTrack,
+  selectedTrack,
 }: {
   message: ChatMessage;
   onShowEvidence: () => void;
   onShowMore: () => void;
+  onSelectTrack: (track: TrackSelection) => void;
+  selectedTrack: TrackSelection | null;
 }) {
   const hasEvidence = Boolean(message.evidence?.length);
   const isAnalytics = message.debug?.parsed_query.intent !== "GENERAL_CHAT";
@@ -231,6 +298,7 @@ function ChatMessageCard({
       <div className="chat-message">
         <div className="chat-message-meta">
           <span>{message.role === "assistant" ? "Analytics Assistant" : "You"}</span>
+          <time dateTime={message.timestamp}>{formatMessageTime(message.timestamp)}</time>
         </div>
         {message.role === "assistant" ? <ResultPresentation message={message} /> : <p>{message.text}</p>}
         {canShowEvidence ? (
@@ -238,7 +306,15 @@ function ChatMessageCard({
             Show evidence
           </button>
         ) : null}
-        {hasEvidence ? <EvidenceSection evidence={message.evidence ?? []} page={message.evidence_page} onShowMore={onShowMore} /> : null}
+        {hasEvidence ? (
+          <EvidenceSection
+            evidence={message.evidence ?? []}
+            page={message.evidence_page}
+            onShowMore={onShowMore}
+            onSelectTrack={onSelectTrack}
+            selectedTrack={selectedTrack}
+          />
+        ) : null}
         {message.debug ? <DebugDetails debug={message.debug} /> : null}
       </div>
     </article>
@@ -289,7 +365,19 @@ function ResultPresentation({ message }: { message: ChatMessage }) {
   );
 }
 
-function EvidenceSection({ evidence, page, onShowMore }: { evidence: VehicleEvidence[]; page?: EvidencePage; onShowMore: () => void }) {
+function EvidenceSection({
+  evidence,
+  page,
+  onShowMore,
+  onSelectTrack,
+  selectedTrack,
+}: {
+  evidence: VehicleEvidence[];
+  page?: EvidencePage;
+  onShowMore: () => void;
+  onSelectTrack: (track: TrackSelection) => void;
+  selectedTrack: TrackSelection | null;
+}) {
   const total = page?.matching_total ?? evidence.length;
   const shown = page?.shown_count ?? evidence.length;
   const remaining = page?.evidence_remaining_count ?? 0;
@@ -308,33 +396,57 @@ function EvidenceSection({ evidence, page, onShowMore }: { evidence: VehicleEvid
           <span>All {total} matching vehicles shown.</span>
         )}
       </div>
-      <EvidenceGrid evidence={evidence} />
+      <EvidenceGrid evidence={evidence} onSelectTrack={onSelectTrack} selectedTrack={selectedTrack} />
     </section>
   );
 }
 
-function EvidenceGrid({ evidence }: { evidence: VehicleEvidence[] }) {
+function EvidenceGrid({
+  evidence,
+  onSelectTrack,
+  selectedTrack,
+}: {
+  evidence: VehicleEvidence[];
+  onSelectTrack?: (track: TrackSelection) => void;
+  selectedTrack?: TrackSelection | null;
+}) {
   return (
     <div className="chat-evidence-grid">
-      {evidence.map((item) => (
-        <article key={item.vehicle_id} className="chat-evidence-card">
-          <span className="evidence-accent" aria-hidden="true" />
-          {item.image_url ? (
-            <img src={item.image_url} alt={`${item.vehicle_class} ${item.colour} crop for ${item.track_id}`} loading="lazy" />
-          ) : (
-            <div className="thumb-placeholder">No crop</div>
-          )}
-          <div className="evidence-card-body">
-            <strong>{item.track_id}</strong>
-            <div className="evidence-badge-row">
-              <span>{item.vehicle_class}</span>
-              <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
+      {evidence.map((item) => {
+        const runId = runIdFromEvidence(item);
+        const isSelected =
+          selectedTrack?.cameraId === item.camera_id &&
+          selectedTrack?.trackId === item.track_id &&
+          (selectedTrack?.runId ?? null) === (runId ?? null);
+        return (
+          <article key={item.vehicle_id} className={`chat-evidence-card ${isSelected ? "selected" : ""}`}>
+            <span className="evidence-accent" aria-hidden="true" />
+            {item.image_url ? (
+              <img src={item.image_url} alt={`${item.vehicle_class} ${item.colour} crop for ${item.track_id}`} loading="lazy" />
+            ) : (
+              <div className="thumb-placeholder">No crop</div>
+            )}
+            <div className="evidence-card-body">
+              <strong>{item.track_id}</strong>
+              <div className="evidence-badge-row">
+                <span>{item.vehicle_class}</span>
+                <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
+              </div>
+              <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
+              {onSelectTrack ? (
+                <button
+                  type="button"
+                  className="evidence-track-link"
+                  aria-pressed={isSelected}
+                  onClick={() => onSelectTrack({ runId, cameraId: item.camera_id, trackId: item.track_id })}
+                >
+                  {isSelected ? "Selected" : "View Track"}
+                </button>
+              ) : null}
             </div>
-            <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
-            <Link className="evidence-track-link" to={item.track_detail_url}>View Track</Link>
-          </div>
-        </article>
-      ))}
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -399,10 +511,12 @@ function VideoContextPanel({
   selectedRun,
   runId,
   latestMessage,
+  selectedTrack,
 }: {
   selectedRun?: RunSummary;
   runId: string;
   latestMessage?: ChatMessage;
+  selectedTrack: TrackSelection | null;
 }) {
   const filters = latestMessage?.debug?.parsed_query
     ? [
@@ -415,45 +529,64 @@ function VideoContextPanel({
 
   return (
     <aside className="video-context-panel" aria-label="Video chat context">
-      <section>
-        <h2>Current Video</h2>
-        <dl className="context-list">
-          <div><dt>Run</dt><dd>{selectedRun?.run_id ?? runId}</dd></div>
-          <div><dt>Status</dt><dd>{selectedRun?.status ?? "Latest"}</dd></div>
-          <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Unavailable"}</dd></div>
-          <div><dt>Completed vehicles</dt><dd>{selectedRun?.track_count ?? "Unavailable"}</dd></div>
-        </dl>
-      </section>
-      <section>
-        <h2>Latest Result</h2>
-        {latestMessage ? (
-          <div className="latest-result-card">
-            <span>Query</span>
-            <strong>{latestMessage.debug?.original_query ?? latestMessage.text}</strong>
-            <div className="context-stat-row">
-              <div><span>Matches</span><strong>{matches}</strong></div>
-              <div><span>Parser</span><strong>{latestMessage.debug?.parser_used ?? "n/a"}</strong></div>
-            </div>
-            {filters.length ? (
-              <div className="filter-chip-row">
-                {filters.map((filter) => <span key={String(filter)}>{filter}</span>)}
+      {selectedTrack ? (
+        <section className="selected-track-panel" aria-label="Selected track details">
+          <TrackDetailPanel selection={selectedTrack} compact showFullPageAction />
+        </section>
+      ) : (
+        <>
+          <section>
+            <h2>Current Video</h2>
+            <dl className="context-list">
+              <div><dt>Run</dt><dd>{selectedRun?.run_id ?? runId}</dd></div>
+              <div><dt>Status</dt><dd>{selectedRun?.status ?? "Latest"}</dd></div>
+              <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Unavailable"}</dd></div>
+              <div><dt>Completed vehicles</dt><dd>{selectedRun?.track_count ?? "Unavailable"}</dd></div>
+            </dl>
+          </section>
+          <section>
+            <h2>Latest Result</h2>
+            {latestMessage ? (
+              <div className="latest-result-card">
+                <span>Query</span>
+                <strong>{latestMessage.debug?.original_query ?? latestMessage.text}</strong>
+                <div className="context-stat-row">
+                  <div><span>Matches</span><strong>{matches}</strong></div>
+                  <div><span>Parser</span><strong>{latestMessage.debug?.parser_used ?? "n/a"}</strong></div>
+                </div>
+                {filters.length ? (
+                  <div className="filter-chip-row">
+                    {filters.map((filter) => <span key={String(filter)}>{filter}</span>)}
+                  </div>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-        ) : (
-          <div className="empty-inline">No result yet.</div>
-        )}
-      </section>
-      <section>
-        <h2>Evidence</h2>
-        {latestMessage?.evidence?.length ? (
-          <EvidenceGrid evidence={latestMessage.evidence.slice(0, 2)} />
-        ) : (
-          <div className="empty-inline">Evidence appears after a matching list or follow-up request.</div>
-        )}
-      </section>
+            ) : (
+              <div className="empty-inline">No result yet.</div>
+            )}
+          </section>
+          <section>
+            <h2>Track Inspector</h2>
+            <div className="empty-inline">Select a vehicle from the chat results to inspect its track.</div>
+          </section>
+        </>
+      )}
     </aside>
   );
+}
+
+function runIdFromEvidence(item: VehicleEvidence): string | null {
+  try {
+    const url = new URL(item.track_detail_url, "http://local");
+    return url.searchParams.get("run_id");
+  } catch {
+    return null;
+  }
+}
+
+function formatMessageTime(timestamp: string) {
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return "";
+  return value.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function getResultMetrics(intent: string | undefined, analytics: Record<string, unknown>) {

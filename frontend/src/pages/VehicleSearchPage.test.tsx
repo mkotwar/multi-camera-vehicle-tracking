@@ -3,14 +3,19 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VehicleSearchPage } from "./VehicleSearchPage";
 
-const { fetchFilterOptions, fetchTracks, searchVehicles } = vi.hoisted(() => ({
+const { fetchFilterOptions, fetchTrackReconciliation, fetchTracks, searchVehicles } = vi.hoisted(() => ({
   fetchFilterOptions: vi.fn(),
+  fetchTrackReconciliation: vi.fn(),
   fetchTracks: vi.fn(),
   searchVehicles: vi.fn(),
 }));
 
 vi.mock("../api/filters", () => ({
   fetchFilterOptions,
+}));
+
+vi.mock("../api/runs", () => ({
+  fetchTrackReconciliation,
 }));
 
 vi.mock("../api/tracks", () => ({
@@ -41,6 +46,7 @@ describe("VehicleSearchPage", () => {
 
   beforeEach(() => {
     fetchFilterOptions.mockReset();
+    fetchTrackReconciliation.mockReset();
     fetchTracks.mockReset();
     searchVehicles.mockReset();
     fetchFilterOptions.mockResolvedValue({
@@ -81,6 +87,74 @@ describe("VehicleSearchPage", () => {
         vehicle_ids: ["CAM_001:TRACK_13", "CAM_001:TRACK_19"],
       },
       response: "There are 6 white cars.",
+    });
+    fetchTrackReconciliation.mockResolvedValue({
+      run_id: "20260808_182124",
+      available: true,
+      message: null,
+      metrics: {
+        raw_bytetrack_unique_tracks: 125,
+        reconciled_vehicle_identities: 120,
+        track_fragments_merged: 5,
+        accepted_matches: 5,
+        ambiguous_matches: 0,
+      },
+      config: {},
+      tracks: [
+        {
+          local_track_id: "CAM_001:TRACK_44",
+          track_id: "TRACK_44",
+          camera_id: "CAM_001",
+          status: "COMPLETED",
+          vehicle_id: "VEHICLE_037",
+          final_class: "car",
+          first_frame: 489,
+          last_frame: 506,
+          first_timestamp_seconds: 16.3,
+          last_timestamp_seconds: 16.86,
+          vehicle_enrichment: { vehicle_class: "CAR", vehicle_colour: { label: "WHITE", status: "completed" } },
+          reconciliation: { matched: false, result: "unmatched", reason: "no_recent_candidate" },
+        },
+        {
+          local_track_id: "CAM_001:TRACK_48",
+          track_id: "TRACK_48",
+          camera_id: "CAM_001",
+          status: "COMPLETED",
+          vehicle_id: "VEHICLE_037",
+          final_class: "car",
+          first_frame: 534,
+          last_frame: 565,
+          first_timestamp_seconds: 17.8,
+          last_timestamp_seconds: 18.83,
+          vehicle_enrichment: { vehicle_class: "CAR", vehicle_colour: { label: "WHITE", status: "completed" } },
+          reconciliation: {
+            matched: true,
+            previous_track_id: "CAM_001:TRACK_44",
+            score: 0.747848,
+            second_best_score: 0,
+            time_gap_frames: 28,
+            time_gap_seconds: 0.9333333333333336,
+            result: "accepted",
+          },
+        },
+      ],
+      accepted_associations: [
+        {
+          old_track: "CAM_001:TRACK_44",
+          new_track: "CAM_001:TRACK_48",
+          vehicle_id: "VEHICLE_037",
+          gap_frames: 28,
+          gap_seconds: 0.9333333333333336,
+          score: 0.747848,
+          second_best_score: 0,
+          colour: "WHITE",
+          class: "CAR",
+          result: "ACCEPTED",
+        },
+      ],
+      manual_validation: [],
+      visual_evidence: [],
+      paths: {},
     });
   });
 
@@ -262,5 +336,68 @@ describe("VehicleSearchPage", () => {
       query: "How many vehicles are there?",
       run_id: "latest",
     }));
+  });
+
+  it("defaults to raw tracks without loading reconciliation output", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+
+    expect(screen.getByRole("button", { name: "Raw Tracks" })).toBeInTheDocument();
+    expect(screen.getByText("TRACK_1")).toBeInTheDocument();
+    expect(fetchTrackReconciliation).not.toHaveBeenCalled();
+  });
+
+  it("shows reconciled vehicle identities with original track fragments and counts", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles?run_id=20260808_182124"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconciled Vehicles" }));
+
+    await waitFor(() => expect(fetchTrackReconciliation).toHaveBeenCalledWith("20260808_182124"));
+    expect(screen.getByText("Raw ByteTrack Tracks")).toBeInTheDocument();
+    expect(screen.getAllByText("Reconciled Vehicles").length).toBeGreaterThan(0);
+    expect(screen.getByText("Recovered Fragments")).toBeInTheDocument();
+    expect(screen.getAllByText("VEHICLE_037").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_44").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_48").length).toBeGreaterThan(0);
+    expect(screen.getByText("YES")).toBeInTheDocument();
+    expect(screen.getAllByText("0.748").length).toBeGreaterThan(0);
+    expect(screen.getByText("View Evidence")).toBeInTheDocument();
+    expect(screen.getByText("ACCEPTED")).toBeInTheDocument();
+  });
+
+  it("shows a clean missing reconciliation message without breaking raw tracks", async () => {
+    fetchTrackReconciliation.mockResolvedValue({
+      run_id: "20260808_182124",
+      available: false,
+      message: "Reconciliation test has not been run for this run.",
+      metrics: {},
+      config: {},
+      tracks: [],
+      accepted_associations: [],
+      manual_validation: [],
+      visual_evidence: [],
+      paths: {},
+    });
+    render(
+      <MemoryRouter initialEntries={["/vehicles?run_id=20260808_182124"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText("TRACK_1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Reconciled Vehicles" }));
+
+    await waitFor(() => expect(screen.getByText("Reconciliation test has not been run for this run.")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Raw Tracks" }));
+    expect(screen.getByText("TRACK_1")).toBeInTheDocument();
   });
 });
