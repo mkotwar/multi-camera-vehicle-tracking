@@ -3,11 +3,11 @@ import { Link } from "react-router-dom";
 import { useSearchParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { fetchFilterOptions } from "../api/filters";
-import { fetchTrackReconciliation } from "../api/runs";
+import { fetchExperimentalVehicles, fetchStationaryRecoveredVehicles, fetchTrackReconciliation } from "../api/runs";
 import { fetchTracks } from "../api/tracks";
 import { searchVehicles } from "../api/vehicleSearch";
 import type { FilterOptions } from "../types/filters";
-import type { ReconciliationAssociation, ReconciliationTrack, TrackReconciliationResult } from "../types/run";
+import type { ExperimentalVehicleIdentityResult, ReconciliationAssociation, ReconciliationTrack, StationaryRecoveryResult, TrackReconciliationResult } from "../types/run";
 import type { TrackRecord } from "../types/track";
 import type { VehicleSearchResponse } from "../types/vehicleSearch";
 import { formatVideoTime, parseVideoTime } from "../utils/time";
@@ -33,7 +33,7 @@ const DEFAULT_FILTERS: Filters = {
 };
 
 const PAGE_SIZE = 25;
-type TrackingViewMode = "raw" | "reconciled";
+type TrackingViewMode = "raw" | "reconciled" | "identity" | "stationary";
 
 type ReconciledVehicleRow = {
   vehicle_id: string;
@@ -155,6 +155,10 @@ export function VehicleSearchPage() {
   const [trackingView, setTrackingView] = useState<TrackingViewMode>("raw");
   const [reconciliation, setReconciliation] = useState<TrackReconciliationResult | null>(null);
   const [reconciliationError, setReconciliationError] = useState<string | null>(null);
+  const [identityResult, setIdentityResult] = useState<ExperimentalVehicleIdentityResult | null>(null);
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  const [stationaryResult, setStationaryResult] = useState<StationaryRecoveryResult | null>(null);
+  const [stationaryError, setStationaryError] = useState<string | null>(null);
 
   const load = async (next = filters) => {
     setError(null);
@@ -200,6 +204,46 @@ export function VehicleSearchPage() {
         if (!active) return;
         setReconciliation(null);
         setReconciliationError(loadError instanceof Error ? loadError.message : "Failed to load reconciliation output.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [filters.run_id, trackingView]);
+
+  useEffect(() => {
+    if (trackingView !== "stationary") return;
+    let active = true;
+    setStationaryError(null);
+    void fetchStationaryRecoveredVehicles(filters.run_id || "latest")
+      .then((payload) => {
+        if (!active) return;
+        setStationaryResult(payload);
+        setCurrentPage(1);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setStationaryResult(null);
+        setStationaryError(loadError instanceof Error ? loadError.message : "Failed to load stationary recovery output.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [filters.run_id, trackingView]);
+
+  useEffect(() => {
+    if (trackingView !== "identity") return;
+    let active = true;
+    setIdentityError(null);
+    void fetchExperimentalVehicles(filters.run_id || "latest")
+      .then((payload) => {
+        if (!active) return;
+        setIdentityResult(payload);
+        setCurrentPage(1);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setIdentityResult(null);
+        setIdentityError(loadError instanceof Error ? loadError.message : "Failed to load persistent identity output.");
       });
     return () => {
       active = false;
@@ -335,6 +379,12 @@ export function VehicleSearchPage() {
             <button type="button" className={`chip-button ${trackingView === "reconciled" ? "active" : ""}`} onClick={() => { setTrackingView("reconciled"); setCurrentPage(1); }}>
               Reconciled Vehicles
             </button>
+            <button type="button" className={`chip-button ${trackingView === "identity" ? "active" : ""}`} onClick={() => { setTrackingView("identity"); setCurrentPage(1); }}>
+              Persistent Identity
+            </button>
+            <button type="button" className={`chip-button ${trackingView === "stationary" ? "active" : ""}`} onClick={() => { setTrackingView("stationary"); setCurrentPage(1); }}>
+              Stationary-Recovered
+            </button>
           </div>
         </div>
 
@@ -407,8 +457,247 @@ export function VehicleSearchPage() {
             setCurrentPage={setCurrentPage}
           />
         ) : null}
+        {trackingView === "identity" ? (
+          <PersistentIdentityView
+            result={identityResult}
+            error={identityError}
+            currentPage={currentPage}
+            setCurrentPage={setCurrentPage}
+          />
+        ) : null}
+        {trackingView === "stationary" ? (
+          <StationaryRecoveredView result={stationaryResult} error={stationaryError} />
+        ) : null}
       </section>
     </section>
+  );
+}
+
+function StationaryRecoveredView({ result, error }: { result: StationaryRecoveryResult | null; error: string | null }) {
+  if (error) return <div className="empty-state">{error}</div>;
+  if (result === null) return <div className="empty-state">Loading stationary recovery output...</div>;
+  if (!result.available) {
+    return (
+      <div className="empty-state">
+        <p>{result.message || "Stationary recovery experiment is not available for this run."}</p>
+        <code>{"python scripts/run_vehicle_identity_test.py --run-dir outputs\\runs\\<RUN_ID>"}</code>
+      </div>
+    );
+  }
+  const metrics = result.metrics ?? {};
+  const analytics = result.analytics_simulation ?? {};
+  const selected = result.calibration?.selected_row ?? {};
+  const recovered = (result.persistent_vehicles ?? []).filter((vehicle) => vehicle.source_vehicle_ids.length > 1);
+  const negativeRows = (result.recovery_scores ?? [])
+    .filter((row) => String(row.rejected) === "True" || String(row.rejected) === "true")
+    .slice(0, 12);
+  return (
+    <>
+      <div className="summary-grid reconciliation-summary">
+        <MetricCard label="Conservative IDs" value={analytics.conservative_vehicle_identities} />
+        <MetricCard label="Recovered IDs" value={analytics.stationary_recovered_vehicle_identities} />
+        <MetricCard label="Extra Merges" value={analytics.duplicates_removed_by_stationary_recovery} />
+        <MetricCard label="Yellow Recovered" value={metrics.yellow_car_fully_recovered ? "YES" : "NO"} />
+        <MetricCard label="False Merges" value={metrics.confirmed_false_merges} />
+        <MetricCard label="Suspicious Merges" value={metrics.suspicious_overmerge_count} />
+      </div>
+      <div className="identity-note">
+        <strong>Stationary-recovered experimental mode</strong>
+        <span className="muted">Selected threshold {formatScore(selected.recovery_threshold)} with stationary confidence floor {formatScore(selected.minimum_stationary_confidence)} and max gap {formatSeconds(selected.maximum_gap_seconds)}.</span>
+      </div>
+      <div className="identity-grid">
+        {(result.persistent_vehicles ?? []).map((vehicle) => (
+          <article className="identity-card" key={vehicle.persistent_vehicle_id}>
+            {vehicle.contact_sheet_url ? <img src={vehicle.contact_sheet_url} alt={`${vehicle.persistent_vehicle_id} contact sheet`} className="identity-contact-sheet" /> : <div className="thumb-placeholder identity-placeholder">No contact sheet</div>}
+            <div className="identity-card-body">
+              <div className="identity-card-header">
+                <strong>{vehicle.persistent_vehicle_id}</strong>
+                <span className={`status ${vehicle.source_vehicle_ids.length > 1 ? "" : "muted-status"}`}>{vehicle.source_vehicle_ids.length > 1 ? "STATIONARY RECOVERY" : "SINGLE"}</span>
+              </div>
+              <p>{vehicle.final_class} / {vehicle.camera_id}</p>
+              <span className="muted">Source identities</span>
+              <div className="search-id-list">{vehicle.source_vehicle_ids.map((id) => <code key={id}>{id}</code>)}</div>
+              <span className="muted">Tracklets</span>
+              <div className="search-id-list">{vehicle.member_tracks.map((trackId) => <code key={trackId}>{shortTrackId(trackId)}</code>)}</div>
+              <dl className="identity-details">
+                <div><dt>Confidence</dt><dd>{formatScore(vehicle.recovery_confidence)}</dd></div>
+                <div><dt>First</dt><dd>{formatVideoTime(vehicle.first_seen_seconds)}</dd></div>
+                <div><dt>Last</dt><dd>{formatVideoTime(vehicle.last_seen_seconds)}</dd></div>
+                <div><dt>Groups</dt><dd>{vehicle.source_vehicle_ids.length}</dd></div>
+              </dl>
+            </div>
+          </article>
+        ))}
+      </div>
+      {recovered.length === 0 ? <div className="empty-state">No stationary recovered merges accepted.</div> : null}
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <h3>Rejected Stationary Candidates</h3>
+            <p className="muted">Strong-looking rejected pairs and the safety rule that blocked them.</p>
+          </div>
+        </div>
+        <div className="table-wrapper">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Source A</th>
+                <th>Source B</th>
+                <th>Raw Score</th>
+                <th>Location</th>
+                <th>Gap</th>
+                <th>Rejected By</th>
+              </tr>
+            </thead>
+            <tbody>
+              {negativeRows.map((row) => (
+                <tr key={`${row.source_vehicle_a}-${row.source_vehicle_b}`}>
+                  <td>{String(row.source_vehicle_a ?? "")}</td>
+                  <td>{String(row.source_vehicle_b ?? "")}</td>
+                  <td>{formatScore(row.raw_score)}</td>
+                  <td>{formatScore(row.location_score)}</td>
+                  <td>{formatSeconds(row.time_gap_seconds)}</td>
+                  <td>{String(row.rejection_reason ?? "-")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
+  );
+}
+
+function PersistentIdentityView({
+  result,
+  error,
+  currentPage,
+  setCurrentPage,
+}: {
+  result: ExperimentalVehicleIdentityResult | null;
+  error: string | null;
+  currentPage: number;
+  setCurrentPage: (updater: (page: number) => number) => void;
+}) {
+  if (error) {
+    return <div className="empty-state">{error}</div>;
+  }
+  if (result === null) {
+    return <div className="empty-state">Loading persistent identity output...</div>;
+  }
+  if (!result.available) {
+    return (
+      <div className="empty-state">
+        <p>{result.message || "Persistent identity experiment is not available for this run."}</p>
+        <code>{"python scripts/run_vehicle_identity_test.py --run-dir outputs\\runs\\<RUN_ID>"}</code>
+      </div>
+    );
+  }
+  const vehicles = [...(result.vehicles ?? [])].sort((left, right) => Number(left.first_seen_frame ?? 0) - Number(right.first_seen_frame ?? 0));
+  const totalPages = Math.max(1, Math.ceil(vehicles.length / PAGE_SIZE));
+  const pagedVehicles = vehicles.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  const metrics = result.metrics ?? {};
+  const analytics = result.analytics_simulation ?? {};
+  const selectedRow = result.calibration?.selected_row ?? {};
+  const acceptedDecisions = (result.association_decisions ?? []).filter((item) => item.decision === "MERGE");
+  const cautiousDecisions = (result.association_decisions ?? []).filter((item) => item.decision !== "MERGE").slice(0, 12);
+  return (
+    <>
+      <div className="summary-grid reconciliation-summary">
+        <MetricCard label="Raw Tracks" value={analytics.raw_completed_tracks} />
+        <MetricCard label="Vehicle IDs" value={analytics.reconciled_physical_vehicles} />
+        <MetricCard label="Duplicates Removed" value={analytics.duplicates_removed} />
+        <MetricCard label="Precision" value={formatScore(metrics.precision)} />
+        <MetricCard label="Recall" value={formatScore(metrics.recall)} />
+        <MetricCard label="Suspicious Merges" value={metrics.suspicious_overmerge_count} />
+      </div>
+      <div className="identity-note">
+        <strong>Experimental persistent identity mode</strong>
+        <span className="muted">Selected threshold {formatScore(selectedRow.acceptance_threshold)} with ambiguity margin {formatScore(selectedRow.ambiguity_margin)}. Raw production counts and chatbot answers are unchanged.</span>
+      </div>
+
+      {pagedVehicles.length === 0 ? (
+        <div className="empty-state">No persistent vehicle identities found in this experiment output.</div>
+      ) : (
+        <>
+          <div className="identity-grid">
+            {pagedVehicles.map((vehicle) => {
+              const recovered = vehicle.member_tracks.length > 1;
+              const relatedDecision = acceptedDecisions.find((item) => item.candidate_vehicle_id === vehicle.vehicle_id || vehicle.member_tracks.includes(String(item.track_b)));
+              return (
+                <article className="identity-card" key={vehicle.vehicle_id}>
+                  {vehicle.contact_sheet_url ? <img src={vehicle.contact_sheet_url} alt={`${vehicle.vehicle_id} contact sheet`} className="identity-contact-sheet" /> : <div className="thumb-placeholder identity-placeholder">No contact sheet</div>}
+                  <div className="identity-card-body">
+                    <div className="identity-card-header">
+                      <strong>{vehicle.vehicle_id}</strong>
+                      <span className={`status ${recovered ? "" : "muted-status"}`}>{recovered ? "MERGED" : "SINGLE"}</span>
+                    </div>
+                    <p>{vehicle.final_class} / {vehicle.camera_id}</p>
+                    <div className="search-id-list">
+                      {vehicle.member_tracks.map((trackId) => <code key={trackId}>{shortTrackId(trackId)}</code>)}
+                    </div>
+                    <dl className="identity-details">
+                      <div><dt>First</dt><dd>{formatVideoTime(vehicle.first_seen_seconds)}</dd></div>
+                      <div><dt>Last</dt><dd>{formatVideoTime(vehicle.last_seen_seconds)}</dd></div>
+                      <div><dt>Stationary</dt><dd>{vehicle.stationary ? "YES" : "NO"}</dd></div>
+                      <div><dt>Best</dt><dd>{formatScore(relatedDecision?.best_member_score)}</dd></div>
+                      <div><dt>Consistency</dt><dd>{formatScore(relatedDecision?.vehicle_consistency_score)}</dd></div>
+                      <div><dt>Conflicts</dt><dd>{formatNumber(relatedDecision?.conflicting_member_count)}</dd></div>
+                    </dl>
+                    {relatedDecision?.ambiguity_reason ? <span className="filter-chip">{relatedDecision.ambiguity_reason}</span> : null}
+                    {relatedDecision?.association_reason ? <span className="filter-chip">{relatedDecision.association_reason}</span> : null}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+          <Pagination allRowsCount={vehicles.length} currentPage={currentPage} totalPages={totalPages} setCurrentPage={setCurrentPage} />
+        </>
+      )}
+
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <h3>Association Diagnostics</h3>
+            <p className="muted">Cautious non-merges show why the calibrated POC refused a candidate.</p>
+          </div>
+        </div>
+        {cautiousDecisions.length === 0 ? (
+          <div className="empty-state">No cautious decisions recorded.</div>
+        ) : (
+          <div className="table-wrapper">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Track A</th>
+                  <th>Track B</th>
+                  <th>Mode</th>
+                  <th>Decision</th>
+                  <th>Reason</th>
+                  <th>Best</th>
+                  <th>Vehicle Score</th>
+                  <th>Conflicts</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cautiousDecisions.map((item) => (
+                  <tr key={`${item.track_a}-${item.track_b}-${item.candidate_vehicle_id}`}>
+                    <td>{shortTrackId(String(item.track_a ?? ""))}</td>
+                    <td>{shortTrackId(String(item.track_b ?? ""))}</td>
+                    <td>{item.association_mode ?? "-"}</td>
+                    <td>{item.decision ?? "-"}</td>
+                    <td>{item.ambiguity_reason || item.association_reason || "-"}</td>
+                    <td>{formatScore(item.best_member_score)}</td>
+                    <td>{formatScore(item.vehicle_consistency_score)}</td>
+                    <td>{formatNumber(item.conflicting_member_count)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </>
   );
 }
 

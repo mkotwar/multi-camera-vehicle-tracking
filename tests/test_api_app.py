@@ -854,3 +854,134 @@ def test_api_track_reconciliation_available_missing_and_tracks_json_untouched(tm
     assert missing_response.status_code == 200
     assert missing_response.json()["available"] is False
     assert missing_response.json()["message"] == "Reconciliation test has not been run for this run."
+
+
+def test_api_experimental_vehicle_identity_available_missing_and_tracks_json_untouched(tmp_path: Path) -> None:
+    run_id = _build_run(tmp_path)
+    run_dir = tmp_path / run_id
+    tracks_before = (run_dir / "tracks.json").read_text(encoding="utf-8")
+    identity_dir = run_dir / "vehicle_identity_test"
+    visual_dir = identity_dir / "visual_evidence"
+    visual_dir.mkdir(parents=True)
+    (visual_dir / "VEHICLE_001.jpg").write_bytes(b"identity-contact")
+    _write_json(
+        identity_dir / "vehicles.json",
+        {
+            "vehicles": [
+                {
+                    "vehicle_id": "VEHICLE_001",
+                    "camera_id": "CAM_001",
+                    "member_tracks": ["CAM_001:TRACK_1", "CAM_002:TRACK_2"],
+                    "final_class": "CAR",
+                    "first_seen_seconds": 1.0,
+                    "last_seen_seconds": 9.0,
+                    "stationary": False,
+                }
+            ]
+        },
+    )
+    _write_json(identity_dir / "vehicle_id_map.json", {"CAM_001:TRACK_1": "VEHICLE_001", "CAM_002:TRACK_2": "VEHICLE_001"})
+    _write_json(
+        identity_dir / "evaluation.json",
+        {
+            "metrics": {"precision": 1.0, "recall": 0.5, "suspicious_overmerge_count": 0},
+            "analytics_simulation": {"raw_completed_tracks": 2, "reconciled_physical_vehicles": 1, "duplicates_removed": 1},
+            "existing_reconciliation_baseline": {"reconciled_vehicle_identities": 1},
+            "config": {"acceptance_threshold": 0.85},
+            "calibration": {"selected_config": {"acceptance_threshold": 0.85}, "selected_row": {"f1": 0.67}},
+        },
+    )
+    (identity_dir / "association_decisions.csv").write_text(
+        "track_a,track_b,candidate_vehicle_id,decision,association_reason,best_member_score,vehicle_consistency_score,conflicting_member_count\n"
+        "CAM_001:TRACK_1,CAM_002:TRACK_2,VEHICLE_001,MERGE,BEST_SEQUENTIAL_PAIR,0.91,0.88,0\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.get("/api/experimental/vehicles", params={"run_id": run_id})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["experimental"] is True
+    assert payload["available"] is True
+    assert payload["metrics"]["suspicious_overmerge_count"] == 0
+    assert payload["analytics_simulation"]["raw_completed_tracks"] == 2
+    assert payload["vehicle_id_map"]["CAM_001:TRACK_1"] == "VEHICLE_001"
+    assert payload["vehicles"][0]["contact_sheet_url"].endswith("/api/media/vehicle_identity_visual/20260808_182124/VEHICLE_001.jpg")
+    assert payload["association_decisions"][0]["association_reason"] == "BEST_SEQUENTIAL_PAIR"
+    assert (run_dir / "tracks.json").read_text(encoding="utf-8") == tracks_before
+
+    summary_response = client.get("/api/experimental/vehicle-summary", params={"run_id": run_id})
+    assert summary_response.status_code == 200
+    assert summary_response.json()["experimental"] is True
+    assert "vehicles" not in summary_response.json()
+
+    missing_run_id = "20260808_190000"
+    _write_json(tmp_path / missing_run_id / "summary.json", {"run_id": missing_run_id, "status": "COMPLETED"})
+    missing_response = client.get("/api/experimental/vehicles", params={"run_id": missing_run_id})
+    assert missing_response.status_code == 200
+    assert missing_response.json()["available"] is False
+    assert missing_response.json()["experimental"] is True
+
+
+def test_api_stationary_recovery_endpoint_available_missing_and_tracks_json_untouched(tmp_path: Path) -> None:
+    run_id = _build_run(tmp_path)
+    run_dir = tmp_path / run_id
+    tracks_before = (run_dir / "tracks.json").read_text(encoding="utf-8")
+    recovery_dir = run_dir / "vehicle_identity_test" / "stationary_recovery"
+    contact_dir = recovery_dir / "contact_sheets"
+    contact_dir.mkdir(parents=True)
+    (contact_dir / "PVEHICLE_001.jpg").write_bytes(b"stationary-contact")
+    _write_json(
+        recovery_dir / "persistent_vehicles.json",
+        {
+            "persistent_vehicles": [
+                {
+                    "persistent_vehicle_id": "PVEHICLE_001",
+                    "source_vehicle_ids": ["VEHICLE_006", "VEHICLE_022", "VEHICLE_024"],
+                    "member_tracks": ["CAM_001:TRACK_6", "CAM_001:TRACK_12", "CAM_001:TRACK_25"],
+                    "camera_id": "CAM_001",
+                    "final_class": "CAR",
+                    "recovery_confidence": 0.81,
+                }
+            ]
+        },
+    )
+    _write_json(recovery_dir / "persistent_vehicle_id_map.json", {"VEHICLE_006": "PVEHICLE_001"})
+    _write_json(
+        recovery_dir / "evaluation.json",
+        {
+            "metrics": {"yellow_car_fully_recovered": True, "confirmed_false_merges": 0, "suspicious_overmerge_count": 0},
+            "analytics_simulation": {"conservative_vehicle_identities": 3, "stationary_recovered_vehicle_identities": 1},
+            "config": {"recovery_threshold": 0.74},
+            "calibration": {"selected_row": {"recovery_threshold": 0.74}},
+        },
+    )
+    (recovery_dir / "recovery_decisions.csv").write_text(
+        "source_vehicle_a,source_vehicle_b,decision,score,location_score,final_reason\n"
+        "VEHICLE_006,VEHICLE_022,MERGE,0.80,0.90,\n",
+        encoding="utf-8",
+    )
+    (recovery_dir / "recovery_scores.csv").write_text(
+        "source_vehicle_a,source_vehicle_b,rejected,rejection_reason,raw_score,location_score\n"
+        "VEHICLE_006,VEHICLE_029,True,different_parking_location,0.57,0.44\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.get("/api/experimental/stationary-recovered-vehicles", params={"run_id": run_id})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["experimental"] is True
+    assert payload["stage"] == "stationary_recovery"
+    assert payload["available"] is True
+    assert payload["persistent_vehicles"][0]["contact_sheet_url"].endswith("/api/media/stationary_recovery_contact_sheets/20260808_182124/PVEHICLE_001.jpg")
+    assert payload["recovery_scores"][0]["rejection_reason"] == "different_parking_location"
+    assert (run_dir / "tracks.json").read_text(encoding="utf-8") == tracks_before
+
+    missing_run_id = "20260808_190000"
+    _write_json(tmp_path / missing_run_id / "summary.json", {"run_id": missing_run_id, "status": "COMPLETED"})
+    missing_response = client.get("/api/experimental/stationary-recovered-vehicles", params={"run_id": missing_run_id})
+    assert missing_response.status_code == 200
+    assert missing_response.json()["available"] is False

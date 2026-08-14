@@ -100,3 +100,85 @@ export type TrackReconciliationResult = {
   visual_evidence: ReconciliationVisualEvidence[];
   paths: Record<string, string>;
 };
+
+export type ExperimentalVehicleIdentity = {
+  vehicle_id: string;
+  camera_id: string;
+  member_tracks: string[];
+  final_class: string;
+  first_seen_frame?: number | null;
+  last_seen_frame?: number | null;
+  first_seen_seconds?: number | null;
+  last_seen_seconds?: number | null;
+  stationary?: boolean;
+  contact_sheet_url?: string | null;
+};
+
+export type ExperimentalAssociationDecision = {
+  track_a?: string;
+  track_b?: string;
+  candidate_vehicle_id?: string;
+  association_mode?: string;
+  decision?: string;
+  association_reason?: string;
+  ambiguity_reason?: string;
+  score?: number | string | null;
+  second_best_score?: number | string | null;
+  best_member_score?: number | string | null;
+  vehicle_consistency_score?: number | string | null;
+  conflicting_member_count?: number | string | null;
+};
+
+export type ExperimentalVehicleIdentityResult = {
+  run_id: string;
+  experimental: true;
+  available: boolean;
+  message?: string | null;
+  metrics: Record<string, unknown>;
+  analytics_simulation: Record<string, unknown>;
+  existing_reconciliation_baseline: Record<string, unknown>;
+  config: Record<string, unknown>;
+  calibration: {
+    selected_config?: Record<string, unknown>;
+    selected_row?: Record<string, unknown>;
+    selection_policy?: string;
+  };
+  vehicles: ExperimentalVehicleIdentity[];
+  vehicle_id_map: Record<string, string>;
+  association_decisions: ExperimentalAssociationDecision[];
+  paths: Record<string, string>;
+};
+
+export type StationaryRecoveredVehicle = {
+  persistent_vehicle_id: string;
+  source_vehicle_ids: string[];
+  member_tracks: string[];
+  camera_id: string;
+  final_class: string;
+  recovery_label?: string | null;
+  recovery_confidence?: number | string | null;
+  first_seen_seconds?: number | null;
+  last_seen_seconds?: number | null;
+  contact_sheet_url?: string | null;
+};
+
+export type StationaryRecoveryResult = {
+  run_id: string;
+  experimental: true;
+  stage: "stationary_recovery";
+  available: boolean;
+  message?: string | null;
+  metrics: Record<string, unknown>;
+  analytics_simulation: Record<string, unknown>;
+  config: Record<string, unknown>;
+  calibration: {
+    selected_config?: Record<string, unknown>;
+    selected_row?: Record<string, unknown>;
+    selection_policy?: string;
+  };
+  persistent_vehicles: StationaryRecoveredVehicle[];
+  persistent_vehicle_id_map: Record<string, string>;
+  recovery_decisions: Record<string, unknown>[];
+  recovery_scores: Record<string, unknown>[];
+  paths: Record<string, string>;
+};

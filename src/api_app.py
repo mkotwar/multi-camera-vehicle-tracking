@@ -350,6 +350,39 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
     def get_reconciliation(run_id: str) -> dict[str, Any]:
         return _get_track_reconciliation_payload(run_id)
 
+    def _get_vehicle_identity_payload(run_id: str) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = repository.get_vehicle_identity_experiment(resolved_run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return payload
+
+    @app.get("/api/experimental/vehicles")
+    def get_experimental_vehicles(run_id: str | None = None) -> dict[str, Any]:
+        return _get_vehicle_identity_payload(run_id or "latest")
+
+    @app.get("/api/experimental/vehicle-summary")
+    def get_experimental_vehicle_summary(run_id: str | None = None) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = repository.get_vehicle_identity_summary(resolved_run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return payload
+
+    @app.get("/api/experimental/stationary-recovered-vehicles")
+    def get_experimental_stationary_recovered_vehicles(run_id: str | None = None) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = repository.get_stationary_recovery_experiment(resolved_run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return payload
+
     @app.get("/api/system/status")
     def get_system_status() -> dict[str, Any]:
         current = runtime_state.get_system_status()

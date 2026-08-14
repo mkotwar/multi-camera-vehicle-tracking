@@ -288,6 +288,74 @@ select {
   color: #eff6ff;
 }
 
+.identity-note {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.85rem 0;
+}
+
+.identity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.9rem;
+}
+
+.identity-card {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.72);
+}
+
+.identity-contact-sheet,
+.identity-placeholder {
+  width: 100%;
+  aspect-ratio: 16 / 7;
+  object-fit: cover;
+}
+
+.identity-card-body {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem;
+}
+
+.identity-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.identity-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 0.85rem;
+  margin: 0;
+}
+
+.identity-details div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.identity-details dt {
+  color: #9eb0c8;
+  font-size: 0.78rem;
+}
+
+.identity-details dd {
+  margin: 0;
+  color: #e5edf7;
+  font-size: 0.9rem;
+}
+
+.muted-status {
+  opacity: 0.72;
+}
+
 .filter-grid {
   display: grid;
   gap: 0.85rem;

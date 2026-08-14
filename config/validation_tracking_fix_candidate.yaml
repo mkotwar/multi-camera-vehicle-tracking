@@ -7,7 +7,7 @@ input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: "D:/old_files/vinfocom/Raw2.mp4"
+      source: "D:/old_files/vinfocom/WhatsApp Video 2026-08-13 at 18.20.26.mp4"
       enabled: true
     - camera_id: CAM_002
       source_type: video
@@ -55,13 +55,13 @@ tracking:
   backend: ocr_mukul_supervision_bytetrack
   isolation_mode: per_camera
   supported_isolation_modes: [per_camera]
-  track_activation_threshold: 0.25
+  track_activation_threshold: 0.3
   lost_track_buffer: 40
-  minimum_matching_threshold: 0.70
+  minimum_matching_threshold: 0.7
   minimum_consecutive_frames: 3
 
 tracking_roi:
-  enabled: false
+  enabled: true
   top_fraction: 0.40
   bottom_fraction: 0.25
   anchor: bottom_center

@@ -80,7 +80,7 @@ class _FakeDetectorTrackerResult:
 
 
 class FakeVehicleDetectorTracker:
-    def __init__(self, config, logger):
+    def __init__(self, config, logger, **_kwargs):
         self.config = config
         self.logger = logger
         self.configured_device = "cpu"

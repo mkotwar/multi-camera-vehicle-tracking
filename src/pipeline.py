@@ -31,6 +31,7 @@ from .models import (
 from .output_writer import RunOutputManager
 from .runtime_state import get_runtime_state_manager
 from .track_manager import TrackManager
+from .tracking_fix_experiment import RuntimeTrackingFixExperiment
 from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
 
 
@@ -193,6 +194,28 @@ def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_tracking_fix_experiment_config(raw_section: Any, config_path: Path) -> dict[str, Any]:
+    if raw_section is None:
+        raw_section = {}
+    if not isinstance(raw_section, dict):
+        raise ConfigurationError("tracking_fix_experiment must be a mapping.")
+    reference_run_dir = raw_section.get("reference_run_dir")
+    if reference_run_dir not in (None, ""):
+        reference_path = Path(str(reference_run_dir)).expanduser()
+        if not reference_path.is_absolute():
+            reference_path = (config_path.parent / reference_path).resolve()
+        else:
+            reference_path = reference_path.resolve()
+        reference_run_dir = str(reference_path)
+    return {
+        "enabled": bool(raw_section.get("enabled", False)),
+        "reference_run_dir": reference_run_dir,
+        "threshold_experiment": bool(raw_section.get("threshold_experiment", True)),
+        "activation_experiment": bool(raw_section.get("activation_experiment", False)),
+        "roi_experiment": bool(raw_section.get("roi_experiment", False)),
+    }
+
+
 def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     project = raw_config.get("project")
     logging_section = raw_config.get("logging")
@@ -201,6 +224,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     detection = raw_config.get("detection")
     tracking = raw_config.get("tracking")
     tracking_roi = raw_config.get("tracking_roi")
+    tracking_fix_experiment = raw_config.get("tracking_fix_experiment")
     evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
@@ -217,6 +241,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     if not isinstance(tracking, dict):
         raise ConfigurationError("Missing or invalid 'tracking' section.")
     normalized_tracking_roi = _normalize_tracking_roi_config(tracking_roi)
+    normalized_tracking_fix_experiment = _normalize_tracking_fix_experiment_config(tracking_fix_experiment, config_path)
     if evidence is not None and not isinstance(evidence, dict):
         raise ConfigurationError("Invalid 'evidence' section.")
     if not isinstance(visualization, dict):
@@ -561,6 +586,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
             ],
         },
         "tracking_roi": normalized_tracking_roi,
+        "tracking_fix_experiment": normalized_tracking_fix_experiment,
         "lifecycle": {
             "minimum_observations": lifecycle_minimum_observations,
             "maximum_lost_frames": lifecycle_maximum_lost_frames,
@@ -788,7 +814,16 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         output_manager.save_metadata(metadata)
 
         ingestion_manager = MultiCameraIngestionManager(validated_config, logger)
-        detector_tracker = VehicleDetectorTracker(validated_config, logger)
+        tracking_fix_experiment = RuntimeTrackingFixExperiment.from_config(
+            validated_config,
+            run_directory=output_manager.run_directory,
+            logger=logger,
+        )
+        detector_tracker = VehicleDetectorTracker(
+            validated_config,
+            logger,
+            shadow_tracker_experiment=tracking_fix_experiment,
+        )
         device_info = detector_tracker.runtime_device_info
         metadata.configured_device = device_info.configured_device
         metadata.configured_dtype = device_info.configured_dtype
@@ -1060,6 +1095,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         ingestion_manager.stop()
         metrics = ingestion_manager.get_metrics()
         lifecycle_metrics = track_manager.get_metrics()
+        tracking_fix_experiment_result = tracking_fix_experiment.finalize() if tracking_fix_experiment is not None else None
         metadata.completed_tracks = len([track for track in track_manager.get_all_output_tracks() if track.status == "COMPLETED"])
         metadata.error_count = len(metrics["camera_errors"])
         metadata.status = RUN_STATUS_COMPLETED

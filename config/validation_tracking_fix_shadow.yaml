@@ -7,7 +7,7 @@ input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: "D:/old_files/vinfocom/Raw2.mp4"
+      source: "D:/old_files/vinfocom/WhatsApp Video 2026-08-13 at 18.20.26.mp4"
       enabled: true
     - camera_id: CAM_002
       source_type: video
@@ -55,16 +55,23 @@ tracking:
   backend: ocr_mukul_supervision_bytetrack
   isolation_mode: per_camera
   supported_isolation_modes: [per_camera]
-  track_activation_threshold: 0.25
+  track_activation_threshold: 0.3
   lost_track_buffer: 40
-  minimum_matching_threshold: 0.70
+  minimum_matching_threshold: 0.6
   minimum_consecutive_frames: 3
 
 tracking_roi:
-  enabled: false
+  enabled: true
   top_fraction: 0.40
   bottom_fraction: 0.25
   anchor: bottom_center
+
+tracking_fix_experiment:
+  enabled: true
+  reference_run_dir: "../outputs/runs/20260813_182311"
+  threshold_experiment: true
+  activation_experiment: false
+  roi_experiment: false
 
 lifecycle:
   minimum_observations: 3
@@ -111,11 +118,11 @@ evidence:
 visualization:
   show_rejected_boxes: false
   detected_frames:
-    enabled: true
+    enabled: false
     save_every_n_frames: 1
     max_saved_frames_per_camera: 600
   tracked_frames:
-    enabled: true
+    enabled: false
     save_every_n_frames: 1
     max_saved_frames_per_camera: 600
 
@@ -124,7 +131,7 @@ output:
   save_run_config: true
 
 vehicle_enrichment:
-  enabled: true
+  enabled: false
   trigger: track_completed
   fail_open: true
   best_crops_per_track: 3

@@ -14,6 +14,7 @@ from ultralytics import YOLO
 
 from .models import BBoxQualityDiagnostic, ConfigurationError, Detection, FramePacket, TrackedDetection
 from .runtime_device import RuntimeDevice, resolve_runtime_device
+from .tracking_fix_experiment import RuntimeTrackingFixExperiment, clone_detections
 
 
 EDGE_MODE_A = "A"
@@ -112,6 +113,7 @@ class VehicleDetectorTracker:
         *,
         model_loader: Callable[[str], Any] | None = None,
         tracker_factory: Callable[..., Any] | None = None,
+        shadow_tracker_experiment: RuntimeTrackingFixExperiment | None = None,
     ) -> None:
         self.config = dict(config)
         self.logger = logger
@@ -194,6 +196,7 @@ class VehicleDetectorTracker:
         self._model_loader = model_loader or YOLO
         self._tracker_factory = tracker_factory or self._create_tracker
         self._model: Any | None = None
+        self._shadow_tracker_experiment = shadow_tracker_experiment
         self._model_class_names: dict[int, str] = {}
         self._allowed_model_class_ids: set[int] = set()
         self._trackers: dict[str | tuple[str, str], Any] = {}
@@ -545,11 +548,13 @@ class VehicleDetectorTracker:
     def track_detections(self, packet: FramePacket, detections: list[Detection], raw_result: Any | None = None) -> list[TrackedDetection]:
         if self.tracking_backend == TRACKING_BACKEND_OCR_MUKUL_SUPERVISION_BYTETRACK:
             supervision_detections = self._to_ocr_mukul_supervision_detections(raw_result, detections)
+            self._observe_shadow_trackers(packet, supervision_detections)
             tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace="camera")
             tracked = tracker.update_with_detections(supervision_detections)
             return self._to_tracked_detections(packet, detections, tracked, tracker_namespace="camera")
         if self.isolation_mode == TRACKER_ISOLATION_MODE_PER_CAMERA:
             supervision_detections = self._to_supervision_detections(detections)
+            self._observe_shadow_trackers(packet, supervision_detections)
             tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace="camera")
             tracked = tracker.update_with_detections(supervision_detections)
             return self._to_tracked_detections(packet, detections, tracked, tracker_namespace="camera")
@@ -561,9 +566,22 @@ class VehicleDetectorTracker:
         for tracker_namespace in namespaces_to_update:
             tracker = self._get_or_create_tracker(packet.camera_id, packet.source_fps, tracker_namespace=tracker_namespace)
             class_detections = grouped_detections.get(tracker_namespace, [])
-            tracked = tracker.update_with_detections(self._to_supervision_detections(class_detections))
+            supervision_detections = self._to_supervision_detections(class_detections)
+            self._observe_shadow_trackers(packet, supervision_detections)
+            tracked = tracker.update_with_detections(supervision_detections)
             tracked_results.extend(self._to_tracked_detections(packet, class_detections, tracked, tracker_namespace=tracker_namespace))
         return tracked_results
+
+    def _observe_shadow_trackers(self, packet: FramePacket, detections: sv.Detections) -> None:
+        if self._shadow_tracker_experiment is None:
+            return
+        self._shadow_tracker_experiment.observe(
+            camera_id=packet.camera_id,
+            frame_number=packet.frame_number,
+            timestamp_seconds=packet.timestamp_seconds,
+            source_fps=packet.source_fps,
+            detections=clone_detections(detections),
+        )
 
     def process_frame(self, packet: FramePacket) -> DetectorTrackerResult:
         return self.process_frames([packet])[0]
@@ -1049,6 +1067,7 @@ class VehicleDetectorTracker:
                 lost_track_buffer=self.lost_track_buffer,
                 track_activation_threshold=self.track_activation_threshold,
                 minimum_matching_threshold=self.minimum_matching_threshold,
+                frame_rate=frame_rate,
                 minimum_consecutive_frames=self.minimum_consecutive_frames,
             )
         if self.tracking_backend != TRACKING_BACKEND_SUPERVISION_BYTETRACK:

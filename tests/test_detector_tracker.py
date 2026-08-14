@@ -900,10 +900,72 @@ def test_ocr_mukul_backend_uses_callable_model_and_ocr_tracker_params(monkeypatc
             "lost_track_buffer": 40,
             "track_activation_threshold": 0.3,
             "minimum_matching_threshold": 0.6,
+            "frame_rate": 10.0,
             "minimum_consecutive_frames": 3,
         }
     ]
     assert result.tracked_detections[0].raw_class_name == "tractor"
+
+
+def test_shadow_tracker_receives_exact_copy_and_production_tracker_unaffected(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        detection_backend="ocr_mukul",
+        tracking_backend="ocr_mukul_supervision_bytetrack",
+    )
+    calls: list[dict] = []
+
+    class ShadowExperiment:
+        def observe(self, *, camera_id, frame_number, timestamp_seconds, source_fps, detections):
+            calls.append(
+                {
+                    "camera_id": camera_id,
+                    "frame_number": frame_number,
+                    "timestamp_seconds": timestamp_seconds,
+                    "source_fps": source_fps,
+                    "xyxy": detections.xyxy.copy(),
+                    "confidence": detections.confidence.copy(),
+                    "class_id": detections.class_id.copy(),
+                }
+            )
+            detections.xyxy[0][0] = 9999.0
+            detections.confidence[0] = 0.01
+            detections.class_id[0] = 99
+
+    detector_tracker._shadow_tracker_experiment = ShadowExperiment()
+    model.next_result = FakeResult(xyxy=[[20, 20, 120, 120]], cls=[6], conf=[0.91])
+
+    result = detector_tracker.process_frame(_frame_packet(frame_number=7, fps=12.5))
+
+    assert len(calls) == 1
+    assert calls[0]["camera_id"] == "CAM_001"
+    assert calls[0]["frame_number"] == 7
+    assert calls[0]["source_fps"] == 12.5
+    np.testing.assert_allclose(calls[0]["xyxy"], np.asarray([[20, 20, 120, 120]], dtype=np.float32))
+    np.testing.assert_allclose(calls[0]["confidence"], np.asarray([0.91], dtype=np.float32), rtol=1e-6)
+    np.testing.assert_array_equal(calls[0]["class_id"], np.asarray([6], dtype=np.int32))
+    np.testing.assert_allclose(created_trackers[0].calls[0].xyxy, np.asarray([[20, 20, 120, 120]], dtype=np.float32))
+    assert result.tracked_detections[0].tracker_id == 1
+
+
+def test_shadow_tracker_receives_empty_frames(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(
+        tmp_path,
+        detection_backend="ocr_mukul",
+        tracking_backend="ocr_mukul_supervision_bytetrack",
+    )
+    counts: list[int] = []
+
+    class ShadowExperiment:
+        def observe(self, **kwargs):
+            counts.append(len(kwargs["detections"].xyxy))
+
+    detector_tracker._shadow_tracker_experiment = ShadowExperiment()
+    model.next_result = FakeResult(xyxy=[], cls=[], conf=[])
+
+    detector_tracker.process_frame(_frame_packet())
+
+    assert counts == [0]
 
 
 def test_ocr_mukul_backend_creates_one_tracker_per_camera(tmp_path: Path) -> None:

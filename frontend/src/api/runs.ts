@@ -1,5 +1,5 @@
 import { apiGet } from "./client";
-import type { RunSummary, TrackReconciliationResult } from "../types/run";
+import type { ExperimentalVehicleIdentityResult, RunSummary, StationaryRecoveryResult, TrackReconciliationResult } from "../types/run";
 
 export function fetchRuns(): Promise<RunSummary[]> {
   return apiGet<RunSummary[]>("/api/runs");
@@ -7,4 +7,12 @@ export function fetchRuns(): Promise<RunSummary[]> {
 
 export function fetchTrackReconciliation(runId: string): Promise<TrackReconciliationResult> {
   return apiGet<TrackReconciliationResult>(`/api/runs/${encodeURIComponent(runId)}/reconciliation`);
+}
+
+export function fetchExperimentalVehicles(runId: string): Promise<ExperimentalVehicleIdentityResult> {
+  return apiGet<ExperimentalVehicleIdentityResult>(`/api/experimental/vehicles?run_id=${encodeURIComponent(runId)}`);
+}
+
+export function fetchStationaryRecoveredVehicles(runId: string): Promise<StationaryRecoveryResult> {
+  return apiGet<StationaryRecoveryResult>(`/api/experimental/stationary-recovered-vehicles?run_id=${encodeURIComponent(runId)}`);
 }

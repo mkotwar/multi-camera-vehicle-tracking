@@ -129,6 +129,129 @@ class RunRepository:
             },
         }
 
+    def get_vehicle_identity_experiment(self, run_id: str) -> dict[str, Any] | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None:
+            return None
+        experiment_dir = run_dir / "vehicle_identity_test"
+        vehicles_payload = self._read_json(experiment_dir / "vehicles.json", default=None)
+        identity_map = self._read_json(experiment_dir / "vehicle_id_map.json", default={})
+        evaluation = self._read_json(experiment_dir / "evaluation.json", default={})
+        decisions = self._read_csv_rows(experiment_dir / "association_decisions.csv")
+        if not isinstance(vehicles_payload, dict):
+            return {
+                "run_id": run_id,
+                "experimental": True,
+                "available": False,
+                "message": "Persistent vehicle identity experiment has not been run for this run.",
+                "metrics": {},
+                "analytics_simulation": {},
+                "config": {},
+                "calibration": {},
+                "vehicles": [],
+                "vehicle_id_map": {},
+                "association_decisions": [],
+                "paths": {},
+            }
+        vehicles = list(vehicles_payload.get("vehicles", []) or [])
+        for vehicle in vehicles:
+            if not isinstance(vehicle, dict):
+                continue
+            vehicle["contact_sheet_url"] = self._vehicle_identity_contact_sheet_url(run_id, str(vehicle.get("vehicle_id") or ""))
+        return {
+            "run_id": run_id,
+            "experimental": True,
+            "available": True,
+            "message": None,
+            "metrics": evaluation.get("metrics", {}),
+            "analytics_simulation": evaluation.get("analytics_simulation", {}),
+            "existing_reconciliation_baseline": evaluation.get("existing_reconciliation_baseline", {}),
+            "config": evaluation.get("config", {}),
+            "calibration": evaluation.get("calibration", {}),
+            "vehicles": vehicles,
+            "vehicle_id_map": identity_map if isinstance(identity_map, dict) else {},
+            "association_decisions": decisions,
+            "paths": {
+                "vehicles": str(experiment_dir / "vehicles.json"),
+                "vehicle_id_map": str(experiment_dir / "vehicle_id_map.json"),
+                "evaluation": str(experiment_dir / "evaluation.json"),
+                "calibration_summary": str(experiment_dir / "calibration_summary.json"),
+                "association_decisions": str(experiment_dir / "association_decisions.csv"),
+                "report": str(experiment_dir / "report.md"),
+            },
+        }
+
+    def get_vehicle_identity_summary(self, run_id: str) -> dict[str, Any] | None:
+        payload = self.get_vehicle_identity_experiment(run_id)
+        if payload is None:
+            return None
+        return {
+            "run_id": payload["run_id"],
+            "experimental": True,
+            "available": payload["available"],
+            "message": payload["message"],
+            "metrics": payload["metrics"],
+            "analytics_simulation": payload["analytics_simulation"],
+            "existing_reconciliation_baseline": payload.get("existing_reconciliation_baseline", {}),
+            "calibration": payload.get("calibration", {}),
+        }
+
+    def get_stationary_recovery_experiment(self, run_id: str) -> dict[str, Any] | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None:
+            return None
+        output_dir = run_dir / "vehicle_identity_test" / "stationary_recovery"
+        vehicles_payload = self._read_json(output_dir / "persistent_vehicles.json", default=None)
+        persistent_map = self._read_json(output_dir / "persistent_vehicle_id_map.json", default={})
+        evaluation = self._read_json(output_dir / "evaluation.json", default={})
+        decisions = self._read_csv_rows(output_dir / "recovery_decisions.csv")
+        scores = self._read_csv_rows(output_dir / "recovery_scores.csv")
+        if not isinstance(vehicles_payload, dict):
+            return {
+                "run_id": run_id,
+                "experimental": True,
+                "stage": "stationary_recovery",
+                "available": False,
+                "message": "Stationary recovery experiment has not been run for this run.",
+                "metrics": {},
+                "analytics_simulation": {},
+                "config": {},
+                "calibration": {},
+                "persistent_vehicles": [],
+                "persistent_vehicle_id_map": {},
+                "recovery_decisions": [],
+                "recovery_scores": [],
+                "paths": {},
+            }
+        vehicles = list(vehicles_payload.get("persistent_vehicles", []) or [])
+        for vehicle in vehicles:
+            if not isinstance(vehicle, dict):
+                continue
+            vehicle["contact_sheet_url"] = self._stationary_recovery_contact_sheet_url(run_id, str(vehicle.get("persistent_vehicle_id") or ""))
+        return {
+            "run_id": run_id,
+            "experimental": True,
+            "stage": "stationary_recovery",
+            "available": True,
+            "message": None,
+            "metrics": evaluation.get("metrics", {}),
+            "analytics_simulation": evaluation.get("analytics_simulation", {}),
+            "config": evaluation.get("config", {}),
+            "calibration": evaluation.get("calibration", {}),
+            "persistent_vehicles": vehicles,
+            "persistent_vehicle_id_map": persistent_map if isinstance(persistent_map, dict) else {},
+            "recovery_decisions": decisions,
+            "recovery_scores": scores,
+            "paths": {
+                "persistent_vehicles": str(output_dir / "persistent_vehicles.json"),
+                "persistent_vehicle_id_map": str(output_dir / "persistent_vehicle_id_map.json"),
+                "evaluation": str(output_dir / "evaluation.json"),
+                "recovery_decisions": str(output_dir / "recovery_decisions.csv"),
+                "recovery_scores": str(output_dir / "recovery_scores.csv"),
+                "report": str(output_dir / "report.md"),
+            },
+        }
+
     def list_tracks(
         self,
         *,
@@ -379,8 +502,26 @@ class RunRepository:
             "detected_frames": run_dir / "detected_frames",
             "raw_frames": run_dir / "raw_frames",
             "track_reconciliation_visual": run_dir / "track_reconciliation_test" / "visual_evidence",
+            "vehicle_identity_visual": run_dir / "vehicle_identity_test" / "visual_evidence",
+            "stationary_recovery_contact_sheets": run_dir / "vehicle_identity_test" / "stationary_recovery" / "contact_sheets",
         }
         return mapping.get(category)
+
+    def _vehicle_identity_contact_sheet_url(self, run_id: str, vehicle_id: str) -> str | None:
+        if not vehicle_id:
+            return None
+        path = self.resolve_media_path(run_id=run_id, category="vehicle_identity_visual", relative_parts=[f"{vehicle_id}.jpg"])
+        if path is None:
+            return None
+        return f"/api/media/vehicle_identity_visual/{run_id}/{vehicle_id}.jpg"
+
+    def _stationary_recovery_contact_sheet_url(self, run_id: str, persistent_vehicle_id: str) -> str | None:
+        if not persistent_vehicle_id:
+            return None
+        path = self.resolve_media_path(run_id=run_id, category="stationary_recovery_contact_sheets", relative_parts=[f"{persistent_vehicle_id}.jpg"])
+        if path is None:
+            return None
+        return f"/api/media/stationary_recovery_contact_sheets/{run_id}/{persistent_vehicle_id}.jpg"
 
     def _read_json(self, path: Path, *, default: Any) -> Any:
         if not path.exists():
