@@ -1,0 +1,264 @@
+project:
+  name: multicamera_vehicle_tracking
+  environment: validation
+  log_level: INFO
+input:
+  cameras:
+  - camera_id: CAM_001
+    source_type: video
+    source: D:/old_files/vinfocom/Raw2.mp4
+    enabled: true
+  - camera_id: CAM_002
+    source_type: video
+    source: D:/old_files/vinfocom/traffic_far_video/test_traffic_4min.mp4
+    enabled: false
+  max_frames_per_camera: null
+ingestion:
+  worker_count: 3
+  target_read_fps: 10
+  frame_queue_size: 50
+  queue_put_timeout_seconds: 2
+  queue_get_timeout_seconds: 1
+  stop_on_camera_error: false
+  round_robin: true
+  raw_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
+    image_format: jpg
+    jpeg_quality: 90
+detection:
+  backend: ocr_mukul
+  model_path: D:/project/models/best_old.pt
+  device: auto
+  dtype: auto
+  confidence_threshold: 0.2
+  iou_threshold: 0.45
+  image_size: 1024
+  agnostic_nms: false
+  allowed_class_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  bbox_quality:
+    enabled: false
+    minimum_width_pixels: 60
+    minimum_height_pixels: 60
+    minimum_area_ratio: 0.005
+    maximum_area_ratio: 0.9
+    minimum_aspect_ratio: 0.3
+    maximum_aspect_ratio: 4.5
+    reject_edge_truncated: true
+    edge_margin_pixels: 8
+tracking:
+  backend: ocr_mukul_supervision_bytetrack
+  isolation_mode: per_camera
+  supported_isolation_modes:
+  - per_camera
+  track_activation_threshold: 0.25
+  lost_track_buffer: 150
+  minimum_matching_threshold: 0.7
+  minimum_consecutive_frames: 3
+tracking_roi:
+  enabled: true
+  mode: rectangle
+  rectangle:
+    x_min_fraction: 0
+    y_min_fraction: 0.544884
+    x_max_fraction: 0.91904
+    y_max_fraction: 0.817806
+  anchor: bottom_center
+vehicle_identity:
+  enabled: true
+  conservative:
+    enabled: true
+    acceptance_threshold: 0.7
+    ambiguity_margin: 0.03
+    vehicle_consistency_floor: 0.58
+  plate_assistance:
+    enabled: true
+    require_high_quality_for_exact_override: true
+    contradiction_veto: true
+  stationary_recovery:
+    enabled: false
+lifecycle:
+  minimum_observations: 3
+  maximum_lost_frames: 40
+  keep_discarded_tracks: true
+track_class:
+  minimum_observations: 3
+  minimum_winner_ratio: 0.6
+  strategy: confidence_weighted_majority
+  unknown_class_name: UNKNOWN
+evidence:
+  enabled: true
+  collect_first: true
+  collect_middle: true
+  collect_last: true
+  collect_highest_confidence: true
+  collect_largest: true
+  collect_sharpest: true
+  collect_best_overall: true
+  maximum_candidates_per_track: 7
+  minimum_crop_width_pixels: 40
+  minimum_crop_height_pixels: 40
+  crop_padding_ratio_x: 0.08
+  crop_padding_ratio_y: 0.08
+  minimum_padding_pixels: 8
+  clamp_bbox_to_frame: true
+  reject_invalid_bbox: true
+  sharpness_enabled: true
+  best_overall_weights:
+    confidence: 0.35
+    sharpness: 0.25
+    bbox_area: 0.2
+    centeredness: 0.1
+    edge_visibility: 0.1
+  jpeg_quality: 90
+  save_vehicle_crops: true
+  save_annotated_full_frames: true
+  save_all_candidates: false
+  include_discarded_tracks: false
+  fail_pipeline_on_error: false
+visualization:
+  show_rejected_boxes: false
+  detected_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
+  tracked_frames:
+    enabled: true
+    save_every_n_frames: 1
+    max_saved_frames_per_camera: 600
+output:
+  root_directory: ../outputs/runs
+  save_run_config: true
+vehicle_enrichment:
+  enabled: true
+  trigger: track_completed
+  fail_open: true
+  best_crops_per_track: 3
+  write_separate_output: true
+  extend_tracks_json: true
+  image_size_policy:
+    florence:
+      default:
+        minimum_original_width: 192
+        minimum_original_height: 144
+        preferred_original_width: 320
+        preferred_original_height: 240
+      class_specific:
+        motorcycle:
+          minimum_original_width: 120
+          minimum_original_height: 120
+        3wheeler:
+          minimum_original_width: 140
+          minimum_original_height: 120
+        car:
+          minimum_original_width: 160
+          minimum_original_height: 120
+      eligibility_dimensions_source: original_crop
+      preserve_aspect_ratio: true
+      pad_to_square: true
+      square_padding_value: 114
+      reject_upscaled_eligibility: true
+  evidence:
+    source: existing_track_evidence
+    save_vehicle_crops: true
+    minimum_crop_width: 100
+    minimum_crop_height: 70
+    minimum_sharpness: 10
+    minimum_quality_score: 0.2
+    border_margin_ratio: 0.02
+    scoring:
+      area_weight: 0.25
+      sharpness_weight: 0.25
+      confidence_weight: 0.2
+      role_weight: 0.15
+      border_weight: 0.05
+      clipping_weight: 0.05
+      brightness_weight: 0.05
+  florence:
+    enabled: true
+    backend: florence
+    model_id: D:/project/models/Florence-2-base-ft
+    processor_path: D:/project/models/Florence-2-base-ft
+    device: auto
+    dtype: auto
+    trust_remote_code: true
+    attention_implementation: eager
+    max_new_tokens: 64
+    num_beams: 1
+    use_cache: false
+    local_files_only: true
+    lazy_load: true
+    adapter:
+      enabled: false
+      path: ''
+      fail_if_missing: false
+  enrichment:
+    enabled: true
+    colour:
+      enabled: true
+      backend: florence
+      maximum_crops_per_track: 3
+      task_token: <VQA>
+      prompt: What colour is the vehicle?
+      inference_strategy: adaptive_fallback
+      generation:
+        max_new_tokens: 16
+        num_beams: 1
+        do_sample: false
+        use_cache: true
+        early_stopping: false
+      async:
+        enabled: true
+        queue_size: 100
+        worker_count: 1
+        queue_put_timeout_seconds: 0.1
+    body_type:
+      enabled: false
+      backend: florence
+      car_only: true
+      run_only_when_vehicle_class:
+      - CAR
+      maximum_crops_per_track: 3
+      minimum_original_width: 120
+      minimum_original_height: 100
+      preferred_original_width: 240
+      preferred_original_height: 160
+      allowed_labels:
+      - SEDAN
+      - HATCHBACK
+      - SUV
+      - MPV
+      - UNKNOWN
+      task_token: <VQA>
+      prompt: 'What type of car is shown in this image?
+
+        Answer with one word only:
+
+        sedan, hatchback, suv, or mpv.'
+      generation:
+        max_new_tokens: 16
+        num_beams: 1
+        do_sample: false
+        use_cache: true
+        early_stopping: false
+    make_model:
+      enabled: false
+    plate:
+      enabled: true
+      detector:
+        enabled: true
+        model_path: D:/project/models/OCR_MUKUL/OCR_MUKUL/license_plate_weights.pt
+      colour:
+        enabled: false
+      ocr:
+        enabled: true
+        backend: ocr_mukul_adapter
+        task_token: <OCR>
+        prompt: ''
+        run_only_when_plate_detected: false

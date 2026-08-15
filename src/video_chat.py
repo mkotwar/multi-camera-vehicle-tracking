@@ -123,13 +123,17 @@ def handle_video_chat(
     *,
     message: str,
     run_id: str,
-    tracks_path: str,
     repository: RunRepository,
+    tracks_path: str | None = None,
+    records: list[VehicleRecord] | None = None,
     session_context: dict[str, Any] | None = None,
     llm_provider: ChatLLMProvider | None = None,
 ) -> dict[str, Any]:
     context = dict(session_context or {})
-    records = load_vehicle_records_from_tracks_json(tracks_path)
+    if records is None:
+        if tracks_path is None:
+            raise ValueError("Either tracks_path or records is required.")
+        records = load_vehicle_records_from_tracks_json(tracks_path)
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(message=message, context=context, llm_provider=llm_provider)
     analytics_result = execute_chat_vehicle_query(records, parsed, context=context) if parsed.intent in ANALYTICS_INTENTS else {}
     matching_vehicle_ids = list(analytics_result.get("vehicle_ids", []) or [])
@@ -376,6 +380,10 @@ def resolve_vehicle_evidence(
     if limit <= 0:
         return evidence
     for vehicle_id in vehicle_ids[offset:offset + limit]:
+        physical_vehicle = _get_physical_vehicle(repository, vehicle_id=vehicle_id, run_id=run_id)
+        if physical_vehicle is not None:
+            evidence.append(_physical_vehicle_evidence(repository=repository, run_id=run_id, vehicle=physical_vehicle))
+            continue
         camera_id, track_id = _split_vehicle_id(vehicle_id)
         if not camera_id or not track_id:
             continue
@@ -395,15 +403,124 @@ def resolve_vehicle_evidence(
                 "vehicle_id": vehicle_id,
                 "camera_id": str(track.get("camera_id") or camera_id),
                 "track_id": str(track.get("track_id") or track_id),
+                "member_track_ids": [str(track.get("local_track_id") or vehicle_id)],
                 "vehicle_class": str(track.get("vehicle_class") or "UNKNOWN").upper(),
                 "colour": str(track.get("colour") or "UNKNOWN").upper(),
                 "first_seen_seconds": track.get("first_seen_seconds"),
                 "last_seen_seconds": track.get("last_seen_seconds"),
+                "best_crop_url": image_url,
                 "image_url": image_url,
                 "track_detail_url": f"/tracks/{camera_id}/{track_id}?run_id={run_id}",
             }
         )
     return evidence
+
+
+def _get_physical_vehicle(repository: RunRepository, *, vehicle_id: str, run_id: str) -> dict[str, Any] | None:
+    getter = getattr(repository, "get_physical_vehicle", None)
+    if not callable(getter):
+        return None
+    vehicle = getter(vehicle_id=vehicle_id, run_id=run_id)
+    return dict(vehicle) if isinstance(vehicle, dict) else None
+
+
+def _physical_vehicle_evidence(*, repository: RunRepository, run_id: str, vehicle: dict[str, Any]) -> dict[str, Any]:
+    vehicle_id = str(vehicle.get("vehicle_id") or vehicle.get("vehicle_key") or "")
+    member_track_ids = [str(item) for item in list(vehicle.get("member_track_ids") or vehicle.get("member_tracks") or []) if item]
+    primary_track_id = member_track_ids[0] if member_track_ids else ""
+    camera_id = str(vehicle.get("primary_camera_id") or (list(vehicle.get("camera_ids") or []) or [""])[0] or _split_vehicle_id(primary_track_id)[0] or "")
+    track_id = str(_split_vehicle_id(primary_track_id)[1] or primary_track_id or vehicle_id)
+    image_url = _physical_vehicle_image_url(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids)
+    return {
+        "vehicle_id": vehicle_id,
+        "camera_id": camera_id,
+        "track_id": track_id,
+        "member_track_ids": member_track_ids,
+        "vehicle_class": str(vehicle.get("vehicle_class") or vehicle.get("final_class") or "UNKNOWN").upper(),
+        "colour": str(vehicle.get("vehicle_colour") or vehicle.get("colour") or "UNKNOWN").upper(),
+        "first_seen_seconds": vehicle.get("first_seen_seconds") or vehicle.get("first_timestamp_seconds"),
+        "last_seen_seconds": vehicle.get("last_seen_seconds") or vehicle.get("last_timestamp_seconds"),
+        "best_crop_url": image_url,
+        "image_url": image_url,
+        "track_detail_url": f"/tracks/{camera_id}/{track_id}?run_id={run_id}" if camera_id and track_id else "",
+    }
+
+
+def _physical_vehicle_image_url(
+    *,
+    repository: RunRepository,
+    run_id: str,
+    vehicle: dict[str, Any],
+    member_track_ids: list[str],
+) -> str | None:
+    direct_url = str(vehicle.get("best_crop_url") or "").strip()
+    if direct_url:
+        return direct_url
+    for item in list(vehicle.get("representative_evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("vehicle_crop_url") or "").strip()
+        if url:
+            return url
+        url = _media_url_from_path(repository=repository, run_id=run_id, path=item.get("vehicle_crop_path"))
+        if url:
+            return url
+    for local_track_id in member_track_ids:
+        camera_id, track_id = _split_vehicle_id(local_track_id)
+        if not camera_id or not track_id:
+            continue
+        track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
+        if not track:
+            continue
+        url = _valid_media_url(repository=repository, media=track.get("best_crop_parts"))
+        if url:
+            return url
+    return None
+
+
+def _media_url_from_path(*, repository: RunRepository, run_id: str, path: Any) -> str | None:
+    if not path:
+        return None
+    raw = str(path).replace("\\", "/")
+    marker = f"/outputs/runs/{run_id}/"
+    if marker in raw:
+        raw = raw.split(marker, 1)[1]
+    elif raw.startswith(f"outputs/runs/{run_id}/"):
+        raw = raw[len(f"outputs/runs/{run_id}/") :]
+    elif f"/{run_id}/" in raw:
+        raw = raw.split(f"/{run_id}/", 1)[1]
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        return None
+    category_map = {
+        "evidence": "evidence",
+        "05_florence_selected_crops": "florence_selected_crops",
+        "04_track_crops": "track_crops",
+        "07_body_type_selected_crops": "body_type_selected_crops",
+        "tracked_frames": "tracked_frames",
+        "detected_frames": "detected_frames",
+        "raw_frames": "raw_frames",
+    }
+    category = category_map.get(parts[0])
+    if category is None:
+        return None
+    media_parts = parts[1:]
+    if repository.resolve_media_path(run_id=run_id, category=category, relative_parts=media_parts) is None:
+        return None
+    return f"/api/media/{category}/{run_id}/{'/'.join(media_parts)}"
+
+
+def _valid_media_url(*, repository: RunRepository, media: Any) -> str | None:
+    image_url = _media_url(media)
+    if image_url is None or not isinstance(media, dict):
+        return image_url
+    if repository.resolve_media_path(
+        run_id=str(media.get("run_id") or ""),
+        category=str(media.get("category") or ""),
+        relative_parts=[str(item) for item in list(media.get("parts", []) or [])],
+    ) is None:
+        return None
+    return image_url
 
 
 def _evidence_offset_for_query(parsed: ChatVehicleQuery, *, context: dict[str, Any]) -> int:
@@ -612,6 +729,8 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     if unsupported_colour:
         raise VehicleQueryParseError(f"Unsupported colour term: {unsupported_colour[0]}")
     context_reference = _context_reference(text)
+    if context_reference == "previous_results" and not context.get("previous_vehicle_ids"):
+        context_reference = None
     previous_filters = dict(context.get("previous_filters", {}) or {}) if context_reference else {}
     explicit_mentions = _extract_explicit_filter_mentions(text)
     show_evidence = bool(re.search(r"\b(show|show me|find|which ones|let me see|want to see|see|evidence|display|show them)\b", text))
@@ -625,7 +744,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
         end_time = previous_filters.get("end_time")
     camera_id = _parse_camera_id(text) or previous_filters.get("camera_id")
 
-    if _is_show_previous(text):
+    if _is_show_previous(text) and context.get("previous_vehicle_ids"):
         return ChatVehicleQuery(intent="LIST", show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     if re.search(r"\bwhich\s+of\s+(those|them|these|ones)\b", text):
         return ChatVehicleQuery(
@@ -650,7 +769,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
         return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, group_by="colour")
     if "most" in text and re.search(r"\b(vehicle\s+)?(class|type|category)\b", text):
         return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, group_by="class", sort_by="count_desc", limit=1)
-    if re.search(r"\b(summary|summarize|overview|breakdown)\b", text):
+    if _is_summary_query(text):
         return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, context_reference=context_reference)
     interval_query = _parse_interval_comparison_query(text)
     if interval_query is not None:
@@ -719,6 +838,10 @@ def _parse_general_chat_query(text: str) -> ChatVehicleQuery | None:
     if re.fullmatch(r"(hello|hi|hey|good\s+(morning|afternoon|evening)|thanks|thank\s+you|who\s+are\s+you\??|what\s+can\s+you\s+do\??)", text):
         return ChatVehicleQuery(intent="GENERAL_CHAT")
     return None
+
+
+def _is_summary_query(text: str) -> bool:
+    return bool(re.search(r"\b(summ?ary|summ?ry|summarize|summarise|overview|breakdown)\b", text))
 
 
 def _classify_message_type(text: str, context: dict[str, Any]) -> str:

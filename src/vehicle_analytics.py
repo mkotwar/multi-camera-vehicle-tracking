@@ -25,6 +25,8 @@ class VehicleRecord:
     last_seen_seconds: float | None
     observation_count: int
     status: str
+    member_track_ids: tuple[str, ...] = ()
+    plate_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +65,65 @@ def vehicle_records_from_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRec
                 last_seen_seconds=_coerce_float(track.get("last_timestamp_seconds")),
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
+            )
+        )
+    return records
+
+
+def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRecord]:
+    records: list[VehicleRecord] = []
+    seen_completed_ids: set[str] = set()
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        if str(track.get("status") or "").strip().upper() != "COMPLETED":
+            continue
+        local_track_id = str(track.get("local_track_id") or "").strip()
+        if not local_track_id:
+            continue
+        if local_track_id in seen_completed_ids:
+            raise ValueError(f"Duplicate completed local_track_id: {local_track_id}")
+        seen_completed_ids.add(local_track_id)
+        records.append(
+            VehicleRecord(
+                vehicle_id=local_track_id,
+                local_track_id=local_track_id,
+                camera_id=str(track.get("camera_id") or "").strip(),
+                vehicle_class=_normalize_vehicle_class(track.get("vehicle_class")),
+                colour=_normalize_colour(track.get("colour")),
+                first_seen_seconds=_coerce_float(track.get("first_seen_seconds") or track.get("first_seen")),
+                last_seen_seconds=_coerce_float(track.get("last_seen_seconds") or track.get("last_seen")),
+                observation_count=_coerce_int(track.get("observation_count")),
+                status="COMPLETED",
+            )
+        )
+    return records
+
+
+def vehicle_records_from_physical_vehicles(vehicles: list[dict[str, Any]]) -> list[VehicleRecord]:
+    records: list[VehicleRecord] = []
+    seen_ids: set[str] = set()
+    for vehicle in vehicles:
+        if not isinstance(vehicle, dict):
+            continue
+        vehicle_id = str(vehicle.get("vehicle_id") or vehicle.get("vehicle_key") or "").strip()
+        if not vehicle_id or vehicle_id in seen_ids:
+            continue
+        seen_ids.add(vehicle_id)
+        member_track_ids = tuple(str(item) for item in list(vehicle.get("member_track_ids") or vehicle.get("member_tracks") or []) if item)
+        records.append(
+            VehicleRecord(
+                vehicle_id=vehicle_id,
+                local_track_id=member_track_ids[0] if member_track_ids else vehicle_id,
+                camera_id=str(vehicle.get("primary_camera_id") or (list(vehicle.get("camera_ids") or []) or [""])[0] or "").strip(),
+                vehicle_class=_normalize_vehicle_class(vehicle.get("vehicle_class") or vehicle.get("final_class")),
+                colour=_normalize_colour(vehicle.get("vehicle_colour") or vehicle.get("colour")),
+                first_seen_seconds=_coerce_float(vehicle.get("first_seen_seconds") or vehicle.get("first_timestamp_seconds")),
+                last_seen_seconds=_coerce_float(vehicle.get("last_seen_seconds") or vehicle.get("last_timestamp_seconds")),
+                observation_count=_coerce_int(vehicle.get("member_track_count") or len(member_track_ids) or 1),
+                status=str(vehicle.get("identity_status") or "PHYSICAL_VEHICLE"),
+                member_track_ids=member_track_ids,
+                plate_text=str(vehicle.get("consensus_plate_text") or "") or None,
             )
         )
     return records
@@ -207,8 +268,8 @@ def build_vehicle_analytics(records: list[VehicleRecord]) -> dict[str, Any]:
     class_counts = count_by_class(records)
     colour_counts = count_by_colour(records)
     return {
-        "canonical_source": "tracks.json",
-        "vehicle_record_rule": "status == COMPLETED; one completed LocalTrack = one unique vehicle candidate",
+        "canonical_source": "physical_vehicles.json",
+        "vehicle_record_rule": "one production PhysicalVehicle = one unique vehicle; raw LocalTracks remain member_track_ids",
         "time_filter_semantics": "overlap inclusive: first_seen_seconds <= query_end and last_seen_seconds >= query_start",
         "total_unique_vehicles": len(records),
         "vehicle_classes": class_counts,

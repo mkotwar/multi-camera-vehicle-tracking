@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+from dataclasses import asdict
 
 from pydantic import BaseModel, Field
 
+from .config_service import ConfigService, ConfigServiceError
+from .env_loader import load_env_file, set_env_file_value
+from .pipeline_run_manager import (
+    PipelineRunManager,
+    PipelineRunConflictError,
+    PipelineRunInvalidStateError,
+    PipelineRunJobNotFoundError,
+)
+from .postgres_run_repository import PostgresRepositoryError
 from .ollama_qwen_provider import build_chat_llm_provider_from_env
-from .run_repository import RunRepository
+from .repository_factory import get_run_repository
 from .runtime_state import get_runtime_state_manager
 from .video_chat import handle_video_chat
-from .vehicle_nlp import VehicleQueryParseError, search_vehicle_data
+from .vehicle_nlp import VehicleQueryParseError, search_vehicle_records
 
 
 class VehicleSearchRequest(BaseModel):
@@ -23,7 +34,24 @@ class VideoChatRequest(BaseModel):
     session_id: str | None = None
 
 
-def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
+class ConfigPayloadRequest(BaseModel):
+    config: dict[str, Any]
+
+
+class ConfigCloneRequest(BaseModel):
+    new_name: str = Field(..., min_length=1)
+    config: dict[str, Any] | None = None
+
+
+class PipelineRunStartRequest(BaseModel):
+    config_name: str = Field(..., min_length=1)
+
+
+class DbAutoImportRequest(BaseModel):
+    enabled: bool
+
+
+def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | Path = "config", env_path: str | Path | None = None) -> Any:
     try:
         from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +60,21 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise RuntimeError("FastAPI is not installed. Install fastapi and uvicorn first.") from exc
 
-    repository = RunRepository(outputs_root)
+    project_root = Path(__file__).resolve().parent.parent
+    resolved_config_dir = Path(config_dir)
+    if not resolved_config_dir.is_absolute():
+        resolved_config_dir = project_root / resolved_config_dir
+    resolved_env_path = Path(env_path) if env_path is not None else project_root / ".env"
+    if not resolved_env_path.is_absolute():
+        resolved_env_path = project_root / resolved_env_path
+
+    repository = get_run_repository(outputs_root=outputs_root)
+    config_service = ConfigService(config_dir=resolved_config_dir)
+    pipeline_run_manager = PipelineRunManager(
+        project_root=project_root,
+        config_service=config_service,
+        jobs_root=project_root / "outputs" / "run_jobs",
+    )
     runtime_state = get_runtime_state_manager()
     chat_sessions: dict[str, dict[str, Any]] = {}
     chat_llm_provider = build_chat_llm_provider_from_env()
@@ -45,9 +87,42 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         allow_headers=["*"],
     )
 
+    @app.exception_handler(PostgresRepositoryError)
+    def postgres_repository_error_handler(request: Any, exc: PostgresRepositoryError) -> Any:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": {"error": "postgres_repository_error", "detail": str(exc)}},
+        )
+
+    @app.exception_handler(ConfigServiceError)
+    def config_service_error_handler(request: Any, exc: ConfigServiceError) -> Any:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "detail": {
+                    "error": "config_error",
+                    "detail": str(exc),
+                    "errors": [asdict(error) for error in exc.errors],
+                }
+            },
+        )
+
+    @app.exception_handler(PipelineRunConflictError)
+    def pipeline_run_conflict_error_handler(request: Any, exc: PipelineRunConflictError) -> Any:
+        return JSONResponse(status_code=409, content={"detail": {"error": "pipeline_run_conflict", "detail": str(exc)}})
+
+    @app.exception_handler(PipelineRunJobNotFoundError)
+    def pipeline_run_not_found_error_handler(request: Any, exc: PipelineRunJobNotFoundError) -> Any:
+        return JSONResponse(status_code=404, content={"detail": {"error": "pipeline_run_not_found", "detail": str(exc)}})
+
+    @app.exception_handler(PipelineRunInvalidStateError)
+    def pipeline_run_invalid_state_error_handler(request: Any, exc: PipelineRunInvalidStateError) -> Any:
+        return JSONResponse(status_code=409, content={"detail": {"error": "pipeline_run_invalid_state", "detail": str(exc)}})
+
     frontend_dist = Path("frontend/dist")
-    if frontend_dist.exists():
-        app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="assets")
+    frontend_assets = frontend_dist / "assets"
+    if frontend_assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(frontend_assets)), name="assets")
 
     def _build_media_url(media: dict[str, Any] | None) -> str | None:
         if not media:
@@ -59,11 +134,71 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
             return None
         return f"/api/media/{category}/{run_id}/{'/'.join(parts)}"
 
+    def _build_media_url_from_path(run_id: str | None, path: Any) -> str | None:
+        if not run_id or not path:
+            return None
+        raw = str(path).replace("\\", "/")
+        marker = f"/outputs/runs/{run_id}/"
+        if marker in raw:
+            raw = raw.split(marker, 1)[1]
+        elif raw.startswith(f"outputs/runs/{run_id}/"):
+            raw = raw[len(f"outputs/runs/{run_id}/") :]
+        elif f"/{run_id}/" in raw:
+            raw = raw.split(f"/{run_id}/", 1)[1]
+        parts = [part for part in raw.split("/") if part]
+        if not parts:
+            return None
+        category_map = {
+            "evidence": "evidence",
+            "05_florence_selected_crops": "florence_selected_crops",
+            "04_track_crops": "track_crops",
+            "07_body_type_selected_crops": "body_type_selected_crops",
+            "tracked_frames": "tracked_frames",
+            "detected_frames": "detected_frames",
+            "raw_frames": "raw_frames",
+        }
+        category = category_map.get(parts[0])
+        if category is None:
+            return None
+        media_parts = parts[1:] if parts[0] in category_map else parts
+        return f"/api/media/{category}/{run_id}/{'/'.join(media_parts)}" if media_parts else None
+
     def _serialize_track(track: dict[str, Any]) -> dict[str, Any]:
         payload = dict(track)
         payload["best_crop_url"] = _build_media_url(payload.get("best_crop_parts"))
+        payload["plate_crop_url"] = _build_media_url(payload.get("plate_crop_parts")) or _build_media_url_from_path(
+            payload.get("run_id"),
+            payload.get("plate_crop_path"),
+        )
         payload["evidence"] = [_serialize_evidence_item(item) for item in list(payload.get("evidence", []) or [])]
         payload["colour_resolution"] = list(payload.get("colour_resolution", []) or [])
+        return payload
+
+    def _serialize_vehicle(vehicle: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(vehicle)
+        run_id = str(payload.get("run_id") or "")
+        payload["member_track_ids"] = [str(item) for item in list(payload.get("member_track_ids") or []) if item]
+        payload["camera_ids"] = [str(item) for item in list(payload.get("camera_ids") or []) if item]
+        evidence = []
+        for item in list(payload.get("representative_evidence", []) or []):
+            entry = dict(item or {})
+            entry["vehicle_crop_url"] = _build_media_url_from_path(run_id, entry.get("vehicle_crop_path"))
+            entry["plate_crop_url"] = _build_media_url_from_path(run_id, entry.get("plate_crop_path"))
+            evidence.append(entry)
+        payload["representative_evidence"] = evidence
+        payload["best_crop_url"] = next((item.get("vehicle_crop_url") for item in evidence if item.get("vehicle_crop_url")), None)
+        if payload["best_crop_url"] is None:
+            for local_track_id in payload["member_track_ids"]:
+                camera_id, _, track_id = local_track_id.partition(":")
+                if not camera_id or not track_id:
+                    continue
+                track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
+                if track:
+                    payload["best_crop_url"] = _build_media_url(track.get("best_crop_parts"))
+                    if payload["best_crop_url"]:
+                        break
+        payload["association_decisions"] = list(payload.get("association_decisions", []) or [])
+        payload["plate_evidence"] = list(payload.get("plate_evidence", []) or [])
         return payload
 
     def _serialize_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -137,7 +272,7 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         raise HTTPException(status_code=404, detail="Camera not found")
 
     @app.get("/api/cameras/{camera_id}/frame")
-    def get_camera_frame(camera_id: str, run_id: str | None = None) -> Response:
+    def get_camera_frame(camera_id: str, run_id: str | None = None) -> Any:
         frame_bytes = runtime_state.get_frame_bytes(camera_id)
         if frame_bytes is not None:
             return Response(content=frame_bytes, media_type="image/jpeg")
@@ -218,6 +353,23 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         rows.sort(key=lambda item: (str(item.get("run_id", "")), float(item.get("last_seen_seconds") or item.get("last_seen") or 0.0)), reverse=True)
         return [_serialize_track(item) for item in rows]
 
+    @app.get("/api/vehicles")
+    def list_vehicles(
+        run_id: str | None = None,
+        vehicle_class: str | None = None,
+        colour: str | None = None,
+        plate_text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not hasattr(repository, "list_physical_vehicles"):
+            return []
+        rows = repository.list_physical_vehicles(
+            run_id=run_id,
+            vehicle_class=vehicle_class,
+            colour=colour,
+            plate_text=plate_text,
+        )
+        return [_serialize_vehicle(item) for item in rows]
+
     @app.get("/api/tracks/{camera_id}/{track_id}")
     def get_track(camera_id: str, track_id: str, run_id: str | None = None) -> dict[str, Any]:
         runtime_tracks = runtime_state.list_tracks()
@@ -253,13 +405,13 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         if resolved_run_id is None:
             raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": "Run not found"})
         tracks_path = repository.tracks_json_path(resolved_run_id)
-        if tracks_path is None or not tracks_path.exists():
+        if tracks_path is not None and not tracks_path.exists():
             raise HTTPException(
                 status_code=500,
                 detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {resolved_run_id}"},
             )
         try:
-            payload = search_vehicle_data(query=request.query, tracks_path=tracks_path)
+            payload = search_vehicle_records(query=request.query, records=repository.list_vehicle_records(run_id=resolved_run_id))
         except VehicleQueryParseError as exc:
             raise HTTPException(status_code=400, detail={"error": "query_not_understood", "detail": str(exc)}) from exc
         except ValueError as exc:
@@ -272,7 +424,7 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
         if resolved_run_id is None:
             raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": "Run not found"})
         tracks_path = repository.tracks_json_path(resolved_run_id)
-        if tracks_path is None or not tracks_path.exists():
+        if tracks_path is not None and not tracks_path.exists():
             raise HTTPException(
                 status_code=500,
                 detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {resolved_run_id}"},
@@ -283,8 +435,8 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
             payload = handle_video_chat(
                 message=request.message,
                 run_id=resolved_run_id,
-                tracks_path=str(tracks_path),
                 repository=repository,
+                records=repository.list_vehicle_records(run_id=resolved_run_id),
                 session_context=context,
                 llm_provider=chat_llm_provider,
             )
@@ -298,12 +450,98 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
     @app.get("/api/filter-options")
     def get_filter_options(run_id: str | None = None) -> dict[str, Any]:
         options = repository.get_filter_options(run_id=run_id)
+        physical_vehicles = []
+        if hasattr(repository, "list_physical_vehicles"):
+            try:
+                physical_vehicles = repository.list_physical_vehicles(run_id=run_id)
+            except PostgresRepositoryError:
+                physical_vehicles = []
+        physical_cameras = sorted(
+            {
+                str(camera_id)
+                for vehicle in physical_vehicles
+                for camera_id in list(vehicle.get("camera_ids") or ([vehicle.get("primary_camera_id")] if vehicle.get("primary_camera_id") else []))
+                if camera_id
+            }
+        )
         return {
             "runs": ["latest", *options["runs"]],
-            "cameras": options["cameras"],
+            "cameras": physical_cameras or options["cameras"],
             "vehicle_classes": options["vehicle_classes"],
             "colours": options["colours"],
         }
+
+    @app.get("/api/configs")
+    def list_configs() -> dict[str, Any]:
+        return config_service.list_configs()
+
+    @app.get("/api/configs/{config_name}")
+    def get_config(config_name: str) -> dict[str, Any]:
+        return config_service.load_config(config_name)
+
+    @app.put("/api/configs/{config_name}")
+    def update_config(config_name: str, request: ConfigPayloadRequest) -> dict[str, Any]:
+        return config_service.save_config(config_name, request.config)
+
+    @app.post("/api/configs/{config_name}/validate")
+    def validate_config(config_name: str, request: ConfigPayloadRequest) -> dict[str, Any]:
+        return config_service.validate_config(config_name, request.config)
+
+    @app.post("/api/configs/{config_name}/clone")
+    def clone_config(config_name: str, request: ConfigCloneRequest) -> dict[str, Any]:
+        return config_service.clone_config(config_name, request.new_name, config=request.config)
+
+    @app.get("/api/configs/{config_name}/roi-preview")
+    def get_config_roi_preview(config_name: str, camera_id: str, frame_number: int | None = Query(default=None)) -> Any:
+        frame_bytes, headers = config_service.read_roi_preview_frame(config_name, camera_id, frame_number=frame_number)
+        return Response(content=frame_bytes, media_type="image/jpeg", headers=headers)
+
+    @app.get("/api/runtime-settings/db-auto-import")
+    def get_db_auto_import_setting() -> dict[str, Any]:
+        values = load_env_file(resolved_env_path)
+        raw_value = os.environ.get("DB_IMPORT_AFTER_RUN") or values.get("DB_IMPORT_AFTER_RUN")
+        return {
+            "key": "DB_IMPORT_AFTER_RUN",
+            "enabled": _truthy_env_value(raw_value),
+            "configured_value": raw_value,
+            "source": str(resolved_env_path),
+        }
+
+    @app.put("/api/runtime-settings/db-auto-import")
+    def update_db_auto_import_setting(request: DbAutoImportRequest) -> dict[str, Any]:
+        value = "true" if request.enabled else "false"
+        values = set_env_file_value(resolved_env_path, "DB_IMPORT_AFTER_RUN", value)
+        return {
+            "key": "DB_IMPORT_AFTER_RUN",
+            "enabled": request.enabled,
+            "configured_value": values.get("DB_IMPORT_AFTER_RUN"),
+            "source": str(resolved_env_path),
+        }
+
+    @app.post("/api/pipeline-runs")
+    def start_pipeline_run(request: PipelineRunStartRequest) -> dict[str, Any]:
+        job = pipeline_run_manager.create_run(request.config_name)
+        return job.to_dict()
+
+    @app.get("/api/pipeline-runs")
+    def list_pipeline_run_jobs(limit: int = Query(default=25, ge=1, le=100)) -> list[dict[str, Any]]:
+        return [job.to_dict() for job in pipeline_run_manager.list_jobs(limit=limit)]
+
+    @app.get("/api/pipeline-runs/launch-summary/{config_name}")
+    def get_pipeline_run_launch_summary(config_name: str) -> dict[str, Any]:
+        return pipeline_run_manager.launch_summary(config_name)
+
+    @app.get("/api/pipeline-runs/{job_id}")
+    def get_pipeline_run_job(job_id: str) -> dict[str, Any]:
+        return pipeline_run_manager.get_job(job_id).to_dict()
+
+    @app.get("/api/pipeline-runs/{job_id}/logs")
+    def get_pipeline_run_logs(job_id: str, limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, Any]:
+        return pipeline_run_manager.get_logs(job_id, limit=limit)
+
+    @app.post("/api/pipeline-runs/{job_id}/cancel")
+    def cancel_pipeline_run(job_id: str) -> dict[str, Any]:
+        return pipeline_run_manager.cancel_job(job_id).to_dict()
 
     @app.get("/api/runs")
     def list_runs() -> list[dict[str, Any]]:
@@ -383,6 +621,16 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
             raise HTTPException(status_code=404, detail="Run not found")
         return payload
 
+    @app.get("/api/experimental/plate-assisted-vehicles")
+    def get_experimental_plate_assisted_vehicles(run_id: str | None = None) -> dict[str, Any]:
+        resolved_run_id = repository.resolve_run_id(run_id)
+        if resolved_run_id is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        payload = repository.get_plate_assisted_identity_experiment(resolved_run_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return payload
+
     @app.get("/api/system/status")
     def get_system_status() -> dict[str, Any]:
         current = runtime_state.get_system_status()
@@ -436,3 +684,10 @@ def create_app(*, outputs_root: str | Path = "outputs/runs") -> Any:
             return FileResponse(str(frontend_dist / "index.html"))
 
     return app
+
+
+app = create_app()
+
+
+def _truthy_env_value(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}

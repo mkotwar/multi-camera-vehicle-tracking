@@ -352,6 +352,43 @@ select {
   font-size: 0.9rem;
 }
 
+.developer-details {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.developer-details summary {
+  cursor: pointer;
+  color: #bfdbfe;
+}
+
+.plate-member-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.plate-member-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.65rem;
+  align-items: start;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  padding-top: 0.65rem;
+}
+
+.plate-member-row p {
+  margin: 0.15rem 0;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+
+.plate-evidence-images {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .muted-status {
   opacity: 0.72;
 }
@@ -445,6 +482,32 @@ select {
   border-radius: 8px;
   background: rgba(30, 41, 59, 0.96);
   color: #bfdbfe;
+}
+
+.plate-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 15rem;
+  padding: 0.26rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  background: rgba(15, 23, 42, 0.88);
+  color: #cbd5e1;
+  font-size: 0.76rem;
+  font-weight: 700;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.plate-badge.readable {
+  border-color: rgba(34, 211, 238, 0.46);
+  background: rgba(8, 47, 73, 0.72);
+  color: #e0f2fe;
+}
+
+.plate-badge.empty {
+  color: #94a3b8;
 }
 
 .parsed-query-details summary {
@@ -1820,6 +1883,366 @@ button.evidence-track-link {
   padding: 0.75rem 0.9rem;
 }
 
+.settings-header,
+.settings-toolbar,
+.settings-actions,
+.roi-controls,
+.roi-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: end;
+  justify-content: space-between;
+}
+
+.settings-header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.75rem;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.8fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.settings-main,
+.settings-side,
+.settings-section {
+  display: grid;
+  gap: 1rem;
+}
+
+.settings-side {
+  position: sticky;
+  top: 92px;
+}
+
+.settings-toolbar {
+  justify-content: flex-start;
+  padding: 1rem;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.64);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.settings-toolbar label,
+.field-control {
+  display: grid;
+  gap: 0.4rem;
+  min-width: min(260px, 100%);
+}
+
+.settings-toolbar span,
+.field-control span,
+.roi-controls label span {
+  color: #9eb0c8;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.settings-toolbar input,
+.settings-toolbar select,
+.field-control input,
+.field-control select,
+.roi-controls select {
+  width: 100%;
+  padding: 0.66rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(15, 23, 42, 0.9);
+  color: #e5edf7;
+}
+
+.primary-button {
+  padding: 0.72rem 1rem;
+  border-radius: 10px;
+  border: 1px solid rgba(191, 219, 254, 0.26);
+  background: #2563eb;
+  color: #eff6ff;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.primary-button:disabled,
+.secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
+.disabled-link {
+  pointer-events: none;
+  opacity: 0.56;
+}
+
+.setting-grid,
+.settings-subgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.85rem;
+}
+
+.toggle-control {
+  display: flex;
+  min-height: 43px;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.62rem 0.7rem;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(9, 18, 32, 0.52);
+}
+
+.toggle-control input {
+  width: 18px;
+  height: 18px;
+}
+
+.toggle-control b,
+.risk {
+  width: fit-content;
+  padding: 0.22rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  color: #dbeafe;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.risk.safe {
+  color: #bbf7d0;
+  border-color: rgba(74, 222, 128, 0.24);
+  background: rgba(20, 83, 45, 0.22);
+}
+
+.risk.advanced {
+  color: #fde68a;
+  border-color: rgba(250, 204, 21, 0.24);
+  background: rgba(113, 63, 18, 0.22);
+}
+
+.risk.experimental,
+.toggle-control b {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.28);
+  background: rgba(127, 29, 29, 0.22);
+}
+
+.status.warning {
+  color: #fde68a;
+  border-color: rgba(250, 204, 21, 0.28);
+  background: rgba(113, 63, 18, 0.28);
+}
+
+.roi-controls {
+  justify-content: flex-start;
+}
+
+.roi-controls label {
+  display: grid;
+  gap: 0.4rem;
+  min-width: min(220px, 100%);
+}
+
+.roi-stage {
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-height: 320px;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: #020617;
+  touch-action: none;
+  user-select: none;
+}
+
+.roi-stage img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 72vh;
+  object-fit: contain;
+}
+
+.roi-placeholder {
+  display: grid;
+  min-height: 320px;
+  place-items: center;
+  color: #93a7c5;
+}
+
+.roi-rectangle {
+  position: absolute;
+  min-width: 12px;
+  min-height: 12px;
+  border: 2px solid #22d3ee;
+  background: rgba(34, 211, 238, 0.12);
+  box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.34);
+  cursor: move;
+}
+
+.roi-handle {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 2px solid #0f172a;
+  border-radius: 999px;
+  background: #f8fafc;
+  cursor: nwse-resize;
+}
+
+.roi-handle.tl {
+  left: -9px;
+  top: -9px;
+}
+
+.roi-handle.tr {
+  right: -9px;
+  top: -9px;
+  cursor: nesw-resize;
+}
+
+.roi-handle.bl {
+  left: -9px;
+  bottom: -9px;
+  cursor: nesw-resize;
+}
+
+.roi-handle.br {
+  right: -9px;
+  bottom: -9px;
+}
+
+.inventory-list {
+  display: grid;
+  gap: 0.45rem;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.inventory-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.52rem;
+  border-radius: 8px;
+  background: rgba(9, 18, 32, 0.62);
+}
+
+.inventory-list code {
+  overflow-wrap: anywhere;
+}
+
+.yaml-card pre {
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.84);
+  color: #dbeafe;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+}
+
+.run-control-page .job-card {
+  display: grid;
+  gap: 1rem;
+}
+
+.run-log-viewer {
+  min-height: 260px;
+  max-height: 480px;
+  overflow: auto;
+  margin: 0;
+  padding: 0.85rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: #020617;
+  color: #dbeafe;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.run-job-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.run-job-list button {
+  display: grid;
+  gap: 0.2rem;
+  width: 100%;
+  padding: 0.7rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(9, 18, 32, 0.72);
+  color: #e5edf7;
+  text-align: left;
+  cursor: pointer;
+}
+
+.run-job-list button.active {
+  border-color: rgba(34, 211, 238, 0.52);
+  background: rgba(8, 47, 73, 0.34);
+}
+
+.run-job-list code {
+  overflow-wrap: anywhere;
+  color: #bfdbfe;
+}
+
+.runtime-setting-row {
+  display: grid;
+  grid-template-columns: minmax(180px, max-content) minmax(0, 1fr);
+  gap: 0.8rem;
+  align-items: center;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(9, 18, 32, 0.52);
+}
+
+.runtime-setting-row p {
+  margin: 0.15rem 0 0;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(2, 6, 23, 0.72);
+}
+
+.confirm-modal {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+}
+
+.launch-summary {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.stats-grid dt {
+  color: #9eb0c8;
+  font-size: 0.78rem;
+}
+
+.stats-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 1400px) {
   .summary-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1832,8 +2255,13 @@ button.evidence-track-link {
 
 @media (max-width: 1024px) {
   .split-grid,
-  .evidence-pair-grid {
+  .evidence-pair-grid,
+  .settings-grid {
     grid-template-columns: 1fr;
+  }
+
+  .settings-side {
+    position: static;
   }
 
   .filter-grid {

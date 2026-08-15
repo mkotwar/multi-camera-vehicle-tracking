@@ -136,7 +136,7 @@ export function VideoChatPage() {
     { label: "Run", value: selectedRun?.run_id ?? runId },
     { label: "Cameras", value: selectedRun?.camera_count ?? "Any" },
     { label: "Duration", value: selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Saved run" },
-    { label: "Vehicles", value: selectedRun?.track_count ?? "Unavailable" },
+    { label: "Vehicles", value: selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable" },
   ];
 
   return (
@@ -414,6 +414,9 @@ function EvidenceGrid({
     <div className="chat-evidence-grid">
       {evidence.map((item) => {
         const runId = runIdFromEvidence(item);
+        const imageUrl = item.best_crop_url ?? item.image_url;
+        const memberTracks = item.member_track_ids ?? [];
+        const displayTrack = memberTracks.length > 1 ? `${memberTracks.length} tracklets` : item.track_id;
         const isSelected =
           selectedTrack?.cameraId === item.camera_id &&
           selectedTrack?.trackId === item.track_id &&
@@ -421,17 +424,18 @@ function EvidenceGrid({
         return (
           <article key={item.vehicle_id} className={`chat-evidence-card ${isSelected ? "selected" : ""}`}>
             <span className="evidence-accent" aria-hidden="true" />
-            {item.image_url ? (
-              <img src={item.image_url} alt={`${item.vehicle_class} ${item.colour} crop for ${item.track_id}`} loading="lazy" />
+            {imageUrl ? (
+              <img src={imageUrl} alt={`${item.vehicle_class} ${item.colour} crop for ${item.vehicle_id}`} loading="lazy" />
             ) : (
               <div className="thumb-placeholder">No crop</div>
             )}
             <div className="evidence-card-body">
-              <strong>{item.track_id}</strong>
+              <strong>{item.vehicle_id}</strong>
               <div className="evidence-badge-row">
                 <span>{item.vehicle_class}</span>
                 <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
               </div>
+              <span className="evidence-seen">{displayTrack}</span>
               <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
               {onSelectTrack ? (
                 <button
@@ -541,7 +545,10 @@ function VideoContextPanel({
               <div><dt>Run</dt><dd>{selectedRun?.run_id ?? runId}</dd></div>
               <div><dt>Status</dt><dd>{selectedRun?.status ?? "Latest"}</dd></div>
               <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Unavailable"}</dd></div>
-              <div><dt>Completed vehicles</dt><dd>{selectedRun?.track_count ?? "Unavailable"}</dd></div>
+              <div><dt>Completed vehicles</dt><dd>{selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable"}</dd></div>
+              {selectedRun?.raw_track_count != null && selectedRun.raw_track_count !== (selectedRun.physical_vehicle_count ?? selectedRun.track_count) ? (
+                <div><dt>Raw tracks</dt><dd>{selectedRun.raw_track_count}</dd></div>
+              ) : null}
             </dl>
           </section>
           <section>

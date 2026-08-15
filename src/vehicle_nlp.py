@@ -184,6 +184,10 @@ def format_vehicle_query_response(parsed_query: VehicleQuery, analytics_result: 
 
 def search_vehicle_data(query: str, tracks_path: str | Path) -> dict[str, Any]:
     records = load_vehicle_records_from_tracks_json(tracks_path)
+    return search_vehicle_records(query=query, records=records)
+
+
+def search_vehicle_records(query: str, records: list[VehicleRecord]) -> dict[str, Any]:
     parsed = parse_vehicle_query(query)
     result = execute_vehicle_query(records, parsed)
     response = format_vehicle_query_response(parsed, result)
@@ -200,7 +204,7 @@ def _parse_intent(text: str) -> str:
         return "UNIQUE_CLASSES"
     if re.search(r"\bcolou?rs?\s+(?:are\s+)?present\b", text):
         return "UNIQUE_COLOURS"
-    if re.search(r"\b(summary|summarize|overview|breakdown)\b", text):
+    if re.search(r"\b(summ?ary|summ?ry|summarize|summarise|overview|breakdown)\b", text):
         return "SUMMARY"
     if re.search(r"\b(show|list|find|display)\b", text):
         return "LIST"

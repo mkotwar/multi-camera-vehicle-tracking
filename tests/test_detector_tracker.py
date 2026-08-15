@@ -242,6 +242,22 @@ def _roi_config(**overrides) -> dict:
     return config
 
 
+def _rectangle_roi_config(**overrides) -> dict:
+    config = {
+        "enabled": True,
+        "mode": "rectangle",
+        "rectangle": {
+            "x_min_fraction": 0.25,
+            "y_min_fraction": 0.25,
+            "x_max_fraction": 0.75,
+            "y_max_fraction": 0.75,
+        },
+        "anchor": "bottom_center",
+    }
+    config.update(overrides)
+    return config
+
+
 def _build_profiled_tracker(tmp_path: Path, *, bbox_quality: dict):
     return _build_tracker(tmp_path, bbox_quality=bbox_quality)
 
@@ -554,6 +570,81 @@ def test_tracking_roi_scales_with_frame_resolution(tmp_path: Path, height: int, 
     assert result.detections[0].bbox_xyxy[3] == pytest.approx(inside_y2)
     assert result.roi_filtered_detection_count == 2
     assert created_trackers[0].calls[0].xyxy.tolist() == [[100.0, inside_y2 - 30, 200.0, inside_y2]]
+
+
+@pytest.mark.parametrize(
+    ("bbox", "expected_eligible"),
+    [
+        ([90, 310, 110, 360], False),  # left of rectangle
+        ([690, 310, 710, 360], False),  # right of rectangle
+        ([310, 130, 410, 170], False),  # above rectangle
+        ([310, 560, 410, 610], False),  # below rectangle
+        ([310, 310, 410, 360], True),  # inside rectangle
+        ([150, 210, 250, 240], True),  # bbox extends outside, bottom-center on boundary
+        ([500, 510, 600, 540], True),  # lower boundary is inclusive
+    ],
+)
+def test_rectangle_tracking_roi_filters_by_bottom_center(tmp_path: Path, bbox: list[float], expected_eligible: bool) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_rectangle_roi_config(),
+    )
+    model.next_result = FakeResult(xyxy=[bbox], cls=[0], conf=[0.9])
+    result = detector_tracker.process_frame(_frame_packet(width=800, height=720))
+    assert len(result.detections) == (1 if expected_eligible else 0)
+    assert result.roi_eligible_detection_count == (1 if expected_eligible else 0)
+    assert result.roi_filtered_detection_count == (0 if expected_eligible else 1)
+    assert len(created_trackers[0].calls[0].xyxy) == (1 if expected_eligible else 0)
+
+
+def test_rectangle_tracking_roi_preserves_original_bbox(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_rectangle_roi_config(),
+    )
+    bbox = [150, 210, 250, 240]
+    model.next_result = FakeResult(xyxy=[bbox], cls=[0], conf=[0.9])
+    result = detector_tracker.process_frame(_frame_packet(width=800, height=720))
+    assert result.detections[0].bbox_xyxy == pytest.approx(bbox)
+    assert created_trackers[0].calls[0].xyxy.tolist() == [bbox]
+
+
+def test_tracking_roi_without_mode_keeps_horizontal_semantics(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_roi_config(),
+    )
+    model.next_result = FakeResult(xyxy=[[10, 328, 40, 360], [10, 620, 40, 650]], cls=[0, 0], conf=[0.9, 0.9])
+    result = detector_tracker.process_frame(_frame_packet(width=800, height=720))
+    assert len(result.detections) == 1
+    assert result.detections[0].bbox_xyxy[3] == pytest.approx(360)
+    assert len(created_trackers[0].calls[0].xyxy) == 1
+
+
+@pytest.mark.parametrize(
+    "tracking_roi",
+    [
+        {"enabled": True, "mode": "unknown", "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.8, "x_max_fraction": 0.2, "y_min_fraction": 0.2, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": -0.1, "x_max_fraction": 0.8, "y_min_fraction": 0.2, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.1, "x_max_fraction": 1.1, "y_min_fraction": 0.2, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.1, "x_max_fraction": 0.8, "y_min_fraction": 0.9, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+    ],
+)
+def test_invalid_rectangle_tracking_roi_config_raises(tmp_path: Path, tracking_roi: dict) -> None:
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    with pytest.raises(ConfigurationError, match="tracking_roi"):
+        VehicleDetectorTracker(
+            _config(str(model_path), tracking_roi=tracking_roi),
+            _logger(),
+            model_loader=lambda _: FakeModel(str(model_path)),
+            tracker_factory=lambda frame_rate: FakeTracker(frame_rate),
+        )
 
 
 @pytest.mark.parametrize(

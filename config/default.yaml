@@ -71,10 +71,34 @@ tracking:
   supported_isolation_modes:
     - per_camera
 
-  track_activation_threshold: 0.3
-  lost_track_buffer: 40
-  minimum_matching_threshold: 0.6
+  track_activation_threshold: 0.25
+  lost_track_buffer: 150
+  minimum_matching_threshold: 0.70
   minimum_consecutive_frames: 3
+
+tracking_roi:
+  enabled: true
+  mode: rectangle
+  rectangle:
+    x_min_fraction: 0.0
+    y_min_fraction: 0.420
+    x_max_fraction: 0.893
+    y_max_fraction: 1.0
+  anchor: bottom_center
+
+vehicle_identity:
+  enabled: true
+  conservative:
+    enabled: true
+    acceptance_threshold: 0.70
+    ambiguity_margin: 0.03
+    vehicle_consistency_floor: 0.58
+  plate_assistance:
+    enabled: true
+    require_high_quality_for_exact_override: true
+    contradiction_veto: true
+  stationary_recovery:
+    enabled: false
 
 lifecycle:
   minimum_observations: 3
@@ -227,19 +251,24 @@ vehicle_enrichment:
     make_model:
       enabled: false
     plate:
-      enabled: false
+      enabled: true
       detector:
-        enabled: false
-        model_path: ""
+        enabled: true
+        model_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/license_plate_weights.pt"
+        confidence_threshold: 0.50
+        minimum_crop_width: 40
+        minimum_crop_height: 16
+        save_plate_crops: true
       colour:
         enabled: false
       ocr:
-        enabled: false
+        enabled: true
         backend: ocr_mukul_adapter
         task_token: "<OCR>"
         prompt: ""
         run_only_when_plate_detected: true
         florence:
+          enabled: true
           base_model_id: "D:/project/models/Florence-2-base-ft"
           processor_path: "D:/project/models/Florence-2-base-ft"
           adapter_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT"

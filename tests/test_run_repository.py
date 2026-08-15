@@ -41,6 +41,10 @@ def test_run_repository_lists_runs_and_tracks(tmp_path: Path) -> None:
                 "camera_id": "CAM_001",
                 "vehicle_class": "CAR",
                 "vehicle_colour": {"label": "WHITE", "status": "completed"},
+                "plate_detected": True,
+                "plate_text": "DL8CAF5030",
+                "plate_text_confidence": 0.86,
+                "plate_ocr_reason": "ocr_completed",
                 "evidence_used": [{"vehicle_crop_path": "crop.jpg"}],
                 "selected_crop_paths": ["crop.jpg"],
                 "status": "completed",
@@ -54,8 +58,10 @@ def test_run_repository_lists_runs_and_tracks(tmp_path: Path) -> None:
     assert runs[0]["run_id"] == "20260808_120000"
     assert tracks[0]["track_id"] == "TRACK_1"
     assert tracks[0]["colour"] == "WHITE"
+    assert tracks[0]["plate_text"] == "DL8CAF5030"
     assert track is not None
     assert track["local_track_id"] == "CAM_001:TRACK_1"
+    assert track["plate_text_confidence"] == 0.86
 
 
 def test_run_repository_resolve_media_path_blocks_traversal(tmp_path: Path) -> None:

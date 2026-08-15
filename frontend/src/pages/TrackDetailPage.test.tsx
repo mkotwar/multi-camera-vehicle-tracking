@@ -17,6 +17,9 @@ vi.mock("../api/tracks", () => ({
     first_frame: 2,
     last_frame: 19,
     status: "COMPLETED",
+    plate_text: "HR38AD4296",
+    plate_detected: true,
+    plate_text_confidence: 0.82,
     colour_resolution: [{ index: 1, label: "GREEN", frame_number: 12, evidence_role: "BEST_OVERALL" }],
   }),
   fetchTrackEvidence: vi.fn().mockResolvedValue([
@@ -44,6 +47,8 @@ describe("TrackDetailPage", () => {
     await waitFor(() => expect(screen.getByText("CAM_002:TRACK_5")).toBeInTheDocument());
     expect(screen.getByText("Full Frame")).toBeInTheDocument();
     expect(screen.getByText("Vehicle Crop")).toBeInTheDocument();
+    expect(screen.getAllByText("HR38AD4296").length).toBeGreaterThan(0);
+    expect(screen.getByText("Licence Plate")).toBeInTheDocument();
     expect(screen.getByText((content) => content.includes("00:04.72"))).toBeInTheDocument();
     expect(screen.getByText("Technical Details")).toBeInTheDocument();
   });

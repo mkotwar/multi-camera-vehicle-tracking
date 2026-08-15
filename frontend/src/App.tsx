@@ -2,6 +2,8 @@ import { Route, Routes } from "react-router-dom";
 import { AppLayout } from "./components/layout/AppLayout";
 import { DashboardPage } from "./pages/DashboardPage";
 import { RunsPage } from "./pages/RunsPage";
+import { RunControlPage } from "./pages/RunControlPage";
+import { SettingsPage } from "./pages/SettingsPage";
 import { SystemPage } from "./pages/SystemPage";
 import { TrackDetailPage } from "./pages/TrackDetailPage";
 import { TrackReconciliationPage } from "./pages/TrackReconciliationPage";
@@ -18,7 +20,9 @@ export default function App() {
         <Route path="/tracks" element={<VehicleSearchPage />} />
         <Route path="/tracks/:cameraId/:trackId" element={<TrackDetailPage />} />
         <Route path="/runs" element={<RunsPage />} />
+        <Route path="/run-control" element={<RunControlPage />} />
         <Route path="/runs/:runId/reconciliation" element={<TrackReconciliationPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="/system" element={<SystemPage />} />
       </Routes>
     </AppLayout>

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VEHICLE_COLOUR_LABELS
+from .vehicle_analytics import vehicle_records_from_physical_vehicles, vehicle_records_from_repository_tracks
 
 
 class RunRepository:
@@ -37,6 +38,9 @@ class RunRepository:
             metadata = self._read_json(run_dir / "run_metadata.json", default={})
             run_config = self._read_yaml_text(run_dir / "run_config.yaml")
             tracks = self._read_json(run_dir / "tracks.json", default=[])
+            raw_track_count = len([item for item in tracks if isinstance(item, dict)])
+            completed_track_count = len([item for item in tracks if isinstance(item, dict) and str(item.get("status") or "").upper() == "COMPLETED"])
+            physical_vehicle_count = self._physical_vehicle_count(run_dir)
             camera_count = summary.get("configured_camera_count")
             if camera_count is None:
                 camera_count = metadata.get("camera_count")
@@ -50,7 +54,10 @@ class RunRepository:
                     "processed_frames": summary.get("processed_frames"),
                     "overall_pipeline_runtime_ms": summary.get("overall_pipeline_runtime_ms"),
                     "duration_seconds": self._duration_seconds_from_summary(summary),
-                    "track_count": len([item for item in tracks if isinstance(item, dict)]),
+                    "track_count": physical_vehicle_count or raw_track_count,
+                    "physical_vehicle_count": physical_vehicle_count,
+                    "raw_track_count": raw_track_count,
+                    "completed_track_count": completed_track_count,
                     "frames_by_camera": summary.get("frames_by_camera", {}),
                     "run_directory": str(run_dir),
                     "has_run_config": run_config is not None,
@@ -70,6 +77,9 @@ class RunRepository:
         evidence = self._read_json(run_dir / "evidence_metrics.json", default={})
         enrichment = self._read_json(run_dir / "vehicle_enrichment_metrics.json", default={})
         tracks = self._read_json(run_dir / "tracks.json", default=[])
+        raw_track_count = len([item for item in tracks if isinstance(item, dict)])
+        completed_track_count = len([item for item in tracks if isinstance(item, dict) and str(item.get("status") or "").upper() == "COMPLETED"])
+        physical_vehicle_count = self._physical_vehicle_count(run_dir)
         return {
             "run_id": run_id,
             "summary": summary,
@@ -78,7 +88,10 @@ class RunRepository:
             "ingestion_metrics": ingestion,
             "evidence_metrics": evidence,
             "vehicle_enrichment_metrics": enrichment,
-            "track_count": len([item for item in tracks if isinstance(item, dict)]),
+            "track_count": physical_vehicle_count or raw_track_count,
+            "physical_vehicle_count": physical_vehicle_count,
+            "raw_track_count": raw_track_count,
+            "completed_track_count": completed_track_count,
             "paths": {
                 "tracks": str(run_dir / "tracks.json"),
                 "vehicle_enrichment": str(run_dir / "vehicle_enrichment.json"),
@@ -252,6 +265,114 @@ class RunRepository:
             },
         }
 
+    def get_plate_assisted_identity_experiment(self, run_id: str) -> dict[str, Any] | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None:
+            return None
+        output_dir = run_dir / "vehicle_identity_test" / "plate_assisted"
+        vehicles_payload = self._read_json(output_dir / "vehicles.json", default=None)
+        vehicle_id_map = self._read_json(output_dir / "vehicle_id_map.json", default={})
+        evaluation = self._read_json(output_dir / "evaluation.json", default={})
+        consensus_rows = self._read_json(output_dir / "track_plate_consensus.json", default=[])
+        decisions = self._read_csv_rows(output_dir / "association_decisions.csv")
+        pair_scores = self._read_csv_rows(output_dir / "plate_pair_scores.csv")
+        identity_scores = self._read_csv_rows(output_dir / "identity_scores.csv")
+        if not isinstance(vehicles_payload, dict):
+            return {
+                "run_id": run_id,
+                "experimental": True,
+                "stage": "plate_assisted_identity",
+                "available": False,
+                "message": "Plate-assisted identity experiment has not been run for this run.",
+                "verification": {},
+                "plate_coverage": {},
+                "baseline_without_plate": {},
+                "plate_assisted": {},
+                "vehicles": [],
+                "vehicle_id_map": {},
+                "track_plate_consensus": [],
+                "association_decisions": [],
+                "plate_pair_scores": [],
+                "identity_scores": [],
+                "paths": {},
+            }
+        consensus_by_track = {
+            str(item.get("local_track_id")): dict(item)
+            for item in consensus_rows
+            if isinstance(item, dict) and item.get("local_track_id")
+        }
+        decisions_by_pair = self._rows_by_track_pair(decisions)
+        vehicles = list(vehicles_payload.get("vehicles", []) or [])
+        for vehicle in vehicles:
+            if not isinstance(vehicle, dict):
+                continue
+            member_tracks = [str(item) for item in list(vehicle.get("member_tracks", []) or [])]
+            member_plate_rows = [self._serialize_plate_member(run_id, consensus_by_track.get(track_id, {})) for track_id in member_tracks]
+            accepted_decisions = [
+                decisions_by_pair[key]
+                for key in self._pair_keys(member_tracks)
+                if key in decisions_by_pair and str(decisions_by_pair[key].get("decision")) == "MERGE"
+            ]
+            plate_texts = [
+                str(item.get("normalized_plate_text"))
+                for item in member_plate_rows
+                if item.get("normalized_plate_text") and str(item.get("plate_evidence_status")) != "NO READABLE PLATE"
+            ]
+            consensus_text = self._most_common_value(plate_texts)
+            qualities = [str(item.get("quality") or "UNUSABLE") for item in member_plate_rows]
+            vehicle["member_track_ids"] = member_tracks
+            vehicle["plate"] = {
+                "consensus_text": consensus_text,
+                "quality": self._best_plate_quality(qualities),
+                "status": self._plate_vehicle_status(member_plate_rows, accepted_decisions),
+                "member_plates": member_plate_rows,
+            }
+            vehicle["representative_evidence"] = [
+                {
+                    "track_id": item.get("local_track_id"),
+                    "vehicle_crop_url": item.get("vehicle_crop_url"),
+                    "plate_crop_url": item.get("plate_crop_url"),
+                    "plate_text": item.get("normalized_plate_text"),
+                    "confidence": item.get("plate_text_confidence") or item.get("plate_detection_confidence"),
+                    "quality": item.get("quality"),
+                }
+                for item in member_plate_rows
+            ]
+            vehicle["association_reasons"] = sorted(
+                {
+                    str(decision.get("decision_reason_codes") or decision.get("plate_reason_code") or decision.get("association_reason"))
+                    for decision in accepted_decisions
+                    if decision.get("decision_reason_codes") or decision.get("plate_reason_code") or decision.get("association_reason")
+                }
+            )
+            vehicle["contact_sheet_url"] = self._plate_assisted_contact_sheet_url(run_id, member_tracks)
+        return {
+            "run_id": run_id,
+            "experimental": True,
+            "stage": "plate_assisted_identity",
+            "available": True,
+            "message": None,
+            "verification": evaluation.get("verification", {}),
+            "plate_coverage": evaluation.get("plate_coverage", {}),
+            "baseline_without_plate": evaluation.get("baseline_without_plate", {}),
+            "plate_assisted": evaluation.get("plate_assisted", {}),
+            "examples": evaluation.get("examples", {}),
+            "vehicles": vehicles,
+            "vehicle_id_map": vehicle_id_map if isinstance(vehicle_id_map, dict) else {},
+            "track_plate_consensus": consensus_rows if isinstance(consensus_rows, list) else [],
+            "association_decisions": decisions,
+            "plate_pair_scores": pair_scores,
+            "identity_scores": identity_scores,
+            "paths": {
+                "vehicles": str(output_dir / "vehicles.json"),
+                "vehicle_id_map": str(output_dir / "vehicle_id_map.json"),
+                "track_plate_consensus": str(output_dir / "track_plate_consensus.json"),
+                "association_decisions": str(output_dir / "association_decisions.csv"),
+                "evaluation": str(output_dir / "evaluation.json"),
+                "report": str(output_dir / "report.md"),
+            },
+        }
+
     def list_tracks(
         self,
         *,
@@ -355,6 +476,60 @@ class RunRepository:
             "runs": runs,
         }
 
+    def list_vehicle_records(self, *, run_id: str | None = None) -> list[Any]:
+        vehicles: list[dict[str, Any]] = []
+        for candidate_run_id in self._resolve_run_ids(run_id):
+            vehicles.extend(self.list_physical_vehicles(run_id=candidate_run_id))
+        if vehicles:
+            return vehicle_records_from_physical_vehicles(vehicles)
+        tracks: list[dict[str, Any]] = []
+        for candidate_run_id in self._resolve_run_ids(run_id):
+            tracks.extend(self._load_run_tracks(run_id=candidate_run_id, include_evidence=False))
+        return vehicle_records_from_repository_tracks(tracks)
+
+    def list_physical_vehicles(
+        self,
+        *,
+        run_id: str | None = None,
+        vehicle_class: str | None = None,
+        colour: str | None = None,
+        plate_text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for candidate_run_id in self._resolve_run_ids(run_id):
+            run_dir = self._resolve_run_directory(candidate_run_id)
+            if run_dir is None:
+                continue
+            payload = self._read_json(run_dir / "physical_vehicles.json", default={})
+            vehicles = list(dict(payload or {}).get("physical_vehicles", []) or []) if isinstance(payload, dict) else []
+            for vehicle in vehicles:
+                if not isinstance(vehicle, dict):
+                    continue
+                record = dict(vehicle)
+                record["run_id"] = candidate_run_id
+                record["vehicle_id"] = str(record.get("vehicle_id") or record.get("vehicle_key") or "")
+                if vehicle_class and str(record.get("vehicle_class", "")).upper() != vehicle_class.upper():
+                    continue
+                if colour and str(record.get("vehicle_colour", "")).upper() != colour.upper():
+                    continue
+                if plate_text and str(record.get("consensus_plate_text", "")).upper() != str(plate_text).upper():
+                    continue
+                rows.append(record)
+        rows.sort(key=lambda item: (str(item.get("run_id", "")), float(item.get("last_seen_seconds") or 0.0)), reverse=True)
+        return rows
+
+    def _physical_vehicle_count(self, run_dir: Path) -> int:
+        payload = self._read_json(run_dir / "physical_vehicles.json", default={})
+        if not isinstance(payload, dict):
+            return 0
+        return len([item for item in list(payload.get("physical_vehicles", []) or []) if isinstance(item, dict)])
+
+    def get_physical_vehicle(self, *, vehicle_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+        for vehicle in self.list_physical_vehicles(run_id=run_id):
+            if str(vehicle.get("vehicle_id")) == vehicle_id or str(vehicle.get("vehicle_key")) == vehicle_id:
+                return vehicle
+        return None
+
     def resolve_media_path(self, *, run_id: str, category: str, relative_parts: list[str]) -> Path | None:
         run_dir = self._resolve_run_directory(run_id)
         if run_dir is None:
@@ -411,6 +586,7 @@ class RunRepository:
             enrichment = enrichment_by_track.get(local_track_id, {})
             colour_payload = dict(enrichment.get("vehicle_colour", {}) or {})
             colour_label = colour_payload.get("label")
+            plate_crop_path = enrichment.get("plate_crop_path")
             vehicle_class_value = enrichment.get("vehicle_class") or item.get("final_class")
             first_seen_seconds = self._coerce_float(item.get("first_timestamp_seconds"))
             last_seen_seconds = self._coerce_float(item.get("last_timestamp_seconds"))
@@ -428,6 +604,16 @@ class RunRepository:
                 "vehicle_class": vehicle_class_value,
                 "colour": colour_label,
                 "colour_status": colour_payload.get("status"),
+                "plate_text": enrichment.get("plate_text"),
+                "plate_detected": enrichment.get("plate_detected"),
+                "plate_colour": enrichment.get("plate_colour"),
+                "registration_category": enrichment.get("registration_category"),
+                "plate_detection_confidence": enrichment.get("plate_detection_confidence"),
+                "plate_text_confidence": enrichment.get("plate_text_confidence"),
+                "plate_quality_status": enrichment.get("plate_quality_status"),
+                "plate_ocr_reason": enrichment.get("plate_ocr_reason"),
+                "plate_crop_path": plate_crop_path,
+                "plate_crop_parts": self._path_to_media_reference(run_id=run_id, path_value=plate_crop_path),
                 "first_seen": first_seen_seconds,
                 "last_seen": last_seen_seconds,
                 "first_seen_seconds": first_seen_seconds,
@@ -504,6 +690,7 @@ class RunRepository:
             "track_reconciliation_visual": run_dir / "track_reconciliation_test" / "visual_evidence",
             "vehicle_identity_visual": run_dir / "vehicle_identity_test" / "visual_evidence",
             "stationary_recovery_contact_sheets": run_dir / "vehicle_identity_test" / "stationary_recovery" / "contact_sheets",
+            "plate_assisted_contact_sheets": run_dir / "vehicle_identity_test" / "plate_assisted" / "contact_sheets",
         }
         return mapping.get(category)
 
@@ -522,6 +709,20 @@ class RunRepository:
         if path is None:
             return None
         return f"/api/media/stationary_recovery_contact_sheets/{run_id}/{persistent_vehicle_id}.jpg"
+
+    def _plate_assisted_contact_sheet_url(self, run_id: str, member_tracks: list[str]) -> str | None:
+        run_dir = self._resolve_run_directory(run_id)
+        if run_dir is None or len(member_tracks) < 2:
+            return None
+        contact_dir = run_dir / "vehicle_identity_test" / "plate_assisted" / "contact_sheets"
+        if not contact_dir.exists():
+            return None
+        short_ids = [self._short_track_id(track_id) for track_id in member_tracks]
+        for path in sorted(contact_dir.glob("*.jpg")):
+            name = path.stem
+            if name.startswith("same__") and all(short_id in name for short_id in short_ids):
+                return f"/api/media/plate_assisted_contact_sheets/{run_id}/{path.name}"
+        return None
 
     def _read_json(self, path: Path, *, default: Any) -> Any:
         if not path.exists():
@@ -627,6 +828,7 @@ class RunRepository:
             "detected_frames": run_dir / "detected_frames",
             "raw_frames": run_dir / "raw_frames",
             "track_reconciliation_visual": run_dir / "track_reconciliation_test" / "visual_evidence",
+            "plate_assisted_contact_sheets": run_dir / "vehicle_identity_test" / "plate_assisted" / "contact_sheets",
         }
         for category, root in category_roots.items():
             try:
@@ -656,6 +858,77 @@ class RunRepository:
         if candidate.exists():
             return [camera_id, candidate.name]
         return None
+
+    def _serialize_plate_member(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        item = dict(payload)
+        item["quality"] = item.get("reliability_label") or "UNUSABLE"
+        item["plate_evidence_status"] = self._plate_member_status(item)
+        item["vehicle_crop_media"] = self._path_to_media_reference(run_id=run_id, path_value=item.get("vehicle_crop_path"))
+        item["plate_crop_media"] = self._path_to_media_reference(run_id=run_id, path_value=item.get("plate_crop_path"))
+        item["vehicle_crop_url"] = self._media_reference_url(item.get("vehicle_crop_media"))
+        item["plate_crop_url"] = self._media_reference_url(item.get("plate_crop_media"))
+        return item
+
+    def _media_reference_url(self, media: dict[str, Any] | None) -> str | None:
+        if not media:
+            return None
+        category = str(media.get("category") or "")
+        run_id = str(media.get("run_id") or "")
+        parts = [str(item) for item in list(media.get("parts", []) or []) if str(item)]
+        if not category or not run_id or not parts:
+            return None
+        return f"/api/media/{category}/{run_id}/{'/'.join(parts)}"
+
+    def _plate_member_status(self, item: dict[str, Any]) -> str:
+        text = str(item.get("normalized_plate_text") or "")
+        if not text:
+            return "NO READABLE PLATE"
+        quality = str(item.get("reliability_label") or "").upper()
+        if quality == "HIGH" and len(text) >= 9:
+            return "EXACT / HIGH QUALITY"
+        if quality in {"HIGH", "MEDIUM"}:
+            return "PARTIAL"
+        return "LOW CONFIDENCE"
+
+    def _plate_vehicle_status(self, members: list[dict[str, Any]], decisions: list[dict[str, str]]) -> str:
+        reason_text = " ".join(str(item.get("decision_reason_codes") or item.get("plate_reason_code") or "") for item in decisions)
+        if "PLATE_EXACT_MATCH" in reason_text:
+            return "EXACT / HIGH QUALITY"
+        if "PLATE_PARTIAL_MATCH" in reason_text:
+            return "PARTIAL"
+        if any(str(item.get("plate_evidence_status")) == "EXACT / HIGH QUALITY" for item in members):
+            return "EXACT / HIGH QUALITY"
+        if any(str(item.get("plate_evidence_status")) == "PARTIAL" for item in members):
+            return "PARTIAL"
+        return "NO READABLE PLATE"
+
+    def _best_plate_quality(self, qualities: list[str]) -> str:
+        order = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNUSABLE": 0}
+        if not qualities:
+            return "UNUSABLE"
+        return max(qualities, key=lambda item: order.get(str(item).upper(), 0))
+
+    def _most_common_value(self, values: list[str]) -> str | None:
+        if not values:
+            return None
+        counts: dict[str, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    def _rows_by_track_pair(self, rows: list[dict[str, str]]) -> dict[tuple[str, str], dict[str, str]]:
+        return {
+            tuple(sorted((str(row.get("track_a")), str(row.get("track_b"))))): row
+            for row in rows
+            if row.get("track_a") and row.get("track_b")
+        }
+
+    def _pair_keys(self, track_ids: list[str]) -> list[tuple[str, str]]:
+        return [
+            tuple(sorted((track_ids[index], track_ids[other_index])))
+            for index in range(len(track_ids))
+            for other_index in range(index + 1, len(track_ids))
+        ]
 
     def _build_reconciliation_visual_evidence(self, *, run_id: str, experiment_dir: Path) -> list[dict[str, Any]]:
         root = experiment_dir / "visual_evidence"

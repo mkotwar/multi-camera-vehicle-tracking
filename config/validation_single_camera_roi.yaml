@@ -7,7 +7,7 @@ input:
   cameras:
     - camera_id: CAM_001
       source_type: video
-      source: "D:/old_files/vinfocom/Raw2.mp4"
+      source: "D:/old_files/vinfocom/WhatsApp Video 2026-08-13 at 18.20.21.mp4"
       enabled: true
     - camera_id: CAM_002
       source_type: video

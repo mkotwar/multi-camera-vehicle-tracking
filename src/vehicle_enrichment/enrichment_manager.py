@@ -1076,6 +1076,70 @@ class VehicleEnrichmentManager:
         self._cleanup_track(result.local_track_id)
         return result
 
+    def _run_plate_enrichment(self, selected: list[Any]) -> dict[str, Any]:
+        plate_detection_enabled = bool(getattr(self.plate_detector, "enabled", False))
+        plate_ocr_enabled = bool(getattr(self.plate_ocr_engine, "enabled", False))
+        if plate_detection_enabled and selected:
+            plate_detection_result = self.plate_detector.detect(selected[0])
+            detection_prediction = next(iter(plate_detection_result.predictions or []), None)
+            detection_payload = dict(getattr(detection_prediction, "raw_response", {}) or {}) if detection_prediction else None
+            plate_quality_result = self.plate_quality_validator.validate(detection_payload)
+        elif plate_detection_enabled:
+            plate_detection_result = PlateDetectionResult(
+                detected=False,
+                predictions=[],
+                status="skipped",
+                source="plate.detector",
+                reason="no_selected_vehicle_crop",
+            )
+            plate_quality_result = self.plate_quality_validator.validate(None)
+        else:
+            plate_detection_result = PlateDetectionResult(
+                detected=False,
+                predictions=[],
+                status=ATTRIBUTE_STATUS_DISABLED,
+                source="plate.detector",
+                reason="plate_scope_frozen",
+            )
+            plate_quality_result = PlateQualityResult(
+                acceptable=None,
+                predictions=[],
+                status=ATTRIBUTE_STATUS_DISABLED,
+                source="plate.quality_validator",
+                reason="plate_scope_frozen",
+            )
+            detection_payload = None
+
+        plate_ocr_attempted = False
+        if plate_detection_enabled and not getattr(plate_detection_result, "detected", False):
+            self._metrics["plate_ocr_skipped_no_plate"] += 1
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="skipped", source="plate.ocr_engine", reason="no_plate_detected")
+        elif plate_detection_enabled and getattr(plate_quality_result, "acceptable", None) is False:
+            self._metrics["plate_ocr_skipped_low_quality"] += 1
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="skipped", source="plate.ocr_engine", reason=getattr(plate_quality_result, "reason", None))
+        elif plate_detection_enabled and plate_ocr_enabled:
+            plate_ocr_attempted = True
+            self._metrics["plate_ocr_attempts"] += 1
+            self._metrics["gpu_memory_before_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
+            plate_ocr_result = self.plate_ocr_engine.recognize(
+                (detection_payload or {}).get("plate_crop_path"),
+                frame_number=(selected[0].frame_number if selected else None),
+                confidence=(detection_payload or {}).get("confidence"),
+            )
+            self._metrics["gpu_memory_after_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
+            if plate_ocr_result.status == "completed":
+                self._metrics["plate_ocr_inference_calls"] += 1
+        elif plate_detection_enabled:
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_ocr_disabled")
+        else:
+            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_scope_frozen")
+
+        plate_aggregate = self.plate_result_aggregator.aggregate(plate_detection_result, plate_quality_result, plate_ocr_result)
+        plate_aggregate["plate_ocr_attempted"] = plate_ocr_attempted
+        plate_aggregate["plate_quality_status"] = getattr(plate_quality_result, "reason", None)
+        plate_aggregate["plate_ocr_backend"] = "ocr_mukul_adapter" if bool(self.plate_ocr_config.get("enabled", False)) else None
+        return plate_aggregate
+
     def _build_async_vehicle_attribute_result(self, prepared: PreparedTrackEnrichment, attribute_result: Any) -> TrackEnrichmentResult:
         track = prepared.track
         selected = list(prepared.selected_items)
@@ -1159,6 +1223,7 @@ class VehicleEnrichmentManager:
             used_fallback=prepared.fallback_crop_count > 0 or colour_selection_tier == "low_resolution_fallback",
             valid_colour=str(colour_result.label or "").upper() not in {"", "UNKNOWN"},
         )
+        plate_aggregate = self._run_plate_enrichment(selected)
         return self._build_base_result(
             track=track,
             vehicle_class_confidence=prepared.vehicle_class_confidence,
@@ -1171,8 +1236,11 @@ class VehicleEnrichmentManager:
             colour_result=colour_result,
             vehicle_make=None,
             vehicle_model=None,
-            plate_detected=False,
-            plate_text=None,
+            plate_detected=plate_aggregate["plate_detected"],
+            plate_text=plate_aggregate["plate_text"],
+            plate_detection_confidence=plate_aggregate["plate_detection_confidence"],
+            plate_bbox=plate_aggregate["plate_bbox"],
+            plate_crop_path=plate_aggregate["plate_crop_path"],
             candidate_crop_count=prepared.candidate_crop_count,
             eligible_crop_count=prepared.eligible_crop_count,
             preferred_crop_count=prepared.preferred_crop_count,
@@ -1201,11 +1269,12 @@ class VehicleEnrichmentManager:
             vehicle_attribute_selected_crop_paths=[str(item.get("vehicle_crop_path")) for item in attribute_result.crop_level_rows],
             vehicle_attribute_inference_count=attribute_result.inference_count,
             attribute_backend="base_florence",
-            plate_ocr_backend=None,
-            plate_ocr_attempted=False,
-            plate_ocr_raw_response=None,
-            plate_ocr_reason="plate_scope_frozen",
-            plate_quality_status="plate_scope_frozen",
+            plate_ocr_backend=plate_aggregate["plate_ocr_backend"],
+            plate_ocr_attempted=plate_aggregate["plate_ocr_attempted"],
+            plate_ocr_raw_response=plate_aggregate["plate_ocr_raw_response"],
+            plate_text_confidence=plate_aggregate["plate_text_confidence"],
+            plate_ocr_reason=plate_aggregate["reason"],
+            plate_quality_status=plate_aggregate["plate_quality_status"],
             comparison_payload=None,
             classification_trigger="track_completion_async_colour",
             final_reason=body_type_result.aggregation_reason or body_type_result.reason or colour_result.aggregation_reason or colour_result.reason,
@@ -1472,8 +1541,6 @@ class VehicleEnrichmentManager:
             valid_colour=str(colour_result.label or "").upper() not in {"", "UNKNOWN"},
         )
         make_model_enabled = bool(getattr(self.make_model_classifier, "enabled", False))
-        plate_detection_enabled = bool(getattr(self.plate_detector, "enabled", False))
-        plate_ocr_enabled = bool(getattr(self.plate_ocr_engine, "enabled", False))
         if make_model_enabled:
             make_model_result = self.make_model_classifier.classify(request)
         else:
@@ -1485,48 +1552,7 @@ class VehicleEnrichmentManager:
                 source="make_model.classifier",
                 reason="make_model_scope_frozen",
             )
-        if plate_detection_enabled and selected:
-            plate_detection_result = self.plate_detector.detect(selected[0])
-            plate_quality_result = self.plate_quality_validator.validate(None)
-        elif plate_detection_enabled:
-            plate_detection_result = PlateDetectionResult(
-                detected=False,
-                predictions=[],
-                status="skipped",
-                source="plate.detector",
-                reason="no_selected_vehicle_crop",
-            )
-            plate_quality_result = self.plate_quality_validator.validate(None)
-        else:
-            plate_detection_result = PlateDetectionResult(
-                detected=False,
-                predictions=[],
-                status=ATTRIBUTE_STATUS_DISABLED,
-                source="plate.detector",
-                reason="plate_scope_frozen",
-            )
-            plate_quality_result = PlateQualityResult(
-                acceptable=None,
-                predictions=[],
-                status=ATTRIBUTE_STATUS_DISABLED,
-                source="plate.quality_validator",
-                reason="plate_scope_frozen",
-            )
-        if plate_detection_enabled and not getattr(plate_detection_result, "detected", False):
-            self._metrics["plate_ocr_skipped_no_plate"] += 1
-            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="skipped", source="plate.ocr_engine", reason="no_plate_detected")
-        elif plate_detection_enabled and plate_ocr_enabled:
-            self._metrics["plate_ocr_attempts"] += 1
-            self._metrics["gpu_memory_before_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
-            plate_ocr_result = self.plate_ocr_engine.recognize(None)
-            self._metrics["gpu_memory_after_ocr_load_mb"] = float(self.ocr_mukul_backend.metrics.get("gpu_memory_allocated_mb") or 0.0)
-            if plate_ocr_result.status == "completed":
-                self._metrics["plate_ocr_inference_calls"] += 1
-        elif plate_detection_enabled:
-            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_ocr_disabled")
-        else:
-            plate_ocr_result = PlateOCRResult(text=None, predictions=[], status="disabled", source="plate.ocr_engine", reason="plate_scope_frozen")
-        plate_aggregate = self.plate_result_aggregator.aggregate(plate_detection_result, plate_quality_result, plate_ocr_result)
+        plate_aggregate = self._run_plate_enrichment(selected)
         overall_status = (
             ENRICHMENT_STATUS_COMPLETED
             if self.body_type_classifier.enabled or self.colour_classifier.enabled or self.enrichment_config.get("enabled", False)
@@ -1547,6 +1573,10 @@ class VehicleEnrichmentManager:
             vehicle_model=make_model_result.model,
             plate_detected=plate_aggregate["plate_detected"],
             plate_text=plate_aggregate["plate_text"],
+            plate_detection_confidence=plate_aggregate["plate_detection_confidence"],
+            plate_bbox=plate_aggregate["plate_bbox"],
+            plate_crop_path=plate_aggregate["plate_crop_path"],
+            plate_text_confidence=plate_aggregate["plate_text_confidence"],
             candidate_crop_count=len(scored),
             eligible_crop_count=eligible_crop_count,
             preferred_crop_count=preferred_crop_count,
@@ -1575,11 +1605,11 @@ class VehicleEnrichmentManager:
             vehicle_attribute_selected_crop_paths=[str(item.get("vehicle_crop_path")) for item in (attribute_result.crop_level_rows if self.enrichment_config.get("enabled", False) else [])],
             vehicle_attribute_inference_count=caption_inference_count if self.enrichment_config.get("enabled", False) else 0,
             attribute_backend="base_florence" if self.enrichment_config.get("enabled", False) else None,
-            plate_ocr_backend="ocr_mukul_adapter" if bool(self.plate_ocr_config.get("enabled", False)) else None,
-            plate_ocr_attempted=False,
-            plate_ocr_raw_response=None,
+            plate_ocr_backend=plate_aggregate["plate_ocr_backend"],
+            plate_ocr_attempted=plate_aggregate["plate_ocr_attempted"],
+            plate_ocr_raw_response=plate_aggregate["plate_ocr_raw_response"],
             plate_ocr_reason=plate_aggregate["reason"],
-            plate_quality_status=getattr(plate_quality_result, "reason", None),
+            plate_quality_status=plate_aggregate["plate_quality_status"],
             comparison_payload=comparison_payload,
             classification_trigger="track_completion",
             final_reason=body_type_result.aggregation_reason or body_type_result.reason or colour_result.aggregation_reason or colour_result.reason,

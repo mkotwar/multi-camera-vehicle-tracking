@@ -33,6 +33,20 @@ export async function apiPost<T>(path: string, payload: unknown): Promise<T> {
   return (await response.json()) as T;
 }
 
+export async function apiPut<T>(path: string, payload: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw await buildApiError(response);
+  }
+  return (await response.json()) as T;
+}
+
 export function apiUrl(path: string): string {
   return `${API_BASE_URL}${path}`;
 }

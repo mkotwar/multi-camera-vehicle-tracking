@@ -8,6 +8,9 @@ export type RunSummary = {
   overall_pipeline_runtime_ms?: number | null;
   duration_seconds?: number | null;
   track_count?: number | null;
+  physical_vehicle_count?: number | null;
+  raw_track_count?: number | null;
+  completed_track_count?: number | null;
   frames_by_camera?: Record<string, number>;
   run_directory?: string | null;
   runtime?: boolean;
@@ -180,5 +183,67 @@ export type StationaryRecoveryResult = {
   persistent_vehicle_id_map: Record<string, string>;
   recovery_decisions: Record<string, unknown>[];
   recovery_scores: Record<string, unknown>[];
+  paths: Record<string, string>;
+};
+
+export type PlateAssistedMemberPlate = {
+  local_track_id: string;
+  normalized_plate_text?: string | null;
+  raw_plate_text?: string | null;
+  quality?: string | null;
+  reliability_label?: string | null;
+  plate_evidence_status?: string | null;
+  plate_detection_confidence?: number | string | null;
+  plate_text_confidence?: number | string | null;
+  plate_crop_url?: string | null;
+  vehicle_crop_url?: string | null;
+  plate_ocr_reason?: string | null;
+};
+
+export type PlateAssistedVehicle = {
+  vehicle_id: string;
+  camera_id: string;
+  member_tracks: string[];
+  member_track_ids?: string[];
+  final_class: string;
+  first_seen_frame?: number | null;
+  last_seen_frame?: number | null;
+  first_seen_seconds?: number | null;
+  last_seen_seconds?: number | null;
+  contact_sheet_url?: string | null;
+  plate?: {
+    consensus_text?: string | null;
+    quality?: string | null;
+    status?: string | null;
+    member_plates?: PlateAssistedMemberPlate[];
+  };
+  representative_evidence?: {
+    track_id?: string | null;
+    vehicle_crop_url?: string | null;
+    plate_crop_url?: string | null;
+    plate_text?: string | null;
+    confidence?: number | string | null;
+    quality?: string | null;
+  }[];
+  association_reasons?: string[];
+};
+
+export type PlateAssistedIdentityResult = {
+  run_id: string;
+  experimental: true;
+  stage: "plate_assisted_identity";
+  available: boolean;
+  message?: string | null;
+  verification: Record<string, unknown>;
+  plate_coverage: Record<string, unknown>;
+  baseline_without_plate: Record<string, unknown>;
+  plate_assisted: Record<string, unknown>;
+  examples?: Record<string, unknown>;
+  vehicles: PlateAssistedVehicle[];
+  vehicle_id_map: Record<string, string>;
+  track_plate_consensus: PlateAssistedMemberPlate[];
+  association_decisions: Record<string, unknown>[];
+  plate_pair_scores: Record<string, unknown>[];
+  identity_scores: Record<string, unknown>[];
   paths: Record<string, string>;
 };

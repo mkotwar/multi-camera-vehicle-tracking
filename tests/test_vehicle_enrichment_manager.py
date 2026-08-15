@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import time
+import sys
 
 import cv2
 import numpy as np
@@ -11,7 +12,8 @@ from src.logging_setup import setup_logging
 from src.models import LocalTrack, TrackEvidence
 from src.output_writer import RunOutputManager
 from src.vehicle_enrichment.enrichment_manager import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
-from src.vehicle_enrichment.schemas import VehicleBodyTypeResult, VehicleColourResult
+from src.vehicle_enrichment.plate.detector import PlateDetector
+from src.vehicle_enrichment.schemas import AttributePrediction, PlateDetectionResult, PlateOCRResult, VehicleBodyTypeResult, VehicleColourResult
 
 
 def _track() -> LocalTrack:
@@ -416,6 +418,192 @@ def test_manager_skips_frozen_make_model_and_plate_runtime_paths(tmp_path: Path,
     assert plate_ocr_calls == 0
     assert result.plate_detected is False
     assert result.plate_text is None
+
+
+def test_plate_enrichment_passes_detected_crop_to_ocr(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    manager.plate_detector.enabled = True
+    manager.plate_quality_validator.enabled = True
+    manager.plate_ocr_engine.enabled = True
+
+    image = np.full((60, 120, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "crop_plate.jpg"
+    plate_path = tmp_path / "plate.jpg"
+    cv2.imwrite(str(crop_path), image)
+    cv2.imwrite(str(plate_path), image[10:30, 40:95])
+
+    monkeypatch.setattr(
+        manager.plate_detector,
+        "detect",
+        lambda item: PlateDetectionResult(
+            detected=True,
+            status="completed",
+            source="plate.detector",
+            reason="plate_detected",
+            predictions=[
+                AttributePrediction(
+                    attribute_name="plate_detection",
+                    label="PLATE",
+                    source_backend="ultralytics_yolo",
+                    source_model="plate.pt",
+                    source_frame_number=3,
+                    source_crop_path=str(plate_path),
+                    raw_response={
+                        "bbox_xyxy": [40.0, 10.0, 95.0, 30.0],
+                        "confidence": 0.91,
+                        "plate_crop_path": str(plate_path),
+                        "plate_crop_width": 55,
+                        "plate_crop_height": 20,
+                    },
+                    confidence=0.91,
+                    quality_weight=0.91,
+                    status="completed",
+                )
+            ],
+        ),
+    )
+
+    recognized_paths: list[str] = []
+
+    def _recognize(path, *, frame_number=None, confidence=None):
+        recognized_paths.append(str(path))
+        return PlateOCRResult(
+            text="MH12AB1234",
+            status="completed",
+            source="plate.ocr_engine",
+            reason="ocr_completed",
+            predictions=[
+                AttributePrediction(
+                    attribute_name="plate_ocr",
+                    label="MH12AB1234",
+                    source_backend="ocr_mukul_adapter",
+                    source_model="florence",
+                    source_frame_number=frame_number,
+                    source_crop_path=str(path),
+                    raw_response="MH 12 AB 1234",
+                    confidence=confidence,
+                    quality_weight=confidence,
+                    status="completed",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(manager.plate_ocr_engine, "recognize", _recognize)
+
+    result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+
+    assert recognized_paths == [str(plate_path)]
+    assert result.plate_detected is True
+    assert result.plate_text == "MH12AB1234"
+    assert result.plate_crop_path == str(plate_path)
+    assert result.plate_detection_confidence == 0.91
+    assert result.plate_ocr_attempted is True
+    assert result.plate_ocr_raw_response == "MH 12 AB 1234"
+
+
+def test_plate_enrichment_skips_ocr_for_low_quality_plate(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    manager.plate_detector.enabled = True
+    manager.plate_quality_validator.enabled = True
+    manager.plate_quality_validator.minimum_crop_width = 40
+    manager.plate_quality_validator.minimum_crop_height = 16
+    manager.plate_ocr_engine.enabled = True
+
+    image = np.full((60, 120, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "crop_plate_low_quality.jpg"
+    cv2.imwrite(str(crop_path), image)
+
+    monkeypatch.setattr(
+        manager.plate_detector,
+        "detect",
+        lambda item: PlateDetectionResult(
+            detected=True,
+            status="completed",
+            source="plate.detector",
+            reason="plate_detected",
+            predictions=[
+                AttributePrediction(
+                    attribute_name="plate_detection",
+                    label="PLATE",
+                    source_backend="ultralytics_yolo",
+                    source_model="plate.pt",
+                    source_frame_number=3,
+                    source_crop_path=str(crop_path),
+                    raw_response={
+                        "bbox_xyxy": [40.0, 10.0, 60.0, 20.0],
+                        "confidence": 0.91,
+                        "plate_crop_path": str(crop_path),
+                        "plate_crop_width": 20,
+                        "plate_crop_height": 10,
+                    },
+                    confidence=0.91,
+                    quality_weight=0.91,
+                    status="completed",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(manager.plate_ocr_engine, "recognize", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("OCR should be skipped")))
+
+    result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+
+    assert result.plate_detected is True
+    assert result.plate_text is None
+    assert result.plate_ocr_attempted is False
+    assert result.plate_ocr_reason == "plate_crop_below_minimum_size"
+
+
+def test_plate_detector_saves_best_plate_crop_with_mock_yolo(tmp_path: Path, monkeypatch) -> None:
+    class _FakeBox:
+        def __init__(self, bbox: list[float], confidence: float) -> None:
+            self.xyxy = [bbox]
+            self.conf = [confidence]
+
+    class _FakeResult:
+        boxes = [
+            _FakeBox([5.0, 5.0, 20.0, 15.0], 0.55),
+            _FakeBox([40.0, 10.0, 95.0, 30.0], 0.93),
+        ]
+
+    class _FakeYOLO:
+        def __init__(self, model_path: str) -> None:
+            self.model_path = model_path
+
+        def __call__(self, image, **kwargs):
+            return [_FakeResult()]
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=_FakeYOLO))
+
+    model_path = tmp_path / "license_plate_weights.pt"
+    model_path.write_bytes(b"fake")
+    crop_path = tmp_path / "CAM_001" / "TRACK_1" / "crops" / "frame_000003.jpg"
+    crop_path.parent.mkdir(parents=True)
+    image = np.full((60, 120, 3), 180, dtype=np.uint8)
+    cv2.imwrite(str(crop_path), image)
+
+    detector = PlateDetector(
+        {
+            "detector": {
+                "enabled": True,
+                "model_path": str(model_path),
+                "confidence_threshold": 0.5,
+                "minimum_crop_width": 10,
+                "minimum_crop_height": 8,
+            }
+        }
+    )
+
+    result = detector.detect(SimpleNamespace(vehicle_crop_path=str(crop_path), frame_number=3, evidence_role="BEST_OVERALL"))
+
+    assert result.detected is True
+    payload = result.predictions[0].raw_response
+    assert payload["bbox_xyxy"] == [40.0, 10.0, 95.0, 30.0]
+    assert payload["confidence"] == 0.93
+    saved_plate_path = Path(payload["plate_crop_path"])
+    assert saved_plate_path.exists()
+    assert saved_plate_path.parent == crop_path.parent.parent / "plate"
+    saved = cv2.imread(str(saved_plate_path))
+    assert saved.shape[:2] == (20, 55)
 
 
 def test_normalize_vehicle_enrichment_config_supports_colour_only_vehicle_attributes() -> None:

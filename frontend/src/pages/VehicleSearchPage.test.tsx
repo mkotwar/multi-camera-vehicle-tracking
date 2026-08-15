@@ -3,10 +3,14 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VehicleSearchPage } from "./VehicleSearchPage";
 
-const { fetchFilterOptions, fetchTrackReconciliation, fetchTracks, searchVehicles } = vi.hoisted(() => ({
+const { fetchExperimentalVehicles, fetchFilterOptions, fetchPlateAssistedVehicles, fetchStationaryRecoveredVehicles, fetchTrackReconciliation, fetchTracks, fetchVehicles, searchVehicles } = vi.hoisted(() => ({
+  fetchExperimentalVehicles: vi.fn(),
   fetchFilterOptions: vi.fn(),
+  fetchPlateAssistedVehicles: vi.fn(),
+  fetchStationaryRecoveredVehicles: vi.fn(),
   fetchTrackReconciliation: vi.fn(),
   fetchTracks: vi.fn(),
+  fetchVehicles: vi.fn(),
   searchVehicles: vi.fn(),
 }));
 
@@ -15,11 +19,15 @@ vi.mock("../api/filters", () => ({
 }));
 
 vi.mock("../api/runs", () => ({
+  fetchExperimentalVehicles,
+  fetchPlateAssistedVehicles,
+  fetchStationaryRecoveredVehicles,
   fetchTrackReconciliation,
 }));
 
 vi.mock("../api/tracks", () => ({
   fetchTracks,
+  fetchVehicles,
 }));
 
 vi.mock("../api/vehicleSearch", () => ({
@@ -46,8 +54,12 @@ describe("VehicleSearchPage", () => {
 
   beforeEach(() => {
     fetchFilterOptions.mockReset();
+    fetchExperimentalVehicles.mockReset();
+    fetchPlateAssistedVehicles.mockReset();
+    fetchStationaryRecoveredVehicles.mockReset();
     fetchTrackReconciliation.mockReset();
     fetchTracks.mockReset();
+    fetchVehicles.mockReset();
     searchVehicles.mockReset();
     fetchFilterOptions.mockResolvedValue({
       runs: ["latest", "20260808_182124"],
@@ -63,10 +75,33 @@ describe("VehicleSearchPage", () => {
         local_track_id: "CAM_001:TRACK_1",
         vehicle_class: "CAR",
         colour: "WHITE",
+        plate_text: "DL8CAF5030",
+        plate_detected: true,
+        plate_text_confidence: 0.86,
         first_seen_seconds: 1.2,
         last_seen_seconds: 2.8,
         duration_seconds: 1.6,
         status: "COMPLETED",
+      },
+    ]);
+    fetchVehicles.mockResolvedValue([
+      {
+        run_id: "20260808_182124",
+        vehicle_id: "VEHICLE_004",
+        vehicle_key: "VEHICLE_004",
+        primary_camera_id: "CAM_001",
+        camera_ids: ["CAM_001"],
+        vehicle_class: "CAR",
+        vehicle_colour: "WHITE",
+        first_seen_seconds: 1.2,
+        last_seen_seconds: 6.8,
+        identity_confidence: 0.96,
+        identity_method: "plate_assisted",
+        identity_status: "MERGED",
+        consensus_plate_text: "HR38AD4296",
+        plate_confidence: 0.75,
+        member_track_ids: ["CAM_001:TRACK_4", "CAM_001:TRACK_14"],
+        member_track_count: 2,
       },
     ]);
     searchVehicles.mockResolvedValue({
@@ -154,6 +189,130 @@ describe("VehicleSearchPage", () => {
       ],
       manual_validation: [],
       visual_evidence: [],
+      paths: {},
+    });
+    fetchExperimentalVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      experimental: true,
+      available: false,
+      message: "Persistent vehicle identity experiment has not been run for this run.",
+      metrics: {},
+      analytics_simulation: {},
+      existing_reconciliation_baseline: {},
+      config: {},
+      calibration: {},
+      vehicles: [],
+      vehicle_id_map: {},
+      association_decisions: [],
+      paths: {},
+    });
+    fetchStationaryRecoveredVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      experimental: true,
+      stage: "stationary_recovery",
+      available: false,
+      message: "Stationary recovery experiment has not been run for this run.",
+      metrics: {},
+      analytics_simulation: {},
+      config: {},
+      calibration: {},
+      persistent_vehicles: [],
+      persistent_vehicle_id_map: {},
+      recovery_decisions: [],
+      recovery_scores: [],
+      paths: {},
+    });
+    fetchPlateAssistedVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      experimental: true,
+      stage: "plate_assisted_identity",
+      available: true,
+      message: null,
+      verification: {},
+      plate_coverage: {
+        completed_tracks: 23,
+        plate_detected_count: 11,
+        readable_plate_count: 11,
+        high_quality_plate_count: 11,
+        exact_matching_plate_pairs: 3,
+      },
+      baseline_without_plate: { reconciled_identities: 16 },
+      plate_assisted: {
+        raw_completed_tracks: 23,
+        reconciled_identities: 13,
+        duplicates_removed: 10,
+        true_fragment_merges: 3,
+        false_merges: 0,
+      },
+      vehicles: [
+        {
+          vehicle_id: "VEHICLE_004",
+          camera_id: "CAM_001",
+          member_tracks: ["CAM_001:TRACK_4", "CAM_001:TRACK_14"],
+          member_track_ids: ["CAM_001:TRACK_4", "CAM_001:TRACK_14"],
+          final_class: "CAR",
+          first_seen_seconds: 0.06,
+          last_seen_seconds: 6.7,
+          contact_sheet_url: "/api/media/plate_assisted_contact_sheets/20260808_182124/same__TRACK_4__TRACK_14.jpg",
+          plate: {
+            consensus_text: "HR38AD4296",
+            quality: "HIGH",
+            status: "EXACT / HIGH QUALITY",
+            member_plates: [
+              {
+                local_track_id: "CAM_001:TRACK_4",
+                normalized_plate_text: "HR38AD4296",
+                quality: "HIGH",
+                plate_evidence_status: "EXACT / HIGH QUALITY",
+                plate_detection_confidence: 0.744,
+                plate_text_confidence: 0.744,
+                plate_crop_url: "/api/media/florence_selected_crops/20260808_182124/CAM_001/TRACK_4/plate/frame.jpg",
+                vehicle_crop_url: "/api/media/florence_selected_crops/20260808_182124/CAM_001/TRACK_4/frame.jpg",
+                plate_ocr_reason: "ocr_completed",
+              },
+              {
+                local_track_id: "CAM_001:TRACK_14",
+                normalized_plate_text: "HR38AD4296",
+                quality: "HIGH",
+                plate_evidence_status: "EXACT / HIGH QUALITY",
+                plate_detection_confidence: 0.755,
+                plate_text_confidence: 0.755,
+                plate_ocr_reason: "ocr_completed",
+              },
+            ],
+          },
+          association_reasons: ["PLATE_EXACT_MATCH | SPATIAL_MATCH"],
+        },
+        {
+          vehicle_id: "VEHICLE_010",
+          camera_id: "CAM_001",
+          member_tracks: ["CAM_001:TRACK_16"],
+          member_track_ids: ["CAM_001:TRACK_16"],
+          final_class: "BUS",
+          plate: {
+            consensus_text: "HR30T42",
+            quality: "HIGH",
+            status: "PARTIAL",
+            member_plates: [
+              {
+                local_track_id: "CAM_001:TRACK_16",
+                normalized_plate_text: "HR30T42",
+                quality: "HIGH",
+                plate_evidence_status: "PARTIAL",
+                plate_detection_confidence: 0.821,
+                plate_text_confidence: 0.821,
+                plate_ocr_reason: "ocr_completed",
+              },
+            ],
+          },
+          association_reasons: [],
+        },
+      ],
+      vehicle_id_map: { "CAM_001:TRACK_4": "VEHICLE_004", "CAM_001:TRACK_14": "VEHICLE_004" },
+      track_plate_consensus: [],
+      association_decisions: [],
+      plate_pair_scores: [],
+      identity_scores: [],
       paths: {},
     });
   });
@@ -338,18 +497,23 @@ describe("VehicleSearchPage", () => {
     }));
   });
 
-  it("defaults to raw tracks without loading reconciliation output", async () => {
+  it("defaults to physical vehicles without loading experiment output", async () => {
     render(
       <MemoryRouter initialEntries={["/vehicles"]}>
         <VehicleSearchPage />
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(fetchTracks).toHaveBeenCalled());
+    await waitFor(() => expect(fetchVehicles).toHaveBeenCalled());
 
+    expect(screen.getByRole("button", { name: "Physical Vehicles" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Raw Tracks" })).toBeInTheDocument();
-    expect(screen.getByText("TRACK_1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Plate-Assisted Identity" })).toBeInTheDocument();
+    expect(screen.getByText("VEHICLE_004")).toBeInTheDocument();
+    expect(screen.getAllByText("HR38AD4296").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_4").length).toBeGreaterThan(0);
     expect(fetchTrackReconciliation).not.toHaveBeenCalled();
+    expect(fetchPlateAssistedVehicles).not.toHaveBeenCalled();
   });
 
   it("shows reconciled vehicle identities with original track fragments and counts", async () => {
@@ -393,10 +557,80 @@ describe("VehicleSearchPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByText("TRACK_1")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("VEHICLE_004")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Reconciled Vehicles" }));
 
     await waitFor(() => expect(screen.getByText("Reconciliation test has not been run for this run.")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Raw Tracks" }));
+    expect(screen.getByText("TRACK_1")).toBeInTheDocument();
+    expect(screen.getByText("DL8CAF5030")).toBeInTheDocument();
+  });
+
+  it("loads plate-assisted identity as a separate experimental view", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles?run_id=20260808_182124"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Plate-Assisted Identity" }));
+
+    await waitFor(() => expect(fetchPlateAssistedVehicles).toHaveBeenCalledWith("20260808_182124"));
+    expect(screen.getByText("Plate-assisted identity experimental mode")).toBeInTheDocument();
+    expect(screen.getByText("Plate-Assisted IDs")).toBeInTheDocument();
+    expect(screen.getByText("Duplicates Removed")).toBeInTheDocument();
+    expect(screen.getByText("Readable Plates")).toBeInTheDocument();
+    expect(screen.getByText("Plate-Confirmed Merges")).toBeInTheDocument();
+    expect(screen.getByText("VEHICLE_004")).toBeInTheDocument();
+    expect(screen.getAllByText("HR38AD4296").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_4").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_14").length).toBeGreaterThan(0);
+    expect(screen.getByText("PLATE_EXACT_MATCH | SPATIAL_MATCH")).toBeInTheDocument();
+  });
+
+  it("shows partial plate status without presenting it as an exact merge", async () => {
+    render(
+      <MemoryRouter initialEntries={["/vehicles?run_id=20260808_182124"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Plate-Assisted Identity" }));
+
+    await waitFor(() => expect(screen.getByText("VEHICLE_010")).toBeInTheDocument());
+    expect(screen.getAllByText("HR30T42").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("PARTIAL").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("TRACK_16").length).toBeGreaterThan(0);
+  });
+
+  it("shows a clean missing plate-assisted experiment state", async () => {
+    fetchPlateAssistedVehicles.mockResolvedValue({
+      run_id: "20260808_182124",
+      experimental: true,
+      stage: "plate_assisted_identity",
+      available: false,
+      message: "Plate-assisted identity experiment has not been run for this run.",
+      verification: {},
+      plate_coverage: {},
+      baseline_without_plate: {},
+      plate_assisted: {},
+      vehicles: [],
+      vehicle_id_map: {},
+      track_plate_consensus: [],
+      association_decisions: [],
+      plate_pair_scores: [],
+      identity_scores: [],
+      paths: {},
+    });
+    render(
+      <MemoryRouter initialEntries={["/vehicles?run_id=20260808_182124"]}>
+        <VehicleSearchPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Plate-Assisted Identity" }));
+
+    await waitFor(() => expect(screen.getByText("Plate-assisted identity experiment has not been run for this run.")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Raw Tracks" }));
     expect(screen.getByText("TRACK_1")).toBeInTheDocument();
   });

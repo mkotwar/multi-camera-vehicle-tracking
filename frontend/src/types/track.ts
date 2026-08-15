@@ -7,6 +7,15 @@ export type TrackRecord = {
   vehicle_class?: string | null;
   colour?: string | null;
   colour_status?: string | null;
+  plate_text?: string | null;
+  plate_detected?: boolean | null;
+  plate_colour?: string | null;
+  registration_category?: string | null;
+  plate_detection_confidence?: number | string | null;
+  plate_text_confidence?: number | string | null;
+  plate_quality_status?: string | null;
+  plate_ocr_reason?: string | null;
+  plate_crop_url?: string | null;
   first_seen?: number | null;
   last_seen?: number | null;
   first_seen_seconds?: number | null;
@@ -22,6 +31,30 @@ export type TrackRecord = {
   best_crop_url?: string | null;
   available_crop_paths?: string[];
   runtime?: boolean;
+};
+
+export type PhysicalVehicleRecord = {
+  run_id?: string | null;
+  vehicle_id: string;
+  vehicle_key?: string | null;
+  primary_camera_id?: string | null;
+  camera_ids?: string[];
+  vehicle_class?: string | null;
+  vehicle_colour?: string | null;
+  first_seen_seconds?: number | null;
+  last_seen_seconds?: number | null;
+  identity_confidence?: number | string | null;
+  identity_method?: string | null;
+  identity_status?: string | null;
+  consensus_plate_text?: string | null;
+  plate_confidence?: number | string | null;
+  plate_quality?: string | null;
+  best_crop_url?: string | null;
+  member_track_ids?: string[];
+  member_track_count?: number | null;
+  representative_evidence?: Record<string, unknown>[];
+  association_decisions?: Record<string, unknown>[];
+  plate_evidence?: Record<string, unknown>[];
 };
 
 export type MediaRef = {

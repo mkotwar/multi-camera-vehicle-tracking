@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -13,7 +15,7 @@ from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VE
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:1.7b"
 DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 8.0
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 45.0
 
 
 class OllamaQwenChatLLMProvider:
@@ -49,11 +51,14 @@ class OllamaQwenChatLLMProvider:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        started = time.perf_counter()
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Ollama chat request failed: {exc}") from exc
+        except HTTPError as exc:
+            raise RuntimeError(f"Ollama chat request failed: {_safe_ollama_error_details(self, exc, started, http_status=exc.code)}") from exc
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Ollama chat request failed: {_safe_ollama_error_details(self, exc, started)}") from exc
         content = str(dict(raw.get("message") or {}).get("content") or "").strip()
         if not content:
             raise RuntimeError("Ollama response did not include message.content")
@@ -64,6 +69,23 @@ class OllamaQwenChatLLMProvider:
         if not isinstance(parsed, dict):
             raise RuntimeError("Ollama structured output was not a JSON object")
         return parsed
+
+
+def _safe_ollama_error_details(provider: OllamaQwenChatLLMProvider, exc: Exception, started: float, *, http_status: int | None = None) -> str:
+    host = urlparse(provider.base_url).netloc or provider.base_url
+    elapsed = time.perf_counter() - started
+    parts = [
+        f"provider=ollama",
+        f"model={provider.model}",
+        f"host={host}",
+        f"timeout_seconds={provider.timeout_seconds:g}",
+        f"elapsed_seconds={elapsed:.3f}",
+        f"exception={exc.__class__.__name__}",
+    ]
+    if http_status is not None:
+        parts.append(f"http_status={http_status}")
+    parts.append(f"detail={exc}")
+    return " ".join(parts)
 
 
 def build_chat_llm_provider_from_env() -> OllamaQwenChatLLMProvider | None:

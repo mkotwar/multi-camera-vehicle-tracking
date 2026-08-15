@@ -1,9 +1,14 @@
 import { apiGet } from "./client";
-import type { EvidenceRecord, TrackRecord } from "../types/track";
+import type { EvidenceRecord, PhysicalVehicleRecord, TrackRecord } from "../types/track";
 
 export function fetchTracks(query: URLSearchParams): Promise<TrackRecord[]> {
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return apiGet<TrackRecord[]>(`/api/tracks${suffix}`);
+}
+
+export function fetchVehicles(query: URLSearchParams): Promise<PhysicalVehicleRecord[]> {
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return apiGet<PhysicalVehicleRecord[]>(`/api/vehicles${suffix}`);
 }
 
 export function fetchTrack(cameraId: string, trackId: string, runId?: string): Promise<TrackRecord> {

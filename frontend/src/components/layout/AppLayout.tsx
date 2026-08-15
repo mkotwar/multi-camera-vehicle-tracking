@@ -13,6 +13,8 @@ export function AppLayout({ children }: Props) {
           <NavLink to="/vehicles">Vehicles</NavLink>
           <NavLink to="/video-chat">Video Chat</NavLink>
           <NavLink to="/runs">Runs</NavLink>
+          <NavLink to="/run-control">Run Control</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
           <NavLink to="/system">System</NavLink>
         </nav>
       </header>

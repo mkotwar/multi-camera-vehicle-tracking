@@ -128,6 +128,100 @@ def _build_run(tmp_path: Path) -> str:
     return run_id
 
 
+def _build_physical_vehicle_run(tmp_path: Path) -> str:
+    run_id = "20260815_170454"
+    run_dir = tmp_path / run_id
+    _write_json(run_dir / "summary.json", {"run_id": run_id, "status": "COMPLETED", "processed_frames": 100})
+    _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 1})
+    representative_crop = run_dir / "evidence" / "CAM_001" / "CAM_001_TRACK_1" / "crops" / "frame_000001.jpg"
+    representative_crop.parent.mkdir(parents=True, exist_ok=True)
+    representative_crop.write_bytes(b"representative crop")
+    fallback_crop = run_dir / "05_florence_selected_crops" / "CAM_001" / "TRACK_3" / "frame_000003_MIDDLE.jpg"
+    fallback_crop.parent.mkdir(parents=True, exist_ok=True)
+    fallback_crop.write_bytes(b"fallback crop")
+    tracks = [
+        {
+            "local_track_id": "CAM_001:TRACK_1",
+            "camera_id": "CAM_001",
+            "status": "COMPLETED",
+            "first_timestamp_seconds": 1.0,
+            "last_timestamp_seconds": 2.0,
+            "observation_count": 5,
+            "final_class": "car",
+            "vehicle_enrichment": {"vehicle_colour": {"label": "WHITE", "status": "completed"}},
+        },
+        {
+            "local_track_id": "CAM_001:TRACK_2",
+            "camera_id": "CAM_001",
+            "status": "COMPLETED",
+            "first_timestamp_seconds": 3.0,
+            "last_timestamp_seconds": 4.0,
+            "observation_count": 5,
+            "final_class": "car",
+            "vehicle_enrichment": {"vehicle_colour": {"label": "WHITE", "status": "completed"}},
+        },
+        {
+            "local_track_id": "CAM_001:TRACK_3",
+            "camera_id": "CAM_001",
+            "status": "COMPLETED",
+            "first_timestamp_seconds": 5.0,
+            "last_timestamp_seconds": 6.0,
+            "observation_count": 5,
+            "final_class": "motorcycle",
+            "vehicle_enrichment": {"vehicle_colour": {"label": "BLACK", "status": "completed"}},
+        },
+    ]
+    _write_json(run_dir / "tracks.json", tracks)
+    _write_json(
+        run_dir / "vehicle_enrichment.json",
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_3",
+                "camera_id": "CAM_001",
+                "vehicle_class": "MOTORCYCLE",
+                "vehicle_colour": {"label": "BLACK", "status": "completed"},
+                "evidence_used": [{"vehicle_crop_path": str(fallback_crop), "selected_for_colour": True}],
+                "selected_crop_paths": [str(fallback_crop)],
+                "status": "completed",
+            }
+        ],
+    )
+    _write_json(
+        run_dir / "physical_vehicles.json",
+        {
+            "physical_vehicles": [
+                {
+                    "vehicle_id": "VEHICLE_001",
+                    "vehicle_key": "VEHICLE_001",
+                    "vehicle_class": "CAR",
+                    "vehicle_colour": "WHITE",
+                    "first_seen_seconds": 1.0,
+                    "last_seen_seconds": 4.0,
+                    "member_track_ids": ["CAM_001:TRACK_1", "CAM_001:TRACK_2"],
+                    "member_track_count": 2,
+                    "primary_camera_id": "CAM_001",
+                    "camera_ids": ["CAM_001"],
+                    "representative_evidence": [{"local_track_id": "CAM_001:TRACK_1", "vehicle_crop_path": str(representative_crop)}],
+                },
+                {
+                    "vehicle_id": "VEHICLE_002",
+                    "vehicle_key": "VEHICLE_002",
+                    "vehicle_class": "MOTORCYCLE",
+                    "vehicle_colour": "BLACK",
+                    "first_seen_seconds": 5.0,
+                    "last_seen_seconds": 6.0,
+                    "member_track_ids": ["CAM_001:TRACK_3"],
+                    "member_track_count": 1,
+                    "primary_camera_id": "CAM_001",
+                    "camera_ids": ["CAM_001"],
+                    "representative_evidence": [],
+                },
+            ]
+        },
+    )
+    return run_id
+
+
 def _build_vehicle_search_run(tmp_path: Path) -> str:
     run_id = "20260812_113742"
     run_dir = tmp_path / run_id
@@ -255,6 +349,45 @@ def test_api_app_filter_options_and_track_filters(tmp_path: Path) -> None:
     assert time_response.status_code == 200
     time_tracks = time_response.json()
     assert len(time_tracks) == 2
+
+
+def test_api_app_physical_vehicle_counts_and_video_chat_evidence(tmp_path: Path) -> None:
+    run_id = _build_physical_vehicle_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    runs_response = client.get("/api/runs")
+    assert runs_response.status_code == 200
+    run_summary = runs_response.json()[0]
+    assert run_summary["run_id"] == run_id
+    assert run_summary["track_count"] == 2
+    assert run_summary["physical_vehicle_count"] == 2
+    assert run_summary["raw_track_count"] == 3
+    assert run_summary["completed_track_count"] == 3
+
+    tracks_response = client.get("/api/tracks", params={"run_id": run_id})
+    assert tracks_response.status_code == 200
+    assert len(tracks_response.json()) == 3
+
+    vehicles_response = client.get("/api/vehicles", params={"run_id": run_id})
+    assert vehicles_response.status_code == 200
+    vehicles = vehicles_response.json()
+    assert len(vehicles) == 2
+    vehicles_by_id = {item["vehicle_id"]: item for item in vehicles}
+    assert vehicles_by_id["VEHICLE_001"]["best_crop_url"].startswith(f"/api/media/evidence/{run_id}/")
+    assert vehicles_by_id["VEHICLE_002"]["best_crop_url"].startswith(f"/api/media/florence_selected_crops/{run_id}/")
+
+    chat_response = client.post("/api/video-chat", json={"message": "Show them", "run_id": run_id, "session_id": "physical-chat"})
+    assert chat_response.status_code == 200
+    payload = chat_response.json()
+    assert payload["analytics_result"]["total"] == 2
+    assert set(payload["matching_vehicle_ids"]) == {"VEHICLE_001", "VEHICLE_002"}
+    assert payload["evidence_page"]["matching_total"] == 2
+    assert payload["evidence_page"]["evidence_returned_count"] == 2
+    assert payload["answer"] == "2 vehicles were observed. Showing 2 of 2."
+    evidence_by_id = {item["vehicle_id"]: item for item in payload["evidence"]}
+    assert evidence_by_id["VEHICLE_001"]["member_track_ids"] == ["CAM_001:TRACK_1", "CAM_001:TRACK_2"]
+    assert evidence_by_id["VEHICLE_001"]["best_crop_url"].startswith(f"/api/media/evidence/{run_id}/")
+    assert evidence_by_id["VEHICLE_002"]["best_crop_url"].startswith(f"/api/media/florence_selected_crops/{run_id}/")
 
 
 def test_api_app_evidence_and_media_endpoints(tmp_path: Path) -> None:
@@ -761,6 +894,16 @@ def test_api_health_tracks_and_latest_regression(tmp_path: Path) -> None:
     assert runs_response.json()[0]["run_id"] == run_id
 
 
+def test_api_openapi_schema_builds(tmp_path: Path) -> None:
+    _build_run(tmp_path)
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    assert response.json()["info"]["title"] == "Multi-Camera Vehicle Tracking API"
+
+
 def test_api_track_reconciliation_available_missing_and_tracks_json_untouched(tmp_path: Path) -> None:
     run_id = _build_run(tmp_path)
     run_dir = tmp_path / run_id
@@ -985,3 +1128,112 @@ def test_api_stationary_recovery_endpoint_available_missing_and_tracks_json_unto
     missing_response = client.get("/api/experimental/stationary-recovered-vehicles", params={"run_id": missing_run_id})
     assert missing_response.status_code == 200
     assert missing_response.json()["available"] is False
+
+
+def test_api_plate_assisted_identity_endpoint_available_missing_and_raw_tracks_unchanged(tmp_path: Path) -> None:
+    run_id = _build_run(tmp_path)
+    run_dir = tmp_path / run_id
+    tracks_before = (run_dir / "tracks.json").read_text(encoding="utf-8")
+    output_dir = run_dir / "vehicle_identity_test" / "plate_assisted"
+    contact_dir = output_dir / "contact_sheets"
+    contact_dir.mkdir(parents=True)
+    (contact_dir / "same__TRACK_1__TRACK_2.jpg").write_bytes(b"plate-contact")
+    plate_crop = run_dir / "05_florence_selected_crops" / "CAM_001" / "TRACK_1" / "plate" / "frame_000005_plate.jpg"
+    plate_crop.parent.mkdir(parents=True, exist_ok=True)
+    plate_crop.write_bytes(b"plate")
+    _write_json(
+        output_dir / "vehicles.json",
+        {
+            "vehicles": [
+                {
+                    "vehicle_id": "VEHICLE_001",
+                    "camera_id": "CAM_001",
+                    "member_tracks": ["CAM_001:TRACK_1", "CAM_002:TRACK_2"],
+                    "final_class": "CAR",
+                    "first_seen_seconds": 1.0,
+                    "last_seen_seconds": 9.0,
+                }
+            ]
+        },
+    )
+    _write_json(output_dir / "vehicle_id_map.json", {"CAM_001:TRACK_1": "VEHICLE_001", "CAM_002:TRACK_2": "VEHICLE_001"})
+    _write_json(
+        output_dir / "track_plate_consensus.json",
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "plate_detected": True,
+                "ocr_attempted": True,
+                "raw_plate_text": "HR38AD4296",
+                "normalized_plate_text": "HR38AD4296",
+                "plate_detection_confidence": 0.82,
+                "plate_text_confidence": 0.81,
+                "plate_crop_path": str(plate_crop),
+                "vehicle_crop_path": str(run_dir / "05_florence_selected_crops" / "CAM_001" / "TRACK_1" / "frame_000005_MIDDLE.jpg"),
+                "reliability_label": "HIGH",
+            },
+            {
+                "local_track_id": "CAM_002:TRACK_2",
+                "plate_detected": True,
+                "ocr_attempted": True,
+                "raw_plate_text": "HR38AD4296",
+                "normalized_plate_text": "HR38AD4296",
+                "plate_detection_confidence": 0.80,
+                "plate_text_confidence": 0.79,
+                "plate_crop_path": str(plate_crop),
+                "vehicle_crop_path": str(run_dir / "05_florence_selected_crops" / "CAM_001" / "TRACK_1" / "frame_000005_MIDDLE.jpg"),
+                "reliability_label": "HIGH",
+            },
+        ],
+    )
+    _write_json(
+        output_dir / "evaluation.json",
+        {
+            "verification": {"plate_enabled": True, "ocr_enabled": True, "rectangle_roi_enabled": True},
+            "plate_coverage": {"completed_tracks": 2, "readable_plate_count": 2, "high_quality_plate_count": 2, "exact_matching_plate_pairs": 1},
+            "baseline_without_plate": {"reconciled_identities": 2},
+            "plate_assisted": {"raw_completed_tracks": 2, "reconciled_identities": 1, "duplicates_removed": 1, "true_fragment_merges": 1, "false_merges": 0},
+        },
+    )
+    (output_dir / "association_decisions.csv").write_text(
+        "track_a,track_b,candidate_vehicle_id,decision,plate_reason_code,decision_reason_codes,best_member_score\n"
+        "CAM_001:TRACK_1,CAM_002:TRACK_2,VEHICLE_001,MERGE,PLATE_EXACT_MATCH,PLATE_EXACT_MATCH | SPATIAL_MATCH,0.98\n",
+        encoding="utf-8",
+    )
+    (output_dir / "plate_pair_scores.csv").write_text(
+        "track_a,track_b,plate_evidence,plate_reason_code\nCAM_001:TRACK_1,CAM_002:TRACK_2,STRONG_POSITIVE,PLATE_EXACT_MATCH\n",
+        encoding="utf-8",
+    )
+    (output_dir / "identity_scores.csv").write_text(
+        "track_a,track_b,score,plate_reason_code\nCAM_001:TRACK_1,CAM_002:TRACK_2,0.98,PLATE_EXACT_MATCH\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.get("/api/experimental/plate-assisted-vehicles", params={"run_id": run_id})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["experimental"] is True
+    assert payload["stage"] == "plate_assisted_identity"
+    assert payload["available"] is True
+    assert payload["plate_coverage"]["readable_plate_count"] == 2
+    assert payload["plate_assisted"]["reconciled_identities"] == 1
+    assert payload["vehicles"][0]["member_track_ids"] == ["CAM_001:TRACK_1", "CAM_002:TRACK_2"]
+    assert payload["vehicles"][0]["plate"]["consensus_text"] == "HR38AD4296"
+    assert payload["vehicles"][0]["plate"]["quality"] == "HIGH"
+    assert payload["vehicles"][0]["plate"]["member_plates"][0]["plate_crop_url"].endswith("frame_000005_plate.jpg")
+    assert payload["vehicles"][0]["contact_sheet_url"].endswith("/api/media/plate_assisted_contact_sheets/20260808_182124/same__TRACK_1__TRACK_2.jpg")
+    assert "PLATE_EXACT_MATCH" in payload["vehicles"][0]["association_reasons"][0]
+    assert (run_dir / "tracks.json").read_text(encoding="utf-8") == tracks_before
+
+    raw_response = client.get("/api/tracks", params={"run_id": run_id})
+    assert raw_response.status_code == 200
+    assert len(raw_response.json()) == 2
+
+    missing_run_id = "20260808_190000"
+    _write_json(tmp_path / missing_run_id / "summary.json", {"run_id": missing_run_id, "status": "COMPLETED"})
+    missing_response = client.get("/api/experimental/plate-assisted-vehicles", params={"run_id": missing_run_id})
+    assert missing_response.status_code == 200
+    assert missing_response.json()["available"] is False
+    assert missing_response.json()["message"] == "Plate-assisted identity experiment has not been run for this run."

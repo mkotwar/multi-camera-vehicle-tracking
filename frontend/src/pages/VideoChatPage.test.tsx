@@ -52,7 +52,7 @@ describe("VideoChatPage", () => {
     sendVideoChatMessage.mockReset();
     fetchTrack.mockReset();
     fetchTrackEvidence.mockReset();
-    fetchRuns.mockResolvedValue([{ run_id: "20260812_113742", status: "COMPLETED", track_count: 41, camera_count: 1, duration_seconds: 20 }]);
+    fetchRuns.mockResolvedValue([{ run_id: "20260812_113742", status: "COMPLETED", track_count: 41, physical_vehicle_count: 41, raw_track_count: 45, camera_count: 1, duration_seconds: 20 }]);
     sendVideoChatMessage.mockResolvedValue({
       run_id: "20260812_113742",
       session_id: "session",
@@ -236,10 +236,68 @@ describe("VideoChatPage", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "View Track" })[0]);
     await waitFor(() => expect(fetchTrack).toHaveBeenCalledWith("CAM_001", "TRACK_13", "20260812_113742"));
     expect(screen.getByTestId("location")).toHaveTextContent("/video-chat");
-    expect(await screen.findByText("CAM_001:TRACK_13")).toBeInTheDocument();
+    expect((await screen.findAllByText("CAM_001:TRACK_13")).length).toBeGreaterThan(0);
     expect(screen.getByText("Open full track page")).toHaveAttribute("href", "/tracks/CAM_001/TRACK_13?run_id=20260812_113742");
     fireEvent.click(screen.getByRole("button", { name: "Show more" }));
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenLastCalledWith(expect.objectContaining({ message: "Show more" })));
+  });
+
+  it("renders physical vehicle counts and best crop evidence cards", async () => {
+    fetchRuns.mockResolvedValue([{ run_id: "20260815_170454", status: "COMPLETED", track_count: 108, physical_vehicle_count: 108, raw_track_count: 135, completed_track_count: 125, camera_count: 2, duration_seconds: 60 }]);
+    sendVideoChatMessage.mockResolvedValue({
+      run_id: "20260815_170454",
+      session_id: "session",
+      answer: "108 vehicles were observed. Showing 6 of 108.",
+      parser_used: "rule",
+      parsed_query: { intent: "LIST", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: true },
+      analytics_result: { total: 108 },
+      matching_vehicle_ids: ["VEHICLE_108"],
+      evidence_page: {
+        matching_total: 108,
+        evidence_returned_count: 1,
+        evidence_offset: 0,
+        evidence_page_size: 6,
+        evidence_remaining_count: 102,
+        shown_count: 6,
+        next_offset: 6,
+      },
+      evidence: [
+        {
+          vehicle_id: "VEHICLE_108",
+          camera_id: "CAM_001",
+          track_id: "TRACK_134",
+          member_track_ids: ["CAM_001:TRACK_134"],
+          vehicle_class: "CAR",
+          colour: "BLACK",
+          first_seen_seconds: 59.5,
+          last_seen_seconds: 59.9,
+          best_crop_url: "/api/media/evidence/20260815_170454/CAM_001/CAM_001_TRACK_134/crops/frame_001791.jpg",
+          image_url: "/legacy.jpg",
+          track_detail_url: "/tracks/CAM_001/TRACK_134?run_id=20260815_170454",
+        },
+      ],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/video-chat"]}>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    expect(screen.getByText("Vehicles").nextSibling).toHaveTextContent("108");
+    expect(screen.getByText("Completed vehicles").nextSibling).toHaveTextContent("108");
+    expect(screen.getByText("Raw tracks").nextSibling).toHaveTextContent("135");
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show them" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("VEHICLE_108")).toBeInTheDocument();
+    expect(screen.getByText("Showing 6 of 108 vehicles")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "CAR BLACK crop for VEHICLE_108" })).toHaveAttribute(
+      "src",
+      "/api/media/evidence/20260815_170454/CAM_001/CAM_001_TRACK_134/crops/frame_001791.jpg",
+    );
   });
 
   it("switches selected tracks and preserves chat results", async () => {

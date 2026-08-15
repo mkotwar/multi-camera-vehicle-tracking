@@ -169,7 +169,7 @@ def test_parses_valid_track(tmp_path: Path) -> None:
     run_dir = _base_run(tmp_path)
     report = build_dry_run(run_dir)
     track = report.rows.vehicle_tracks[0]
-    assert track.ref.local_track_id == "TRACK_1"
+    assert track.ref.local_track_id == "CAM_001:TRACK_1"
     assert track.vehicle_class == "CAR"
     assert track.raw_track["new_debug_field"] == "kept"
 
@@ -183,7 +183,7 @@ def test_preserves_completed_and_discarded_status(tmp_path: Path) -> None:
 
 def test_observation_maps_to_correct_logical_track(tmp_path: Path) -> None:
     report = build_dry_run(_base_run(tmp_path))
-    assert report.rows.track_observations[0].ref.key == "20260812_192758|CAM_001|TRACK_1"
+    assert report.rows.track_observations[0].ref.key == "20260812_192758|CAM_001|CAM_001:TRACK_1"
 
 
 def test_orphan_observation_is_reported(tmp_path: Path) -> None:
@@ -214,7 +214,7 @@ def test_orphan_observation_is_reported(tmp_path: Path) -> None:
 
 def test_evidence_maps_to_correct_logical_track(tmp_path: Path) -> None:
     report = build_dry_run(_base_run(tmp_path))
-    assert report.rows.track_evidence[0].ref.key == "20260812_192758|CAM_001|TRACK_1"
+    assert report.rows.track_evidence[0].ref.key == "20260812_192758|CAM_001|CAM_001:TRACK_1"
     assert report.rows.track_evidence[0].evidence_role == "FIRST"
 
 
@@ -256,13 +256,121 @@ def test_unknown_source_fields_are_not_silently_lost(tmp_path: Path) -> None:
     assert report.field_mapping["unresolved"] == []
 
 
-def test_duplicate_logical_track_identity_is_detected(tmp_path: Path) -> None:
+def test_duplicate_completed_logical_track_identity_is_detected(tmp_path: Path) -> None:
     run_dir = _base_run(tmp_path)
     tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
     tracks.append(tracks[0])
     _write_json(run_dir / "tracks.json", tracks)
     report = build_dry_run(run_dir)
-    assert any(issue.code == "duplicate_logical_track_identity" for issue in report.issues)
+    assert any(issue.code == "duplicate_completed_logical_track_identity" for issue in report.issues)
+
+
+def test_duplicate_discarded_track_identity_is_remapped_for_import(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
+    tracks.append(
+        {
+            **tracks[0],
+            "status": "DISCARDED",
+            "first_frame": 9,
+            "last_frame": 9,
+            "observation_count": 1,
+        }
+    )
+    _write_json(run_dir / "tracks.json", tracks)
+    _write_csv(
+        run_dir / "observations.csv",
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 1,
+                "frame_number": 1,
+                "timestamp_seconds": 0.1,
+                "x1": 1,
+                "y1": 2,
+                "x2": 3,
+                "y2": 4,
+                "confidence": 0.9,
+                "raw_class_id": 2,
+                "raw_class_name": "car",
+            },
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 1,
+                "frame_number": 9,
+                "timestamp_seconds": 0.9,
+                "x1": 1,
+                "y1": 2,
+                "x2": 3,
+                "y2": 4,
+                "confidence": 0.9,
+                "raw_class_id": 2,
+                "raw_class_name": "car",
+            },
+        ],
+    )
+
+    report = build_dry_run(run_dir)
+
+    assert report.counts["issues"]["ERROR"] == 0
+    assert any(issue.code == "duplicate_noncanonical_track_identity_remapped" for issue in report.issues)
+    remapped = next(row for row in report.rows.vehicle_tracks if row.ref.local_track_id.startswith("CAM_001:TRACK_1__DUPLICATE"))
+    assert remapped.track_status == "DISCARDED"
+    assert remapped.raw_track["original_local_track_id"] == "CAM_001:TRACK_1"
+    assert any(row.ref.local_track_id == remapped.ref.local_track_id and row.frame_number == 9 for row in report.rows.track_observations)
+
+
+def test_missing_tracks_json_is_reported(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    (run_dir / "tracks.json").unlink()
+    report = build_dry_run(run_dir)
+    assert any(issue.code == "missing_required_file" for issue in report.issues)
+
+
+def test_malformed_json_is_reported(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    (run_dir / "tracks.json").write_text("{not-json", encoding="utf-8")
+    report = build_dry_run(run_dir)
+    assert any(issue.code == "malformed_json" for issue in report.issues)
+
+
+def test_invalid_csv_row_is_reported(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    _write_csv(
+        run_dir / "observations.csv",
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 1,
+                "frame_number": "not-a-number",
+                "timestamp_seconds": 0.1,
+                "x1": 1,
+                "y1": 2,
+                "x2": 3,
+                "y2": 4,
+                "confidence": 0.9,
+                "raw_class_id": 2,
+                "raw_class_name": "car",
+            }
+        ],
+    )
+    report = build_dry_run(run_dir)
+    assert any(issue.code == "invalid_observation_time" for issue in report.issues)
+
+
+def test_orphan_evidence_is_reported(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    evidence = json.loads((run_dir / "evidence_index.json").read_text(encoding="utf-8"))
+    evidence[0]["local_track_id"] = "CAM_001:TRACK_99"
+    _write_json(run_dir / "evidence_index.json", evidence)
+    report = build_dry_run(run_dir)
+    assert any(issue.code == "orphan_evidence" for issue in report.issues)
 
 
 def test_dry_run_executes_without_supabase_client_call(tmp_path: Path, monkeypatch) -> None:

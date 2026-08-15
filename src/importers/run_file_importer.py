@@ -16,8 +16,11 @@ from src.importers.models import (
     DryRunRows,
     LogicalTrackRef,
     MediaAssetRow,
+    IdentityDecisionRow,
     PlateDetectionRow,
     PlateReadingRow,
+    PhysicalVehicleRow,
+    PhysicalVehicleTrackRow,
     ProcessingRunRow,
     RunCameraRow,
     TrackEvidenceRow,
@@ -133,35 +136,92 @@ def load_run_files(run_dir: Path) -> dict[str, Any]:
         "observations": _read_csv(run_dir / "observations.csv"),
         "evidence": _read_json(run_dir / "evidence_index.json", default=[]),
         "enrichment": _read_json(run_dir / "vehicle_enrichment.json", default=[]),
+        "physical_vehicles": _read_json(run_dir / "physical_vehicles.json", default={}),
+        "identity_decisions": _read_json(run_dir / "identity_decisions.json", default=[]),
     }
 
 
 def build_dry_run(run_dir: str | Path) -> DryRunReport:
     run_path = Path(run_dir).resolve()
-    source = load_run_files(run_path)
-    run_key = str(source["metadata"].get("run_id") or source["summary"].get("run_id") or run_path.name)
     rows = DryRunRows()
     issues: list[ValidationIssue] = []
     normalizations: list[dict[str, Any]] = []
     media_seen: set[tuple[str, str | None, str | None]] = set()
+    source = _load_run_files_for_report(run_path, issues)
+    run_key = str(source["metadata"].get("run_id") or source["summary"].get("run_id") or run_path.name)
 
-    enrichment_by_track = _index_by_track(source["enrichment"], run_key)
-    rows.processing_runs.append(_map_processing_run(run_key, source))
+    rows.processing_runs.append(_map_processing_run(run_key, source, run_path))
     rows.run_cameras.extend(_map_run_cameras(run_key, source))
 
     known_refs: dict[str, LogicalTrackRef] = {}
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]] = defaultdict(list)
+    track_occurrences = Counter((_str_or_none(track.get("camera_id")) or "UNKNOWN_CAMERA", _str_or_none(track.get("local_track_id")) or "UNKNOWN_TRACK") for track in source["tracks"])
+    completed_occurrences = Counter(
+        (_str_or_none(track.get("camera_id")) or "UNKNOWN_CAMERA", _str_or_none(track.get("local_track_id")) or "UNKNOWN_TRACK")
+        for track in source["tracks"]
+        if str(track.get("status") or "").upper() == "COMPLETED"
+    )
+    completed_seen: set[tuple[str, str]] = set()
+    track_refs: list[tuple[dict[str, Any], LogicalTrackRef]] = []
     duplicate_tracks = 0
-    for track in source["tracks"]:
-        ref = _track_ref(run_key, track.get("camera_id"), track.get("local_track_id"))
-        if ref.key in known_refs:
-            duplicate_tracks += 1
-            issues.append(ValidationIssue("ERROR", "duplicate_logical_track_identity", "Duplicate logical track identity.", {"track_key": ref.key}))
+    for index, track in enumerate(source["tracks"]):
+        camera_key = _str_or_none(track.get("camera_id")) or "UNKNOWN_CAMERA"
+        original_local = _str_or_none(track.get("local_track_id")) or "UNKNOWN_TRACK"
+        identity = (camera_key, original_local)
+        status = str(track.get("status") or "").upper()
+        local_for_import = original_local
+        if track_occurrences[identity] > 1:
+            if status == "COMPLETED" and identity not in completed_seen and completed_occurrences[identity] == 1:
+                completed_seen.add(identity)
+            else:
+                duplicate_tracks += 1
+                if status == "COMPLETED":
+                    issues.append(
+                        ValidationIssue(
+                            "ERROR",
+                            "duplicate_completed_logical_track_identity",
+                            "Multiple completed tracks share one logical track identity.",
+                            {
+                                "rule": "vehicle_tracks_unique_completed_logical_identity",
+                                "table": "vehicle_tracks",
+                                "entity": "vehicle_track",
+                                "track_key": f"{run_key}|{camera_key}|{original_local}",
+                                "expected": "at most one COMPLETED row for a run/camera/local_track_id",
+                                "actual": f"{completed_occurrences[identity]} COMPLETED rows",
+                            },
+                        )
+                    )
+                local_for_import = f"{original_local}__DUPLICATE_{index + 1}_{status or 'UNKNOWN'}"
+                issues.append(
+                    ValidationIssue(
+                        "INFO",
+                        "duplicate_noncanonical_track_identity_remapped",
+                        "A duplicate noncanonical raw track was assigned an import-only logical ID.",
+                        {
+                            "rule": "vehicle_tracks_unique_logical_identity",
+                            "table": "vehicle_tracks",
+                            "entity": "vehicle_track",
+                            "original_track_key": f"{run_key}|{camera_key}|{original_local}",
+                            "import_track_key": f"{run_key}|{camera_key}|{local_for_import}",
+                            "expected": "unique run/camera/local_track_id for DB import",
+                            "actual": f"{track_occurrences[identity]} raw rows share the original ID",
+                            "status": status,
+                        },
+                    )
+                )
+        ref = _track_ref(run_key, camera_key, local_for_import)
         known_refs[ref.key] = ref
+        track_candidates[identity].append((ref, _int_or_none(track.get("first_frame")), _int_or_none(track.get("last_frame")), status))
+        track_refs.append((track, ref))
+
+    enrichment_by_track = _index_by_track(source["enrichment"], run_key, track_candidates)
+    for track, ref in track_refs:
         rows.vehicle_tracks.append(_map_vehicle_track(ref, track, enrichment_by_track.get(ref.key), normalizations))
 
-    _map_observations(run_key, source["observations"], known_refs, rows, issues)
-    _map_evidence(run_key, source["evidence"], known_refs, rows, issues, run_path, media_seen)
-    _map_enrichment(run_key, source["enrichment"], known_refs, rows, issues, normalizations, run_path, media_seen)
+    _map_observations(run_key, source["observations"], known_refs, rows, issues, track_candidates)
+    _map_evidence(run_key, source["evidence"], known_refs, rows, issues, run_path, media_seen, track_candidates)
+    _map_enrichment(run_key, source["enrichment"], known_refs, rows, issues, normalizations, run_path, media_seen, track_candidates)
+    _map_physical_identity(run_key, source, known_refs, rows, issues)
     _add_pipeline_artifact_media(run_key, run_path, rows, media_seen)
 
     _validate_media(rows.media_assets, issues)
@@ -200,6 +260,9 @@ def build_dry_run(run_dir: str | Path) -> DryRunReport:
             "vehicle_attribute_predictions": len(rows.vehicle_attribute_predictions),
             "plate_detections": len(rows.plate_detections),
             "plate_readings": len(rows.plate_readings),
+            "physical_vehicles": len(rows.physical_vehicles),
+            "physical_vehicle_tracks": len(rows.physical_vehicle_tracks),
+            "identity_decisions": len(rows.identity_decisions),
         },
         "tracks": {
             "mapped": len(rows.vehicle_tracks),
@@ -241,6 +304,11 @@ def build_dry_run(run_dir: str | Path) -> DryRunReport:
             "readings": len(rows.plate_readings),
             "tracks_plate_detected": sum(1 for row in rows.vehicle_tracks if row.plate_detected),
         },
+        "physical_identity": {
+            "physical_vehicles": len(rows.physical_vehicles),
+            "physical_vehicle_tracks": len(rows.physical_vehicle_tracks),
+            "identity_decisions": len(rows.identity_decisions),
+        },
         "issues": count_by_severity(issues),
     }
     field_mapping = _build_field_mapping(source)
@@ -268,7 +336,7 @@ def report_to_dict(report: DryRunReport, include_rows: bool = False) -> dict[str
         "field_mapping": report.field_mapping,
         "normalizations": report.normalizations,
         "verdict": report.verdict,
-        "database_calls": {"supabase_reads": "NO", "supabase_writes": "NO"},
+        "database_calls": {"postgres_reads": "NO", "postgres_writes": "NO", "supabase_rest_writes": "NO"},
     }
     if include_rows:
         payload["rows"] = _jsonable(report.rows)
@@ -348,12 +416,37 @@ def format_console_report(report: DryRunReport) -> str:
         f"info: {c['issues']['INFO']}",
         "",
         "VERDICT",
-        report.verdict,
+        "DRY RUN PASSED" if c["issues"]["ERROR"] == 0 else report.verdict,
     ]
     return "\n".join(lines)
 
 
-def _map_processing_run(run_key: str, source: dict[str, Any]) -> ProcessingRunRow:
+def _load_run_files_for_report(run_path: Path, issues: list[ValidationIssue]) -> dict[str, Any]:
+    source = {
+        "metadata": _safe_read_json(run_path / "run_metadata.json", default={}, issues=issues, required=False),
+        "summary": _safe_read_json(run_path / "summary.json", default={}, issues=issues, required=False),
+        "config": _safe_read_yaml(run_path / "run_config.yaml", issues=issues),
+        "tracks": _safe_read_json(run_path / "tracks.json", default=[], issues=issues, required=True),
+        "observations": _safe_read_csv(run_path / "observations.csv", issues=issues),
+        "evidence": _safe_read_json(run_path / "evidence_index.json", default=[], issues=issues, required=False),
+        "enrichment": _safe_read_json(run_path / "vehicle_enrichment.json", default=[], issues=issues, required=False),
+        "physical_vehicles": _safe_read_json(run_path / "physical_vehicles.json", default={}, issues=issues, required=False),
+        "identity_decisions": _safe_read_json(run_path / "identity_decisions.json", default=[], issues=issues, required=False),
+    }
+    for key in ("tracks", "evidence", "enrichment"):
+        if not isinstance(source[key], list):
+            issues.append(ValidationIssue("ERROR", f"invalid_{key}_json_root", f"{key} source must contain a list.", {"run_dir": str(run_path)}))
+            source[key] = []
+    if not isinstance(source["physical_vehicles"], dict):
+        issues.append(ValidationIssue("ERROR", "invalid_physical_vehicles_json_root", "physical_vehicles source must contain a mapping.", {"run_dir": str(run_path)}))
+        source["physical_vehicles"] = {}
+    if not isinstance(source["identity_decisions"], list):
+        issues.append(ValidationIssue("ERROR", "invalid_identity_decisions_json_root", "identity_decisions source must contain a list.", {"run_dir": str(run_path)}))
+        source["identity_decisions"] = []
+    return source
+
+
+def _map_processing_run(run_key: str, source: dict[str, Any], run_path: Path) -> ProcessingRunRow:
     metadata = source["metadata"]
     summary = source["summary"]
     discarded = sum((summary.get("tracks_discarded_by_camera") or {}).values()) if isinstance(summary.get("tracks_discarded_by_camera"), dict) else None
@@ -365,8 +458,10 @@ def _map_processing_run(run_key: str, source: dict[str, Any]) -> ProcessingRunRo
         project_name=metadata.get("project_name") or summary.get("project_name"),
         started_at=metadata.get("started_at"),
         completed_at=metadata.get("completed_at"),
+        output_directory=str(run_path),
         config_path=metadata.get("config_path"),
         config_snapshot=source["config"],
+        summary=summary,
         detection_backend=summary.get("detection_backend"),
         tracking_backend=summary.get("tracking_backend"),
         enrichment_enabled=summary.get("vehicle_enrichment_enabled"),
@@ -387,6 +482,7 @@ def _map_run_cameras(run_key: str, source: dict[str, Any]) -> list[RunCameraRow]
     cameras = (((config.get("input") or {}).get("cameras")) or []) if isinstance(config, dict) else []
     fps = _float_or_none((config.get("ingestion") or {}).get("target_read_fps")) if isinstance(config, dict) else None
     frames = summary.get("frames_by_camera") or summary.get("frames_consumed_by_camera") or {}
+    scheduled_frames = summary.get("frames_scheduled_by_camera") or frames
     detections = summary.get("detections_by_camera") or {}
     rows = []
     seen = set()
@@ -405,6 +501,7 @@ def _map_run_cameras(run_key: str, source: dict[str, Any]) -> list[RunCameraRow]
                 fps=fps,
                 width=None,
                 height=None,
+                total_frames=_int_or_none(scheduled_frames.get(camera_key) if isinstance(scheduled_frames, dict) else None),
                 frames_processed=_int_or_none(frames.get(camera_key)),
                 detections_count=_int_or_none(detections.get(camera_key)),
                 metadata={k: v for k, v in camera.items() if k not in {"camera_id", "source", "source_type", "enabled"}},
@@ -421,6 +518,7 @@ def _map_run_cameras(run_key: str, source: dict[str, Any]) -> list[RunCameraRow]
                 fps=fps,
                 width=None,
                 height=None,
+                total_frames=_int_or_none(scheduled_frames.get(camera_key) if isinstance(scheduled_frames, dict) else None),
                 frames_processed=_int_or_none(frames.get(camera_key)),
                 detections_count=_int_or_none(detections.get(camera_key)),
                 metadata={},
@@ -437,6 +535,11 @@ def _map_vehicle_track(ref: LogicalTrackRef, track: dict[str, Any], enrichment: 
     plate_detected = (enrichment or {}).get("plate_detected")
     plate_text = _empty_to_none((enrichment or {}).get("plate_text"))
     enrichment_summary = {k: v for k, v in (enrichment or {}).items() if k not in ENRICHMENT_FINAL_FIELDS}
+    raw_track = {k: v for k, v in track.items() if k not in TRACK_TYPED_FIELDS and k != "vehicle_enrichment"}
+    original_local_track_id = _str_or_none(track.get("local_track_id"))
+    if original_local_track_id and original_local_track_id != ref.local_track_id:
+        raw_track["original_local_track_id"] = original_local_track_id
+        raw_track["import_local_track_id"] = ref.local_track_id
     return VehicleTrackRow(
         ref=ref,
         tracker_namespace=track.get("tracker_namespace"),
@@ -451,6 +554,7 @@ def _map_vehicle_track(ref: LogicalTrackRef, track: dict[str, Any], enrichment: 
         observation_count=_int_or_none(track.get("observation_count")),
         lost_frames=_int_or_none(track.get("lost_frames")),
         vehicle_class=_normalize_label(track.get("final_class"), "vehicle_class", ref, normalizations, attempted=True),
+        final_class_reason=_empty_to_none(track.get("final_class_reason")),
         vehicle_class_confidence=_float_or_none((enrichment or {}).get("vehicle_class_confidence")),
         vehicle_colour=final_colour,
         vehicle_colour_status=colour_obj.get("status") if isinstance(colour_obj, dict) else None,
@@ -462,14 +566,22 @@ def _map_vehicle_track(ref: LogicalTrackRef, track: dict[str, Any], enrichment: 
         registration_category=_empty_to_none((enrichment or {}).get("registration_category")),
         class_counts=track.get("class_counts") or {},
         class_confidence_sums=track.get("class_confidence_sums") or {},
-        raw_track={k: v for k, v in track.items() if k not in TRACK_TYPED_FIELDS and k != "vehicle_enrichment"},
+        evidence_record_count=_int_or_none(track.get("evidence_record_count")),
+        raw_track=raw_track,
         enrichment_summary=enrichment_summary,
     )
 
 
-def _map_observations(run_key: str, observations: list[dict[str, Any]], known_refs: dict[str, LogicalTrackRef], rows: DryRunRows, issues: list[ValidationIssue]) -> None:
+def _map_observations(
+    run_key: str,
+    observations: list[dict[str, Any]],
+    known_refs: dict[str, LogicalTrackRef],
+    rows: DryRunRows,
+    issues: list[ValidationIssue],
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]],
+) -> None:
     for index, obs in enumerate(observations):
-        ref = _track_ref(run_key, obs.get("camera_id"), obs.get("local_track_id"))
+        ref = _resolve_track_ref(run_key, obs.get("camera_id"), obs.get("local_track_id"), obs.get("frame_number"), track_candidates)
         if ref.key not in known_refs:
             issues.append(ValidationIssue("ERROR", "orphan_observation", "Observation references missing track.", {"row": index, "track_key": ref.key}))
         frame_number = _int_or_none(obs.get("frame_number"))
@@ -503,17 +615,18 @@ def _map_evidence(
     issues: list[ValidationIssue],
     run_path: Path,
     media_seen: set[tuple[str, str | None, str | None]],
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]],
 ) -> None:
     for index, evidence in enumerate(evidence_rows):
-        ref = _track_ref(run_key, evidence.get("camera_id"), evidence.get("local_track_id"))
+        ref = _resolve_track_ref(run_key, evidence.get("camera_id"), evidence.get("local_track_id"), evidence.get("frame_number"), track_candidates)
         if ref.key not in known_refs:
             issues.append(ValidationIssue("ERROR", "orphan_evidence", "Evidence references missing track.", {"row": index, "track_key": ref.key}))
         crop_path = evidence.get("crop_path") or evidence.get("vehicle_crop_path")
         annotated_path = evidence.get("annotated_frame_path")
         source_path = evidence.get("source_image_path") or evidence.get("source_frame_path")
-        crop_media = _add_media(run_key, run_path, rows, media_seen, ref, "crop", crop_path, evidence.get("frame_number"), evidence.get("original_crop_width") or evidence.get("crop_width"), evidence.get("original_crop_height") or evidence.get("crop_height"), {"source": "evidence"})
-        source_media = _add_media(run_key, run_path, rows, media_seen, ref, "source_full_frame", source_path, evidence.get("frame_number"), evidence.get("source_frame_width"), evidence.get("source_frame_height"), {"source": "evidence"}) if source_path else None
-        annotated_media = _add_media(run_key, run_path, rows, media_seen, ref, "annotated_frame", annotated_path, evidence.get("frame_number"), evidence.get("source_frame_width"), evidence.get("source_frame_height"), {"source": "evidence"}) if annotated_path else None
+        crop_media = _add_media(run_key, run_path, rows, media_seen, ref, "crop", crop_path, evidence.get("frame_number"), evidence.get("timestamp_seconds"), evidence.get("original_crop_width") or evidence.get("crop_width"), evidence.get("original_crop_height") or evidence.get("crop_height"), {"source": "evidence"})
+        source_media = _add_media(run_key, run_path, rows, media_seen, ref, "source_full_frame", source_path, evidence.get("frame_number"), evidence.get("timestamp_seconds"), evidence.get("source_frame_width"), evidence.get("source_frame_height"), {"source": "evidence"}) if source_path else None
+        annotated_media = _add_media(run_key, run_path, rows, media_seen, ref, "annotated_frame", annotated_path, evidence.get("frame_number"), evidence.get("timestamp_seconds"), evidence.get("source_frame_width"), evidence.get("source_frame_height"), {"source": "evidence"}) if annotated_path else None
         rows.track_evidence.append(
             TrackEvidenceRow(
                 ref=ref,
@@ -526,6 +639,8 @@ def _map_evidence(
                 detection_confidence=_float_or_none(evidence.get("detection_confidence") or evidence.get("confidence")),
                 quality_score=_float_or_none(evidence.get("quality_score") or evidence.get("best_overall_score")),
                 sharpness_score=_float_or_none(evidence.get("sharpness_score")),
+                centeredness_score=_float_or_none(evidence.get("centeredness_score")),
+                edge_visibility_score=_float_or_none(evidence.get("edge_visibility_score")),
                 brightness_score=_float_or_none(evidence.get("brightness_score")),
                 crop_width=_int_or_none(evidence.get("crop_width") or evidence.get("original_crop_width")),
                 crop_height=_int_or_none(evidence.get("crop_height") or evidence.get("original_crop_height")),
@@ -551,9 +666,10 @@ def _map_enrichment(
     normalizations: list[dict[str, Any]],
     run_path: Path,
     media_seen: set[tuple[str, str | None, str | None]],
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]],
 ) -> None:
     for index, enrichment in enumerate(enrichment_rows):
-        ref = _track_ref(run_key, enrichment.get("camera_id"), enrichment.get("local_track_id"))
+        ref = _resolve_track_ref(run_key, enrichment.get("camera_id"), enrichment.get("local_track_id"), enrichment.get("source_frame_number"), track_candidates)
         if ref.key not in known_refs:
             issues.append(ValidationIssue("ERROR", "orphan_enrichment", "Enrichment references missing track.", {"row": index, "track_key": ref.key}))
         colour_obj = enrichment.get("vehicle_colour") or {}
@@ -571,24 +687,26 @@ def _map_enrichment(
                 VehicleAttributePredictionRow(
                     ref=ref,
                     attribute_type="body_type",
-                    label=_normalize_label(body_obj.get("label"), "body_type", ref, normalizations, attempted=True),
+                    attribute_value=_normalize_label(body_obj.get("label"), "body_type", ref, normalizations, attempted=True),
                     status=body_obj.get("status"),
                     confidence=None,
                     source_backend=body_obj.get("source"),
                     source_model=body_obj.get("model"),
                     raw_response=None,
                     evidence_relative_path=None,
+                    evidence_frame_number=None,
+                    evidence_timestamp_seconds=None,
                     metadata={k: v for k, v in body_obj.items() if k not in {"label", "status", "source", "model"}},
                 )
             )
         for path in enrichment.get("selected_crop_paths") or []:
-            _add_media(run_key, run_path, rows, media_seen, ref, "selected_enrichment_crop", path, None, None, None, {"source": "vehicle_enrichment.selected_crop_paths"})
+            _add_media(run_key, run_path, rows, media_seen, ref, "selected_enrichment_crop", path, None, None, None, None, {"source": "vehicle_enrichment.selected_crop_paths"})
         for path in enrichment.get("selected_colour_crop_paths") or []:
-            _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", path, None, None, None, {"source": "vehicle_enrichment.selected_colour_crop_paths"})
+            _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", path, None, None, None, None, {"source": "vehicle_enrichment.selected_colour_crop_paths"})
         for path in enrichment.get("selected_body_type_crop_paths") or []:
-            _add_media(run_key, run_path, rows, media_seen, ref, "selected_body_type_crop", path, None, None, None, {"source": "vehicle_enrichment.selected_body_type_crop_paths"})
+            _add_media(run_key, run_path, rows, media_seen, ref, "selected_body_type_crop", path, None, None, None, None, {"source": "vehicle_enrichment.selected_body_type_crop_paths"})
         if enrichment.get("plate_crop_path"):
-            plate_media = _add_media(run_key, run_path, rows, media_seen, ref, "plate_crop", enrichment.get("plate_crop_path"), None, None, None, {"source": "vehicle_enrichment.plate_crop_path"})
+            plate_media = _add_media(run_key, run_path, rows, media_seen, ref, "plate_crop", enrichment.get("plate_crop_path"), None, None, None, None, {"source": "vehicle_enrichment.plate_crop_path"})
         else:
             plate_media = None
         if enrichment.get("plate_detected"):
@@ -598,6 +716,9 @@ def _map_enrichment(
                     plate_bbox=enrichment.get("plate_bbox"),
                     confidence=_float_or_none(enrichment.get("plate_detection_confidence")),
                     crop_relative_path=plate_media.relative_path if plate_media else None,
+                    frame_number=None,
+                    timestamp_seconds=None,
+                    source_model=enrichment.get("plate_ocr_backend") or enrichment.get("attribute_backend"),
                     quality_status=enrichment.get("plate_quality_status"),
                     metadata={},
                 )
@@ -613,9 +734,101 @@ def _map_enrichment(
                     ocr_backend=enrichment.get("plate_ocr_backend"),
                     raw_response=enrichment.get("plate_ocr_raw_response"),
                     reason=enrichment.get("plate_ocr_reason"),
+                    is_selected=True,
                     metadata={},
                 )
             )
+
+
+def _map_physical_identity(
+    run_key: str,
+    source: dict[str, Any],
+    known_refs: dict[str, LogicalTrackRef],
+    rows: DryRunRows,
+    issues: list[ValidationIssue],
+) -> None:
+    payload = dict(source.get("physical_vehicles") or {})
+    vehicles = list(payload.get("physical_vehicles", []) or [])
+    for vehicle in vehicles:
+        if not isinstance(vehicle, dict):
+            continue
+        vehicle_key = _str_or_none(vehicle.get("vehicle_key") or vehicle.get("vehicle_id"))
+        if not vehicle_key:
+            issues.append(ValidationIssue("WARNING", "invalid_physical_vehicle", "Physical vehicle row has no vehicle key.", {"vehicle": vehicle}))
+            continue
+        rows.physical_vehicles.append(
+            PhysicalVehicleRow(
+                run_key=run_key,
+                vehicle_key=vehicle_key,
+                vehicle_class=_str_or_none(vehicle.get("vehicle_class") or vehicle.get("final_class")),
+                vehicle_colour=_str_or_none(vehicle.get("vehicle_colour") or vehicle.get("colour")),
+                first_timestamp_seconds=_float_or_none(vehicle.get("first_seen_seconds") or vehicle.get("first_timestamp_seconds")),
+                last_timestamp_seconds=_float_or_none(vehicle.get("last_seen_seconds") or vehicle.get("last_timestamp_seconds")),
+                identity_confidence=_float_or_none(vehicle.get("identity_confidence")),
+                identity_method=_str_or_none(vehicle.get("identity_method")),
+                identity_status=_str_or_none(vehicle.get("identity_status")),
+                consensus_plate_text=_str_or_none(vehicle.get("consensus_plate_text") or dict(vehicle.get("plate", {}) or {}).get("consensus_text")),
+                plate_confidence=_float_or_none(vehicle.get("plate_confidence")),
+                metadata={
+                    k: v
+                    for k, v in vehicle.items()
+                    if k
+                    not in {
+                        "vehicle_key",
+                        "vehicle_id",
+                        "vehicle_class",
+                        "final_class",
+                        "vehicle_colour",
+                        "colour",
+                        "first_seen_seconds",
+                        "first_timestamp_seconds",
+                        "last_seen_seconds",
+                        "last_timestamp_seconds",
+                        "identity_confidence",
+                        "identity_method",
+                        "identity_status",
+                        "consensus_plate_text",
+                        "plate_confidence",
+                    }
+                },
+            )
+        )
+        for local_track_id in list(vehicle.get("member_track_ids") or vehicle.get("member_tracks") or []):
+            ref = _known_ref_for_local_track(run_key, _str_or_none(local_track_id), known_refs)
+            if ref is None:
+                issues.append(ValidationIssue("WARNING", "orphan_physical_vehicle_track", "Physical vehicle member track does not exist in raw vehicle_tracks.", {"vehicle_key": vehicle_key, "local_track_id": local_track_id}))
+                continue
+            rows.physical_vehicle_tracks.append(
+                PhysicalVehicleTrackRow(
+                    run_key=run_key,
+                    vehicle_key=vehicle_key,
+                    ref=ref,
+                    association_score=_float_or_none(vehicle.get("identity_confidence")),
+                    association_method=_str_or_none(vehicle.get("identity_method")),
+                    association_reason=_str_or_none(vehicle.get("identity_status")),
+                    metadata={},
+                )
+            )
+    for item in list(source.get("identity_decisions") or []):
+        if not isinstance(item, dict):
+            continue
+        rows.identity_decisions.append(
+            IdentityDecisionRow(
+                run_key=run_key,
+                source_ref=_known_ref_for_local_track(run_key, _str_or_none(item.get("source_track_id") or item.get("track_a")), known_refs),
+                target_ref=_known_ref_for_local_track(run_key, _str_or_none(item.get("target_track_id") or item.get("track_b")), known_refs),
+                decision=_str_or_none(item.get("decision")) or "UNKNOWN",
+                final_score=_float_or_none(item.get("final_score") or item.get("score")),
+                plate_score=_float_or_none(item.get("plate_score")),
+                spatial_score=_float_or_none(item.get("spatial_score")),
+                temporal_score=_float_or_none(item.get("temporal_score")),
+                motion_score=_float_or_none(item.get("motion_score")),
+                appearance_score=_float_or_none(item.get("appearance_score")),
+                colour_score=_float_or_none(item.get("colour_score")),
+                reason=_str_or_none(item.get("reason") or item.get("decision_reason_codes") or item.get("plate_reason_code")),
+                metadata=item,
+            )
+        )
 
 
 def _colour_prediction_from_model(
@@ -627,7 +840,7 @@ def _colour_prediction_from_model(
     rows: DryRunRows,
     media_seen: set[tuple[str, str | None, str | None]],
 ) -> ColourPredictionRow:
-    media = _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", pred.get("source_crop_path"), pred.get("source_frame_number"), pred.get("original_crop_width"), pred.get("original_crop_height"), {"source": "colour_prediction"}) if pred.get("source_crop_path") else None
+    media = _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", pred.get("source_crop_path"), pred.get("source_frame_number"), None, pred.get("original_crop_width"), pred.get("original_crop_height"), {"source": "colour_prediction"}) if pred.get("source_crop_path") else None
     return ColourPredictionRow(
         ref=ref,
         evidence_relative_path=media.relative_path if media else None,
@@ -640,6 +853,8 @@ def _colour_prediction_from_model(
         prompt=colour_obj.get("prompt_text") or colour_obj.get("task_prompt"),
         raw_response=pred.get("raw_response"),
         inference_duration_ms=_float_or_none(pred.get("inference_duration_ms")),
+        evidence_frame_number=_int_or_none(pred.get("source_frame_number")),
+        evidence_timestamp_seconds=None,
         metadata={k: v for k, v in pred.items() if k not in {"label", "confidence", "status", "source_model", "source_backend", "source_crop_path", "source_frame_number", "raw_response", "inference_duration_ms"}},
     )
 
@@ -653,7 +868,7 @@ def _colour_prediction_from_crop_level(
     rows: DryRunRows,
     media_seen: set[tuple[str, str | None, str | None]],
 ) -> ColourPredictionRow:
-    media = _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", pred.get("crop_path"), pred.get("frame_index"), None, None, {"source": "crop_level_colours"}) if pred.get("crop_path") else None
+    media = _add_media(run_key, run_path, rows, media_seen, ref, "selected_colour_crop", pred.get("crop_path"), pred.get("frame_index"), None, None, None, {"source": "crop_level_colours"}) if pred.get("crop_path") else None
     return ColourPredictionRow(
         ref=ref,
         evidence_relative_path=media.relative_path if media else None,
@@ -666,6 +881,8 @@ def _colour_prediction_from_crop_level(
         prompt=pred.get("prompt") or colour_obj.get("prompt_text"),
         raw_response=pred.get("raw_response"),
         inference_duration_ms=_float_or_none(pred.get("inference_time_ms")),
+        evidence_frame_number=_int_or_none(pred.get("frame_index")),
+        evidence_timestamp_seconds=None,
         metadata={k: v for k, v in pred.items() if k not in {"raw_colour_phrase", "normalized_colour", "status", "crop_path", "frame_index", "prompt", "raw_response", "inference_time_ms"}},
     )
 
@@ -680,17 +897,19 @@ def _attribute_prediction(
     rows: DryRunRows,
     media_seen: set[tuple[str, str | None, str | None]],
 ) -> VehicleAttributePredictionRow:
-    media = _add_media(run_key, run_path, rows, media_seen, ref, f"selected_{attribute_type}_crop", pred.get("source_crop_path"), pred.get("source_frame_number"), pred.get("original_crop_width"), pred.get("original_crop_height"), {"source": f"{attribute_type}_prediction"}) if pred.get("source_crop_path") else None
+    media = _add_media(run_key, run_path, rows, media_seen, ref, f"selected_{attribute_type}_crop", pred.get("source_crop_path"), pred.get("source_frame_number"), None, pred.get("original_crop_width"), pred.get("original_crop_height"), {"source": f"{attribute_type}_prediction"}) if pred.get("source_crop_path") else None
     return VehicleAttributePredictionRow(
         ref=ref,
         attribute_type=attribute_type,
-        label=pred.get("label"),
+        attribute_value=pred.get("label"),
         status=pred.get("status"),
         confidence=_float_or_none(pred.get("confidence")),
         source_backend=pred.get("source_backend") or source_obj.get("source"),
         source_model=pred.get("source_model") or source_obj.get("model"),
         raw_response=pred.get("raw_response"),
         evidence_relative_path=media.relative_path if media else None,
+        evidence_frame_number=_int_or_none(pred.get("source_frame_number")),
+        evidence_timestamp_seconds=None,
         metadata={k: v for k, v in pred.items() if k not in {"label", "status", "confidence", "source_backend", "source_model", "raw_response", "source_crop_path", "source_frame_number"}},
     )
 
@@ -706,7 +925,7 @@ def _add_pipeline_artifact_media(run_key: str, run_path: Path, rows: DryRunRows,
             continue
         for image_path in path.rglob("*.jpg"):
             camera_key = image_path.parent.name if image_path.parent != path else None
-            _add_media(run_key, run_path, rows, media_seen, None, media_type, str(image_path), None, None, None, {"source": folder, "camera_key": camera_key})
+            _add_media(run_key, run_path, rows, media_seen, None, media_type, str(image_path), None, None, None, None, {"source": folder, "camera_key": camera_key})
 
 
 def _add_media(
@@ -718,6 +937,7 @@ def _add_media(
     media_type: str,
     original_path: Any,
     frame_number: Any,
+    timestamp_seconds: Any,
     width: Any,
     height: Any,
     metadata: dict[str, Any],
@@ -740,6 +960,7 @@ def _add_media(
         relative_path=normalized["relative_path"],
         original_path=normalized["original_path"],
         frame_number=_int_or_none(frame_number),
+        timestamp_seconds=_float_or_none(timestamp_seconds),
         width=_int_or_none(width),
         height=_int_or_none(height),
         exists=normalized["exists"],
@@ -811,10 +1032,14 @@ def _build_field_mapping(source: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _index_by_track(items: list[dict[str, Any]], run_key: str) -> dict[str, dict[str, Any]]:
+def _index_by_track(
+    items: list[dict[str, Any]],
+    run_key: str,
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]] | None = None,
+) -> dict[str, dict[str, Any]]:
     result = {}
     for item in items:
-        ref = _track_ref(run_key, item.get("camera_id"), item.get("local_track_id"))
+        ref = _resolve_track_ref(run_key, item.get("camera_id"), item.get("local_track_id"), item.get("source_frame_number"), track_candidates or {})
         result[ref.key] = item
     return result
 
@@ -822,8 +1047,75 @@ def _index_by_track(items: list[dict[str, Any]], run_key: str) -> dict[str, dict
 def _track_ref(run_key: str, camera_id: Any, local_track_id: Any) -> LogicalTrackRef:
     camera_key = _str_or_none(camera_id) or "UNKNOWN_CAMERA"
     local = _str_or_none(local_track_id) or "UNKNOWN_TRACK"
-    short = local.split(":", 1)[1] if ":" in local else local
-    return LogicalTrackRef(run_key=run_key, camera_key=camera_key, local_track_id=short)
+    return LogicalTrackRef(run_key=run_key, camera_key=camera_key, local_track_id=local)
+
+
+def _resolve_track_ref(
+    run_key: str,
+    camera_id: Any,
+    local_track_id: Any,
+    frame_number: Any,
+    track_candidates: dict[tuple[str, str], list[tuple[LogicalTrackRef, int | None, int | None, str | None]]],
+) -> LogicalTrackRef:
+    camera_key = _str_or_none(camera_id) or "UNKNOWN_CAMERA"
+    local = _str_or_none(local_track_id) or "UNKNOWN_TRACK"
+    candidates = list(track_candidates.get((camera_key, local), []) or [])
+    if not candidates:
+        return _track_ref(run_key, camera_key, local)
+    if len(candidates) == 1:
+        return candidates[0][0]
+    frame = _int_or_none(frame_number)
+    if frame is not None:
+        in_range = [candidate for candidate in candidates if candidate[1] is not None and candidate[2] is not None and candidate[1] <= frame <= candidate[2]]
+        if len(in_range) == 1:
+            return in_range[0][0]
+    completed = [candidate for candidate in candidates if candidate[3] == "COMPLETED"]
+    if len(completed) == 1:
+        return completed[0][0]
+    return candidates[0][0]
+
+
+def _known_ref_for_local_track(run_key: str, local_track_id: str | None, known_refs: dict[str, LogicalTrackRef]) -> LogicalTrackRef | None:
+    if not local_track_id:
+        return None
+    for ref in known_refs.values():
+        if ref.run_key == run_key and ref.local_track_id == local_track_id:
+            return ref
+    return None
+
+
+def _safe_read_json(path: Path, *, default: Any, issues: list[ValidationIssue], required: bool) -> Any:
+    if not path.exists():
+        if required:
+            issues.append(ValidationIssue("ERROR", "missing_required_file", "Required run file is missing.", {"path": str(path)}))
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        issues.append(ValidationIssue("ERROR", "malformed_json", "JSON file could not be parsed.", {"path": str(path), "error": str(exc)}))
+        return default
+
+
+def _safe_read_yaml(path: Path, issues: list[ValidationIssue]) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        issues.append(ValidationIssue("ERROR", "malformed_yaml", "YAML file could not be parsed.", {"path": str(path), "error": str(exc)}))
+        return {}
+
+
+def _safe_read_csv(path: Path, issues: list[ValidationIssue]) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    except Exception as exc:
+        issues.append(ValidationIssue("ERROR", "malformed_csv", "CSV file could not be parsed.", {"path": str(path), "error": str(exc)}))
+        return []
 
 
 def _normalize_label(value: Any, field_name: str, ref: LogicalTrackRef, normalizations: list[dict[str, Any]], attempted: bool) -> str | None:

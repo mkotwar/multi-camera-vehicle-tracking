@@ -4,10 +4,12 @@ export type VehicleEvidence = {
   vehicle_id: string;
   camera_id: string;
   track_id: string;
+  member_track_ids?: string[];
   vehicle_class: string;
   colour: string;
   first_seen_seconds?: number | null;
   last_seen_seconds?: number | null;
+  best_crop_url?: string | null;
   image_url?: string | null;
   track_detail_url: string;
 };

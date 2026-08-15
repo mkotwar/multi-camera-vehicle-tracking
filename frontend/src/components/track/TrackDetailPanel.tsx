@@ -20,6 +20,17 @@ function labelForRole(role?: string | null): string {
   return String(role || "Evidence").split("_").join(" ");
 }
 
+function formatScore(value: unknown): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(3) : "Unavailable";
+}
+
+function plateLabel(track: TrackRecord): string {
+  const text = String(track.plate_text ?? "").trim();
+  if (text) return text.toUpperCase();
+  return track.plate_detected ? "Plate detected, no readable text" : "No readable plate";
+}
+
 export function TrackDetailPanel({ selection, compact = false, showFullPageAction = false }: TrackDetailPanelProps) {
   const [track, setTrack] = useState<TrackRecord | null>(null);
   const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
@@ -103,6 +114,7 @@ export function TrackDetailContent({
             <p className="muted">Run {track.run_id ?? "runtime"} / Camera {track.camera_id}</p>
           </div>
           <div className="track-header-actions">
+            <span className={`plate-badge ${track.plate_text ? "readable" : "empty"}`}>{plateLabel(track)}</span>
             <span className="status">{track.status ?? "Unavailable"}</span>
             {showFullPageAction ? <Link className="secondary-button compact-action" to={fullTrackUrl}>Open full track page</Link> : null}
           </div>
@@ -111,6 +123,8 @@ export function TrackDetailContent({
         <div className="stats-grid detail-overview">
           <div><strong>Vehicle Class</strong><span>{(track.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></div>
           <div><strong>Colour</strong><span>{track.colour ?? track.colour_status ?? "Colour pending"}</span></div>
+          <div><strong>Licence Plate</strong><span>{plateLabel(track)}</span></div>
+          <div><strong>Plate Confidence</strong><span>{track.plate_text ? formatScore(track.plate_text_confidence) : formatScore(track.plate_detection_confidence)}</span></div>
           <div><strong>First Seen</strong><span>{formatVideoTime(firstSeen)}</span></div>
           <div><strong>Last Seen</strong><span>{formatVideoTime(lastSeen)}</span></div>
           <div><strong>Duration</strong><span>{formatVideoTime(duration)}</span></div>
@@ -181,6 +195,7 @@ export function TrackDetailContent({
           <div><strong>Observation Count</strong><span>{track.observation_count ?? "Unavailable"}</span></div>
           <div><strong>Completion Reason</strong><span>{track.completion_reason ?? "Unavailable"}</span></div>
           <div><strong>Colour Status</strong><span>{track.colour_status ?? "Unavailable"}</span></div>
+          <div><strong>Plate Status</strong><span>{track.plate_ocr_reason ?? track.plate_quality_status ?? "Unavailable"}</span></div>
           <div><strong>Best Crop</strong><span>{track.best_crop_url ? "Available" : "Unavailable"}</span></div>
         </div>
         {track.colour_resolution && track.colour_resolution.length > 0 ? (

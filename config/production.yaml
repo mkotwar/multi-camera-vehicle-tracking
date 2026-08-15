@@ -55,10 +55,34 @@ tracking:
   backend: ocr_mukul_supervision_bytetrack
   isolation_mode: per_camera
   supported_isolation_modes: [per_camera]
-  track_activation_threshold: 0.3
-  lost_track_buffer: 40
-  minimum_matching_threshold: 0.6
+  track_activation_threshold: 0.25
+  lost_track_buffer: 150
+  minimum_matching_threshold: 0.70
   minimum_consecutive_frames: 3
+
+tracking_roi:
+  enabled: true
+  mode: rectangle
+  rectangle:
+    x_min_fraction: 0.0
+    y_min_fraction: 0.420
+    x_max_fraction: 0.893
+    y_max_fraction: 1.0
+  anchor: bottom_center
+
+vehicle_identity:
+  enabled: true
+  conservative:
+    enabled: true
+    acceptance_threshold: 0.70
+    ambiguity_margin: 0.03
+    vehicle_consistency_floor: 0.58
+  plate_assistance:
+    enabled: true
+    require_high_quality_for_exact_override: true
+    contradiction_veto: true
+  stationary_recovery:
+    enabled: false
 
 lifecycle:
   minimum_observations: 3
@@ -206,14 +230,14 @@ vehicle_enrichment:
   make_model:
     enabled: false
   plate:
-    detection_enabled: false
+    detection_enabled: true
     colour_enabled: false
-    recognition_enabled: false
+    recognition_enabled: true
     detector:
-      enabled: false
-      model_path: ""
+      enabled: true
+      model_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/license_plate_weights.pt"
     ocr:
-      enabled: false
+      enabled: true
       backend: ocr_mukul_adapter
       task_token: "<OCR>"
       prompt: ""

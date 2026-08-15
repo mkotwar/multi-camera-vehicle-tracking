@@ -40,6 +40,80 @@ class _FakeHTTPResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class _PhysicalEvidenceRepository:
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.member_crop = run_dir / "05_florence_selected_crops" / "CAM_001" / "TRACK_22" / "frame_000022_MIDDLE.jpg"
+        self.member_crop.parent.mkdir(parents=True, exist_ok=True)
+        self.member_crop.write_bytes(b"member crop")
+
+    def get_physical_vehicle(self, *, vehicle_id: str, run_id: str) -> dict | None:
+        if vehicle_id == "VEHICLE_001":
+            return {
+                "run_id": run_id,
+                "vehicle_id": "VEHICLE_001",
+                "vehicle_class": "CAR",
+                "vehicle_colour": "WHITE",
+                "primary_camera_id": "CAM_001",
+                "first_seen_seconds": 1.0,
+                "last_seen_seconds": 9.0,
+                "member_track_ids": ["CAM_001:TRACK_11", "CAM_001:TRACK_22"],
+                "representative_evidence": [
+                    {
+                        "local_track_id": "CAM_001:TRACK_11",
+                        "vehicle_crop_path": str(self.run_dir / "evidence" / "CAM_001" / "CAM_001_TRACK_11" / "crops" / "missing.jpg"),
+                    }
+                ],
+            }
+        if vehicle_id == "VEHICLE_002":
+            return {
+                "run_id": run_id,
+                "vehicle_id": "VEHICLE_002",
+                "vehicle_class": "MOTORCYCLE",
+                "vehicle_colour": "BLACK",
+                "primary_camera_id": "CAM_001",
+                "first_seen_seconds": 10.0,
+                "last_seen_seconds": 12.0,
+                "member_track_ids": ["CAM_001:TRACK_33"],
+                "representative_evidence": [
+                    {
+                        "local_track_id": "CAM_001:TRACK_33",
+                        "vehicle_crop_path": str(self.run_dir / "evidence" / "CAM_001" / "CAM_001_TRACK_33" / "crops" / "frame_000033.jpg"),
+                    }
+                ],
+            }
+        return None
+
+    def get_track(self, *, camera_id: str, track_id: str, run_id: str) -> dict | None:
+        if camera_id == "CAM_001" and track_id == "TRACK_22":
+            return {
+                "run_id": run_id,
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "local_track_id": "CAM_001:TRACK_22",
+                "vehicle_class": "CAR",
+                "colour": "WHITE",
+                "first_seen_seconds": 2.0,
+                "last_seen_seconds": 8.0,
+                "best_crop_parts": {
+                    "category": "florence_selected_crops",
+                    "run_id": run_id,
+                    "parts": ["CAM_001", "TRACK_22", "frame_000022_MIDDLE.jpg"],
+                },
+            }
+        return None
+
+    def resolve_media_path(self, *, run_id: str, category: str, relative_parts: list[str]) -> Path | None:
+        base = {
+            "florence_selected_crops": self.run_dir / "05_florence_selected_crops",
+            "evidence": self.run_dir / "evidence",
+        }.get(category)
+        if base is None:
+            return None
+        candidate = base.joinpath(*relative_parts)
+        return candidate if candidate.exists() else None
+
+
 def _valid_payload(**overrides):
     payload = {
         "intent": "LIST",
@@ -475,6 +549,55 @@ def test_video_chat_exact_negation_failures_a_b_c(tmp_path: Path) -> None:
     assert all(item["colour"] == "BLACK" and item["vehicle_class"] != "MOTORCYCLE" for item in response_a["evidence"])
 
 
+def test_video_chat_physical_vehicle_show_them_resolves_member_track_evidence(tmp_path: Path) -> None:
+    run_id = "20260815_170454"
+    repository = _PhysicalEvidenceRepository(tmp_path / run_id)
+    records = [
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_001",
+            "vehicle_class": "CAR",
+            "colour": "WHITE",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 1.0,
+            "last_seen_seconds": 9.0,
+        })(),
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_002",
+            "vehicle_class": "MOTORCYCLE",
+            "colour": "BLACK",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 10.0,
+            "last_seen_seconds": 12.0,
+        })(),
+    ]
+
+    response = handle_video_chat(
+        message="Show them",
+        run_id=run_id,
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["VEHICLE_001", "VEHICLE_002"]},
+        llm_provider=None,
+    )
+
+    assert response["analytics_result"]["total"] == 2
+    assert response["matching_vehicle_ids"] == ["VEHICLE_001", "VEHICLE_002"]
+    assert response["evidence_page"]["matching_total"] == 2
+    assert response["evidence_page"]["evidence_returned_count"] == 2
+    assert response["answer"] == "2 vehicles were observed. Showing 2 of 2."
+    assert response["evidence"][0]["vehicle_id"] == "VEHICLE_001"
+    assert response["evidence"][0]["member_track_ids"] == ["CAM_001:TRACK_11", "CAM_001:TRACK_22"]
+    assert response["evidence"][0]["best_crop_url"] == f"/api/media/florence_selected_crops/{run_id}/CAM_001/TRACK_22/frame_000022_MIDDLE.jpg"
+    assert response["evidence"][0]["image_url"] == response["evidence"][0]["best_crop_url"]
+
+
+def test_video_chat_accepts_common_summary_typo() -> None:
+    parsed, parser_used = parse_chat_vehicle_query(message="summry of the video", context={}, llm_provider=None)
+
+    assert parser_used == "rule_based"
+    assert parsed.intent == "SUMMARY"
+
+
 def test_semantic_query_evaluation_fixture_final_plans() -> None:
     fixtures = json.loads(Path("tests/fixtures/semantic_query_evaluation.json").read_text(encoding="utf-8"))
     assert len(fixtures) >= 50
@@ -528,6 +651,12 @@ def test_ollama_provider_posts_schema_think_false_and_ignores_thinking(monkeypat
     assert "hidden chain of thought" not in json.dumps(parsed)
 
 
+def test_ollama_provider_default_timeout_allows_local_qwen_warmup() -> None:
+    provider = OllamaQwenChatLLMProvider()
+
+    assert provider.timeout_seconds == 45.0
+
+
 def test_ollama_provider_malformed_json_and_unavailable_raise_runtime_error(monkeypatch) -> None:
     def bad_json_urlopen(request, timeout):
         return _FakeHTTPResponse({"message": {"content": "{not-json"}})
@@ -541,5 +670,5 @@ def test_ollama_provider_malformed_json_and_unavailable_raise_runtime_error(monk
         raise URLError("connection refused")
 
     monkeypatch.setattr("src.ollama_qwen_provider.urlopen", unavailable_urlopen)
-    with pytest.raises(RuntimeError, match="Ollama chat request failed"):
+    with pytest.raises(RuntimeError, match="provider=ollama.*model=qwen3:1.7b.*timeout_seconds=45.*exception=URLError"):
         provider.parse("message", {})

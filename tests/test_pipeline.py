@@ -449,6 +449,75 @@ def test_validate_config_rejects_invalid_tracking_roi_fractions(tmp_path: Path) 
         _validate_config(_load_raw_config(config_path), config_path)
 
 
+def test_validate_config_accepts_rectangle_tracking_roi_and_preserves_effective_values(tmp_path: Path) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config_rectangle_tracking_roi.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["tracking_roi"] = {
+        "enabled": True,
+        "mode": "rectangle",
+        "rectangle": {
+            "x_min_fraction": 0.361,
+            "y_min_fraction": 0.315,
+            "x_max_fraction": 0.800,
+            "y_max_fraction": 0.996,
+        },
+        "anchor": "bottom_center",
+    }
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    validated = _validate_config(_load_raw_config(config_path), config_path)
+
+    assert validated["tracking_roi"]["enabled"] is True
+    assert validated["tracking_roi"]["mode"] == "rectangle"
+    assert validated["tracking_roi"]["anchor"] == "bottom_center"
+    assert validated["tracking_roi"]["rectangle"] == {
+        "x_min_fraction": pytest.approx(0.361),
+        "y_min_fraction": pytest.approx(0.315),
+        "x_max_fraction": pytest.approx(0.800),
+        "y_max_fraction": pytest.approx(0.996),
+    }
+
+
+@pytest.mark.parametrize(
+    "tracking_roi",
+    [
+        {"enabled": True, "mode": "diagonal", "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.8, "x_max_fraction": 0.2, "y_min_fraction": 0.2, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.1, "x_max_fraction": 0.8, "y_min_fraction": -0.1, "y_max_fraction": 0.8}, "anchor": "bottom_center"},
+        {"enabled": True, "mode": "rectangle", "rectangle": {"x_min_fraction": 0.1, "x_max_fraction": 0.8, "y_min_fraction": 0.2, "y_max_fraction": 1.1}, "anchor": "bottom_center"},
+    ],
+)
+def test_validate_config_rejects_invalid_rectangle_tracking_roi(tmp_path: Path, tracking_roi: dict) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config_invalid_rectangle_tracking_roi.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["tracking_roi"] = tracking_roi
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(Exception, match="tracking_roi"):
+        _validate_config(_load_raw_config(config_path), config_path)
+
+
 def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
     video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=5)
@@ -523,6 +592,107 @@ def test_pipeline_succeeds_with_one_configured_camera(monkeypatch, tmp_path: Pat
     assert "predicted_colour" in validation_report
     assert tracks[0]["vehicle_enrichment"]["status"] in {"evidence_ready", "disabled", "no_evidence"}
     assert "CAM_001:TRACK_1" in observations
+
+
+class _FakeImportResult:
+    def __init__(self, *, elapsed_seconds: float = 0.25):
+        self.elapsed_seconds = elapsed_seconds
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "table_counts": {
+                "vehicle_tracks": 1,
+                "track_observations": 2,
+                "track_evidence": 1,
+            },
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+
+
+def _run_small_pipeline_for_db_import_test(monkeypatch, tmp_path: Path) -> tuple[int, str, Path]:
+    monkeypatch.setattr(pipeline_module, "VehicleDetectorTracker", FakeVehicleDetectorTracker)
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=3)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / "config.yaml"
+    _write_config(
+        config_path,
+        cameras=[{"camera_id": "CAM_001", "source_type": "video", "source": str(video_path), "enabled": True}],
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+    exit_code, run_id, run_directory = run_pipeline(str(config_path))
+    return exit_code, run_id, Path(run_directory)
+
+
+def test_pipeline_db_import_after_run_missing_defaults_to_off(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("DB_IMPORT_AFTER_RUN", raising=False)
+    calls: list[Path] = []
+    monkeypatch.setattr(pipeline_module, "import_completed_run", lambda run_dir: calls.append(Path(run_dir)))
+
+    exit_code, _run_id, run_dir = _run_small_pipeline_for_db_import_test(monkeypatch, tmp_path)
+
+    assert exit_code == 0
+    assert json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))["status"] == "COMPLETED"
+    assert calls == []
+
+
+def test_pipeline_db_import_after_run_false_does_not_invoke_importer(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DB_IMPORT_AFTER_RUN", "false")
+    calls: list[Path] = []
+    monkeypatch.setattr(pipeline_module, "import_completed_run", lambda run_dir: calls.append(Path(run_dir)))
+
+    exit_code, _run_id, run_dir = _run_small_pipeline_for_db_import_test(monkeypatch, tmp_path)
+
+    assert exit_code == 0
+    assert (run_dir / "summary.json").exists()
+    assert calls == []
+
+
+def test_pipeline_db_import_after_run_true_invokes_importer_after_final_files(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DB_IMPORT_AFTER_RUN", "true")
+    calls: list[Path] = []
+
+    def fake_import(run_dir: str | Path):
+        run_path = Path(run_dir)
+        for filename in ("run_metadata.json", "tracks.json", "observations.csv", "evidence_index.json", "vehicle_enrichment.json", "summary.json"):
+            assert (run_path / filename).exists(), filename
+        assert json.loads((run_path / "run_metadata.json").read_text(encoding="utf-8"))["status"] == "COMPLETED"
+        assert json.loads((run_path / "summary.json").read_text(encoding="utf-8"))["status"] == "COMPLETED"
+        calls.append(run_path)
+        return _FakeImportResult(), {"vehicle_tracks": 1, "track_observations": 2, "track_evidence": 1}
+
+    monkeypatch.setattr(pipeline_module, "import_completed_run", fake_import)
+
+    exit_code, _run_id, run_dir = _run_small_pipeline_for_db_import_test(monkeypatch, tmp_path)
+    pipeline_log = (run_dir / "pipeline.log").read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert calls == [run_dir]
+    assert "Post-run PostgreSQL import enabled" in pipeline_log
+    assert "Post-run PostgreSQL import completed" in pipeline_log
+
+
+def test_pipeline_db_import_after_run_failure_does_not_fail_completed_run(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DB_IMPORT_AFTER_RUN", "on")
+
+    def fake_import(_run_dir: str | Path):
+        raise RuntimeError("connection failed for postgresql://secret-user:secret-pass@example.invalid/db")
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://secret-user:secret-pass@example.invalid/db")
+    monkeypatch.setattr(pipeline_module, "import_completed_run", fake_import)
+
+    exit_code, _run_id, run_dir = _run_small_pipeline_for_db_import_test(monkeypatch, tmp_path)
+    metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    pipeline_log = (run_dir / "pipeline.log").read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert metadata["status"] == "COMPLETED"
+    assert (run_dir / "summary.json").exists()
+    assert "Post-run PostgreSQL import failed" in pipeline_log
+    assert "postgresql://secret-user:secret-pass@example.invalid/db" not in pipeline_log
+    assert "<redacted>" in pipeline_log
 
 
 def test_pipeline_supports_unlimited_frame_limit_and_logs_it(monkeypatch, tmp_path: Path) -> None:

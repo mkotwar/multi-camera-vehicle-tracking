@@ -3,12 +3,12 @@ import { Link } from "react-router-dom";
 import { useSearchParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { fetchFilterOptions } from "../api/filters";
-import { fetchExperimentalVehicles, fetchStationaryRecoveredVehicles, fetchTrackReconciliation } from "../api/runs";
-import { fetchTracks } from "../api/tracks";
+import { fetchExperimentalVehicles, fetchPlateAssistedVehicles, fetchStationaryRecoveredVehicles, fetchTrackReconciliation } from "../api/runs";
+import { fetchTracks, fetchVehicles } from "../api/tracks";
 import { searchVehicles } from "../api/vehicleSearch";
 import type { FilterOptions } from "../types/filters";
-import type { ExperimentalVehicleIdentityResult, ReconciliationAssociation, ReconciliationTrack, StationaryRecoveryResult, TrackReconciliationResult } from "../types/run";
-import type { TrackRecord } from "../types/track";
+import type { ExperimentalVehicleIdentityResult, PlateAssistedIdentityResult, ReconciliationAssociation, ReconciliationTrack, StationaryRecoveryResult, TrackReconciliationResult } from "../types/run";
+import type { PhysicalVehicleRecord, TrackRecord } from "../types/track";
 import type { VehicleSearchResponse } from "../types/vehicleSearch";
 import { formatVideoTime, parseVideoTime } from "../utils/time";
 
@@ -33,7 +33,7 @@ const DEFAULT_FILTERS: Filters = {
 };
 
 const PAGE_SIZE = 25;
-type TrackingViewMode = "raw" | "reconciled" | "identity" | "stationary";
+type TrackingViewMode = "vehicles" | "raw" | "reconciled" | "identity" | "stationary" | "plate";
 
 type ReconciledVehicleRow = {
   vehicle_id: string;
@@ -68,6 +68,12 @@ function formatScore(value: unknown): string {
 function formatSeconds(value: unknown): string {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? `${numeric.toFixed(2)}s` : "Unavailable";
+}
+
+function formatPlate(track: TrackRecord): string {
+  const text = String(track.plate_text ?? "").trim();
+  if (text) return text.toUpperCase();
+  return track.plate_detected ? "Detected, unreadable" : "No readable plate";
 }
 
 function shortTrackId(value: string): string {
@@ -144,6 +150,7 @@ export function VehicleSearchPage() {
   const [searchParams] = useSearchParams();
   const initialRunId = searchParams.get("run_id") ?? "latest";
   const [rows, setRows] = useState<TrackRecord[]>([]);
+  const [vehicleRows, setVehicleRows] = useState<PhysicalVehicleRecord[]>([]);
   const [filters, setFilters] = useState<Filters>({ ...DEFAULT_FILTERS, run_id: initialRunId });
   const [options, setOptions] = useState<FilterOptions>({ runs: ["latest"], cameras: [], vehicle_classes: [], colours: [] });
   const [currentPage, setCurrentPage] = useState(1);
@@ -152,13 +159,15 @@ export function VehicleSearchPage() {
   const [nlResult, setNlResult] = useState<VehicleSearchResponse | null>(null);
   const [nlError, setNlError] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
-  const [trackingView, setTrackingView] = useState<TrackingViewMode>("raw");
+  const [trackingView, setTrackingView] = useState<TrackingViewMode>("vehicles");
   const [reconciliation, setReconciliation] = useState<TrackReconciliationResult | null>(null);
   const [reconciliationError, setReconciliationError] = useState<string | null>(null);
   const [identityResult, setIdentityResult] = useState<ExperimentalVehicleIdentityResult | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const [stationaryResult, setStationaryResult] = useState<StationaryRecoveryResult | null>(null);
   const [stationaryError, setStationaryError] = useState<string | null>(null);
+  const [plateAssistedResult, setPlateAssistedResult] = useState<PlateAssistedIdentityResult | null>(null);
+  const [plateAssistedError, setPlateAssistedError] = useState<string | null>(null);
 
   const load = async (next = filters) => {
     setError(null);
@@ -173,7 +182,13 @@ export function VehicleSearchPage() {
     if (next.from_time && fromSeconds !== null) query.set("from_time", String(fromSeconds));
     if (next.to_time && toSeconds !== null) query.set("to_time", String(toSeconds));
     try {
-      setRows(await fetchTracks(query));
+      const vehicleQuery = new URLSearchParams();
+      if (next.run_id) vehicleQuery.set("run_id", next.run_id);
+      if (next.vehicle_class) vehicleQuery.set("vehicle_class", next.vehicle_class);
+      if (next.colour) vehicleQuery.set("colour", next.colour);
+      const [nextTracks, nextVehicles] = await Promise.all([fetchTracks(query), fetchVehicles(vehicleQuery)]);
+      setRows(nextTracks);
+      setVehicleRows(nextVehicles);
       setCurrentPage(1);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Failed to load tracks.");
@@ -250,6 +265,26 @@ export function VehicleSearchPage() {
     };
   }, [filters.run_id, trackingView]);
 
+  useEffect(() => {
+    if (trackingView !== "plate") return;
+    let active = true;
+    setPlateAssistedError(null);
+    void fetchPlateAssistedVehicles(filters.run_id || "latest")
+      .then((payload) => {
+        if (!active) return;
+        setPlateAssistedResult(payload);
+        setCurrentPage(1);
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setPlateAssistedResult(null);
+        setPlateAssistedError(loadError instanceof Error ? loadError.message : "Failed to load plate-assisted identity output.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [filters.run_id, trackingView]);
+
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     void load();
@@ -280,6 +315,22 @@ export function VehicleSearchPage() {
 
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const pagedRows = useMemo(() => rows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [currentPage, rows]);
+  const filteredVehicleRows = useMemo(() => {
+    const fromSeconds = parseVideoTime(filters.from_time);
+    const toSeconds = parseVideoTime(filters.to_time);
+    return vehicleRows.filter((vehicle) => {
+      const cameras = vehicle.camera_ids?.length ? vehicle.camera_ids : [vehicle.primary_camera_id ?? ""];
+      if (filters.camera_id && !cameras.includes(filters.camera_id)) return false;
+      if (filters.track_id && !(vehicle.member_track_ids ?? []).some((trackId) => trackId === filters.track_id || shortTrackId(trackId) === filters.track_id)) return false;
+      const first = nullableNumber(vehicle.first_seen_seconds);
+      const last = nullableNumber(vehicle.last_seen_seconds);
+      if (fromSeconds !== null && last !== null && last < fromSeconds) return false;
+      if (toSeconds !== null && first !== null && first > toSeconds) return false;
+      return true;
+    });
+  }, [filters.camera_id, filters.from_time, filters.to_time, filters.track_id, vehicleRows]);
+  const vehicleTotalPages = Math.max(1, Math.ceil(filteredVehicleRows.length / PAGE_SIZE));
+  const pagedVehicleRows = useMemo(() => filteredVehicleRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [currentPage, filteredVehicleRows]);
   const reconciledRows = useMemo(() => buildReconciledRows(reconciliation), [reconciliation]);
   const reconciledTotalPages = Math.max(1, Math.ceil(reconciledRows.length / PAGE_SIZE));
   const pagedReconciledRows = useMemo(() => reconciledRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE), [currentPage, reconciledRows]);
@@ -370,9 +421,12 @@ export function VehicleSearchPage() {
         <div className="table-toolbar">
           <div>
             <strong>Tracking View</strong>
-            <span className="muted"> Raw tracks are production data. Reconciled vehicles are experiment-only.</span>
+            <span className="muted"> Physical vehicles are production identities. Raw ByteTrack tracks remain available for debugging.</span>
           </div>
           <div className="grid-controls" role="group" aria-label="Tracking View">
+            <button type="button" className={`chip-button ${trackingView === "vehicles" ? "active" : ""}`} onClick={() => { setTrackingView("vehicles"); setCurrentPage(1); }}>
+              Physical Vehicles
+            </button>
             <button type="button" className={`chip-button ${trackingView === "raw" ? "active" : ""}`} onClick={() => { setTrackingView("raw"); setCurrentPage(1); }}>
               Raw Tracks
             </button>
@@ -385,8 +439,23 @@ export function VehicleSearchPage() {
             <button type="button" className={`chip-button ${trackingView === "stationary" ? "active" : ""}`} onClick={() => { setTrackingView("stationary"); setCurrentPage(1); }}>
               Stationary-Recovered
             </button>
+            <button type="button" className={`chip-button ${trackingView === "plate" ? "active" : ""}`} onClick={() => { setTrackingView("plate"); setCurrentPage(1); }}>
+              Plate-Assisted Identity
+            </button>
           </div>
         </div>
+
+        {trackingView === "vehicles" ? (
+          <PhysicalVehiclesView
+            rows={pagedVehicleRows}
+            allRowsCount={filteredVehicleRows.length}
+            currentPage={currentPage}
+            totalPages={vehicleTotalPages}
+            setCurrentPage={setCurrentPage}
+            runId={filters.run_id}
+            error={error}
+          />
+        ) : null}
 
         <div hidden={trackingView !== "raw"}>
         <div className="table-toolbar">
@@ -407,6 +476,7 @@ export function VehicleSearchPage() {
                     <th>Run</th>
                     <th>Camera</th>
                     <th>Track</th>
+                    <th>Plate</th>
                     <th>Class</th>
                     <th>Colour</th>
                     <th>First Seen</th>
@@ -422,6 +492,7 @@ export function VehicleSearchPage() {
                       <td>{row.run_id ?? "runtime"}</td>
                       <td>{row.camera_id}</td>
                       <td><Link to={`/tracks/${row.camera_id}/${row.track_id}?run_id=${encodeURIComponent(row.run_id ?? "latest")}`}>{row.track_id}</Link></td>
+                      <td><span className={`plate-badge ${row.plate_text ? "readable" : "empty"}`}>{formatPlate(row)}</span></td>
                       <td>{(row.vehicle_class ?? "UNKNOWN").toUpperCase()}</td>
                       <td><span className="colour-badge">{row.colour ?? row.colour_status ?? "Unavailable"}</span></td>
                       <td>{formatVideoTime(row.first_seen_seconds ?? row.first_seen)}</td>
@@ -468,8 +539,174 @@ export function VehicleSearchPage() {
         {trackingView === "stationary" ? (
           <StationaryRecoveredView result={stationaryResult} error={stationaryError} />
         ) : null}
+        {trackingView === "plate" ? (
+          <PlateAssistedIdentityView result={plateAssistedResult} error={plateAssistedError} />
+        ) : null}
       </section>
     </section>
+  );
+}
+
+function PhysicalVehiclesView({
+  rows,
+  allRowsCount,
+  currentPage,
+  totalPages,
+  setCurrentPage,
+  runId,
+  error,
+}: {
+  rows: PhysicalVehicleRecord[];
+  allRowsCount: number;
+  currentPage: number;
+  totalPages: number;
+  setCurrentPage: (updater: (page: number) => number) => void;
+  runId: string;
+  error: string | null;
+}) {
+  if (error) return <div className="empty-state">{error}</div>;
+  if (allRowsCount === 0) return <div className="empty-state">No physical vehicle identities found for this run.</div>;
+  return (
+    <>
+      <div className="table-toolbar">
+        <strong>{allRowsCount} physical vehicles found</strong>
+        <span className="muted">Run context: {runId === "latest" ? "Latest" : runId || "All Runs"}</span>
+      </div>
+      <div className="table-wrapper">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Evidence</th>
+              <th>Vehicle ID</th>
+              <th>Raw Tracklets</th>
+              <th>Camera</th>
+              <th>Class</th>
+              <th>Colour</th>
+              <th>Plate</th>
+              <th>First Seen</th>
+              <th>Last Seen</th>
+              <th>Confidence</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((vehicle) => {
+              const memberTracks = vehicle.member_track_ids ?? [];
+              const cameras = vehicle.camera_ids?.length ? vehicle.camera_ids : [vehicle.primary_camera_id ?? "-"];
+              return (
+                <tr key={`${vehicle.run_id ?? "latest"}-${vehicle.vehicle_id}`}>
+                  <td>{vehicle.best_crop_url ? <img src={vehicle.best_crop_url} alt={`${vehicle.vehicle_id} crop`} className="table-thumb" /> : <div className="thumb-placeholder small">No crop</div>}</td>
+                  <td><span className="status">{vehicle.vehicle_id}</span></td>
+                  <td>
+                    <div className="search-id-list">
+                      {memberTracks.map((trackId) => <code key={trackId}>{shortTrackId(trackId)}</code>)}
+                    </div>
+                  </td>
+                  <td>{cameras.join(", ")}</td>
+                  <td>{String(vehicle.vehicle_class ?? "UNKNOWN").toUpperCase()}</td>
+                  <td><span className="colour-badge">{vehicle.vehicle_colour ?? "Unavailable"}</span></td>
+                  <td>{vehicle.consensus_plate_text ?? "No readable plate"}</td>
+                  <td>{formatVideoTime(vehicle.first_seen_seconds)}</td>
+                  <td>{formatVideoTime(vehicle.last_seen_seconds)}</td>
+                  <td>{formatScore(vehicle.identity_confidence)}</td>
+                  <td>{vehicle.identity_status ?? vehicle.identity_method ?? "-"}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <Pagination allRowsCount={allRowsCount} currentPage={currentPage} totalPages={totalPages} setCurrentPage={setCurrentPage} />
+    </>
+  );
+}
+
+function PlateAssistedIdentityView({ result, error }: { result: PlateAssistedIdentityResult | null; error: string | null }) {
+  if (error) return <div className="empty-state">{error}</div>;
+  if (result === null) return <div className="empty-state">Loading plate-assisted identity output...</div>;
+  if (!result.available) {
+    return (
+      <div className="empty-state">
+        <p>{result.message || "Plate-assisted identity experiment has not been run for this run."}</p>
+        <code>{"python scripts/run_plate_assisted_identity_test.py --run-dir outputs\\runs\\<RUN_ID>"}</code>
+      </div>
+    );
+  }
+  const coverage = result.plate_coverage ?? {};
+  const assisted = result.plate_assisted ?? {};
+  const vehicles = [...(result.vehicles ?? [])].sort((left, right) => Number(left.first_seen_frame ?? 0) - Number(right.first_seen_frame ?? 0));
+  const plateConfirmedMerges = Number(coverage.exact_matching_plate_pairs ?? assisted.true_fragment_merges ?? 0);
+  return (
+    <>
+      <div className="summary-grid reconciliation-summary">
+        <MetricCard label="Raw Tracks" value={assisted.raw_completed_tracks} />
+        <MetricCard label="Plate-Assisted IDs" value={assisted.reconciled_identities} />
+        <MetricCard label="Duplicates Removed" value={assisted.duplicates_removed} />
+        <MetricCard label="Plate Detected" value={coverage.plate_detected_count} />
+        <MetricCard label="Readable Plates" value={coverage.readable_plate_count} />
+        <MetricCard label="High-Quality Plates" value={coverage.high_quality_plate_count} />
+        <MetricCard label="Plate-Confirmed Merges" value={plateConfirmedMerges} />
+        <MetricCard label="False Merges" value={assisted.false_merges} />
+      </div>
+      <div className="identity-note">
+        <strong>Plate-assisted identity experimental mode</strong>
+        <span className="muted">Reads persisted plate-assisted outputs only. Raw ByteTrack IDs, production analytics, and chatbot answers are unchanged.</span>
+      </div>
+      <div className="identity-grid">
+        {vehicles.map((vehicle) => {
+          const memberTracks = vehicle.member_track_ids ?? vehicle.member_tracks ?? [];
+          const memberPlates = vehicle.plate?.member_plates ?? [];
+          const merged = memberTracks.length > 1;
+          return (
+            <article className="identity-card" key={vehicle.vehicle_id}>
+              {vehicle.contact_sheet_url ? <img src={vehicle.contact_sheet_url} alt={`${vehicle.vehicle_id} contact sheet`} className="identity-contact-sheet" /> : <div className="thumb-placeholder identity-placeholder">No contact sheet</div>}
+              <div className="identity-card-body">
+                <div className="identity-card-header">
+                  <strong>{vehicle.vehicle_id}</strong>
+                  <span className={`status ${merged ? "" : "muted-status"}`}>{merged ? "MERGED" : "SINGLE"}</span>
+                </div>
+                <p>{vehicle.final_class} / {vehicle.camera_id}</p>
+                <dl className="identity-details">
+                  <div><dt>Plate</dt><dd>{vehicle.plate?.consensus_text ?? "No readable plate"}</dd></div>
+                  <div><dt>Quality</dt><dd>{vehicle.plate?.quality ?? "UNUSABLE"}</dd></div>
+                  <div><dt>Status</dt><dd>{vehicle.plate?.status ?? "NO READABLE PLATE"}</dd></div>
+                  <div><dt>Fragments</dt><dd>{memberTracks.length}</dd></div>
+                  <div><dt>First</dt><dd>{formatVideoTime(vehicle.first_seen_seconds)}</dd></div>
+                  <div><dt>Last</dt><dd>{formatVideoTime(vehicle.last_seen_seconds)}</dd></div>
+                </dl>
+                <span className="muted">Tracklets</span>
+                <div className="search-id-list">{memberTracks.map((trackId) => <code key={trackId}>{shortTrackId(trackId)}</code>)}</div>
+                {vehicle.association_reasons?.length ? (
+                  <div className="chip-row">{vehicle.association_reasons.map((reason) => <span className="filter-chip" key={reason}>{reason}</span>)}</div>
+                ) : null}
+                <details className="developer-details">
+                  <summary>Developer Details</summary>
+                  <div className="plate-member-list">
+                    {memberPlates.map((plate) => (
+                      <div className="plate-member-row" key={plate.local_track_id}>
+                        <div>
+                          <strong>{shortTrackId(plate.local_track_id)}</strong>
+                          <p>Plate: {plate.normalized_plate_text ?? "No readable plate"}</p>
+                          <p>Status: {plate.plate_evidence_status ?? "NO READABLE PLATE"}</p>
+                          <p>Quality: {plate.quality ?? plate.reliability_label ?? "UNUSABLE"}</p>
+                          <p>Detector: {formatScore(plate.plate_detection_confidence)} / OCR: {formatScore(plate.plate_text_confidence)}</p>
+                          <p>Reason: {plate.plate_ocr_reason ?? "-"}</p>
+                        </div>
+                        <div className="plate-evidence-images">
+                          {plate.vehicle_crop_url ? <img src={plate.vehicle_crop_url} alt={`${plate.local_track_id} vehicle crop`} className="table-thumb" /> : null}
+                          {plate.plate_crop_url ? <img src={plate.plate_crop_url} alt={`${plate.local_track_id} plate crop`} className="table-thumb" /> : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      {vehicles.length === 0 ? <div className="empty-state">No plate-assisted identities found in this experiment output.</div> : null}
+    </>
   );
 }
 

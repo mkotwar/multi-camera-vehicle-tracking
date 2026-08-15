@@ -7,6 +7,7 @@ import traceback
 from dataclasses import asdict
 from datetime import datetime, timezone
 import csv
+import os
 from pathlib import Path
 import shutil
 from typing import Any
@@ -15,7 +16,9 @@ import numpy as np
 import yaml
 
 from .detector_tracker import VehicleDetectorTracker
+from .env_flags import db_import_after_run_enabled
 from .evidence import EvidenceCollector
+from .importers.run_db_import import import_completed_run
 from .ingestion_manager import MultiCameraIngestionManager
 from .logging_setup import setup_logging
 from .models import (
@@ -32,6 +35,7 @@ from .output_writer import RunOutputManager
 from .runtime_state import get_runtime_state_manager
 from .track_manager import TrackManager
 from .tracking_fix_experiment import RuntimeTrackingFixExperiment
+from .vehicle_identity import build_physical_vehicle_identity_for_run, normalize_vehicle_identity_config
 from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
 
 
@@ -176,14 +180,18 @@ def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
         raw_tracking_roi = {}
     if not isinstance(raw_tracking_roi, dict):
         raise ConfigurationError("tracking_roi must be a mapping.")
+    mode = str(raw_tracking_roi.get("mode", "horizontal")).strip().lower() or "horizontal"
     normalized = {
         "enabled": bool(raw_tracking_roi.get("enabled", False)),
+        "mode": mode,
         "top_fraction": float(raw_tracking_roi.get("top_fraction", 0.0)),
         "bottom_fraction": float(raw_tracking_roi.get("bottom_fraction", 0.0)),
         "anchor": str(raw_tracking_roi.get("anchor", "bottom_center")).strip() or "bottom_center",
     }
     if normalized["anchor"] != "bottom_center":
         raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+    if normalized["mode"] not in {"horizontal", "rectangle"}:
+        raise ConfigurationError("tracking_roi.mode must be horizontal or rectangle.")
     if not 0.0 <= normalized["top_fraction"] < 1.0:
         raise ConfigurationError("tracking_roi.top_fraction must satisfy 0 <= top_fraction < 1.")
     if not 0.0 <= normalized["bottom_fraction"] < 1.0:
@@ -191,6 +199,25 @@ def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
     if normalized["top_fraction"] + normalized["bottom_fraction"] >= 1.0:
         raise ConfigurationError("tracking_roi top_fraction + bottom_fraction must be less than 1.")
     normalized["bottom_limit_fraction"] = 1.0 - normalized["bottom_fraction"]
+    rectangle = raw_tracking_roi.get("rectangle")
+    if rectangle is None:
+        rectangle = {}
+    if not isinstance(rectangle, dict):
+        raise ConfigurationError("tracking_roi.rectangle must be a mapping.")
+    normalized_rectangle = {
+        "x_min_fraction": float(rectangle.get("x_min_fraction", 0.0)),
+        "y_min_fraction": float(rectangle.get("y_min_fraction", 0.0)),
+        "x_max_fraction": float(rectangle.get("x_max_fraction", 1.0)),
+        "y_max_fraction": float(rectangle.get("y_max_fraction", 1.0)),
+    }
+    if normalized["mode"] == "rectangle":
+        if "rectangle" not in raw_tracking_roi:
+            raise ConfigurationError("tracking_roi.rectangle must be provided when mode=rectangle.")
+        if not 0.0 <= normalized_rectangle["x_min_fraction"] < normalized_rectangle["x_max_fraction"] <= 1.0:
+            raise ConfigurationError("tracking_roi.rectangle x fractions must satisfy 0 <= x_min_fraction < x_max_fraction <= 1.")
+        if not 0.0 <= normalized_rectangle["y_min_fraction"] < normalized_rectangle["y_max_fraction"] <= 1.0:
+            raise ConfigurationError("tracking_roi.rectangle y fractions must satisfy 0 <= y_min_fraction < y_max_fraction <= 1.")
+    normalized["rectangle"] = normalized_rectangle
     return normalized
 
 
@@ -225,6 +252,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
     tracking = raw_config.get("tracking")
     tracking_roi = raw_config.get("tracking_roi")
     tracking_fix_experiment = raw_config.get("tracking_fix_experiment")
+    vehicle_identity = raw_config.get("vehicle_identity")
     evidence = raw_config.get("evidence")
     visualization = raw_config.get("visualization")
     output_section = raw_config.get("output")
@@ -242,6 +270,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Missing or invalid 'tracking' section.")
     normalized_tracking_roi = _normalize_tracking_roi_config(tracking_roi)
     normalized_tracking_fix_experiment = _normalize_tracking_fix_experiment_config(tracking_fix_experiment, config_path)
+    normalized_vehicle_identity = normalize_vehicle_identity_config(vehicle_identity or {})
     if evidence is not None and not isinstance(evidence, dict):
         raise ConfigurationError("Invalid 'evidence' section.")
     if not isinstance(visualization, dict):
@@ -252,6 +281,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         raise ConfigurationError("Invalid 'debug_outputs' section.")
     if vehicle_enrichment is not None and not isinstance(vehicle_enrichment, dict):
         raise ConfigurationError("Invalid 'vehicle_enrichment' section.")
+    if vehicle_identity is not None and not isinstance(vehicle_identity, dict):
+        raise ConfigurationError("Invalid 'vehicle_identity' section.")
     if logging_section is None:
         logging_section = {}
     if not isinstance(logging_section, dict):
@@ -587,6 +618,7 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
         },
         "tracking_roi": normalized_tracking_roi,
         "tracking_fix_experiment": normalized_tracking_fix_experiment,
+        "vehicle_identity": normalized_vehicle_identity,
         "lifecycle": {
             "minimum_observations": lifecycle_minimum_observations,
             "maximum_lost_frames": lifecycle_maximum_lost_frames,
@@ -697,6 +729,37 @@ def _capture_zone_enabled_for_camera(config: dict[str, Any], camera_id: str) -> 
     if isinstance(overrides, dict) and "enabled" in overrides:
         enabled = bool(overrides.get("enabled"))
     return enabled
+
+
+def _run_post_run_db_import_if_enabled(run_directory: Path, run_id: str, logger: Any) -> None:
+    if not db_import_after_run_enabled():
+        return
+    logger.info("Post-run PostgreSQL import enabled for %s", run_id)
+    try:
+        result, payload_counts = import_completed_run(run_directory)
+    except Exception as exc:
+        logger.error("Post-run PostgreSQL import failed for run %s: %s", run_id, _safe_post_run_import_error(exc))
+        return
+
+    result_payload = result.to_dict()
+    table_counts = dict(result_payload.get("table_counts") or payload_counts or {})
+    logger.info(
+        "Post-run PostgreSQL import completed for %s tracks=%s observations=%s evidence=%s elapsed_seconds=%.3f",
+        run_id,
+        table_counts.get("vehicle_tracks", 0),
+        table_counts.get("track_observations", 0),
+        table_counts.get("track_evidence", 0),
+        float(result_payload.get("elapsed_seconds", 0.0) or 0.0),
+    )
+
+
+def _safe_post_run_import_error(exc: Exception) -> str:
+    message = str(exc) or exc.__class__.__name__
+    for key in ("DATABASE_URL", "SUPABASE_DB_URL", "POSTGRES_URL"):
+        secret = os.environ.get(key)
+        if secret:
+            message = message.replace(secret, "<redacted>")
+    return message
 
 
 def run_pipeline(config_path: str) -> tuple[int, str, str]:
@@ -1267,6 +1330,12 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         vehicle_enrichment_track_evidence_summary_path = output_manager.save_vehicle_enrichment_track_evidence_summary(
             _build_vehicle_enrichment_track_evidence_summary_rows(enrichment_results, track_manager.get_all_output_tracks())
         )
+        physical_identity_result = build_physical_vehicle_identity_for_run(
+            output_manager.run_directory,
+            validated_config.get("vehicle_identity", {}),
+        )
+        physical_identity_paths = dict(physical_identity_result.paths)
+        physical_identity_metrics = dict(physical_identity_result.metrics)
         enrichment_by_local_track_id = {item.local_track_id: item for item in enrichment_results}
         motorcycle_geometry_rows: list[dict[str, Any]] = []
         for row in evidence_collector.motorcycle_geometry_records:
@@ -1507,6 +1576,14 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 "vehicle_pipeline_trace_path": str(vehicle_pipeline_trace_path),
                 "vehicle_enrichment_enabled": validated_config["vehicle_enrichment"]["enabled"],
                 "vehicle_enrichment_result_count": len(enrichment_results),
+                "vehicle_identity": {
+                    "enabled": bool(validated_config.get("vehicle_identity", {}).get("enabled", False)),
+                    "physical_vehicle_count": int(physical_identity_metrics.get("physical_vehicle_count", 0) or 0),
+                    "raw_completed_tracks": int(physical_identity_metrics.get("raw_completed_tracks", 0) or 0),
+                    "duplicates_removed": int(physical_identity_metrics.get("duplicates_removed", 0) or 0),
+                    "stationary_recovery_enabled": bool(physical_identity_metrics.get("stationary_recovery_enabled", False)),
+                    "paths": physical_identity_paths,
+                },
                 "colour_async_enabled": bool(vehicle_enrichment_manager.metrics.get("colour_async_enabled", False)),
                 "colour_worker_count": int(vehicle_enrichment_manager.metrics.get("colour_worker_count", 0)),
                 "colour_queue_count": int(vehicle_enrichment_manager.metrics.get("colour_queue_count", 0)),
@@ -1573,7 +1650,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             float(metrics.get("duration_seconds", 0.0)),
         )
         logger.debug(
-            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s track_crop_manifest=%s capture_zone_index=%s capture_zone_metrics=%s motorcycle_geometry_report=%s vehicle_pipeline_trace=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s",
+            "track output paths tracks=%s observations=%s lifecycle_metrics=%s evidence_index=%s evidence_metrics=%s track_crop_manifest=%s capture_zone_index=%s capture_zone_metrics=%s motorcycle_geometry_report=%s vehicle_pipeline_trace=%s vehicle_enrichment=%s vehicle_enrichment_metrics=%s vehicle_enrichment_validation_report=%s vehicle_enrichment_crop_diagnostics=%s vehicle_enrichment_track_evidence_summary=%s physical_vehicles=%s vehicle_identity_map=%s identity_decisions=%s",
             tracks_path,
             observations_path,
             lifecycle_metrics_path,
@@ -1589,8 +1666,12 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             vehicle_enrichment_validation_report_path,
             vehicle_enrichment_crop_diagnostics_path,
             vehicle_enrichment_track_evidence_summary_path,
+            physical_identity_paths.get("physical_vehicles"),
+            physical_identity_paths.get("vehicle_identity_map"),
+            physical_identity_paths.get("identity_decisions"),
         )
         detector_tracker.reset_all()
+        _run_post_run_db_import_if_enabled(output_manager.run_directory, output_manager.run_id, logger)
         logger.info("Pipeline completed")
         return 0, output_manager.run_id, str(output_manager.run_directory)
     except Exception as exc:
