@@ -262,3 +262,16 @@ vehicle_enrichment:
         task_token: <OCR>
         prompt: ''
         run_only_when_plate_detected: false
+        florence:
+          enabled: true
+          base_model_id: "D:/project/models/Florence-2-base-ft"
+          processor_path: "D:/project/models/Florence-2-base-ft"
+          adapter_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT"
+          adapter_enabled: true
+          device: auto
+          dtype: auto
+          trust_remote_code: true
+          attention_implementation: eager
+          max_new_tokens: 64
+          num_beams: 3
+          local_files_only: true
