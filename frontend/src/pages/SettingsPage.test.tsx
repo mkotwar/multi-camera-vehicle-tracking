@@ -9,14 +9,27 @@ const mocks = vi.hoisted(() => ({
   validateConfig: vi.fn(),
   saveConfig: vi.fn(),
   cloneConfig: vi.fn(),
-  roiPreviewUrl: vi.fn(),
+  roiPreviewDraftUrl: vi.fn(),
 }));
 
 vi.mock("../api/configs", () => mocks);
 
 const baseConfig = {
   input: {
-    cameras: [{ camera_id: "CAM_001", source_type: "video", source: "D:/video.mp4", enabled: true }],
+    cameras: [
+      {
+        camera_id: "CAM_001",
+        source_type: "video",
+        source: "D:/video.mp4",
+        enabled: true,
+        tracking_roi: {
+          enabled: true,
+          mode: "rectangle",
+          rectangle: { x_min_fraction: 0, y_min_fraction: 0.4, x_max_fraction: 1, y_max_fraction: 0.75 },
+          anchor: "bottom_center",
+        },
+      },
+    ],
   },
   detection: { backend: "ocr_mukul", model_path: "D:/model.pt", confidence_threshold: 0.2, iou_threshold: 0.45, image_size: 1024, agnostic_nms: false },
   tracking: { backend: "ocr_mukul_supervision_bytetrack", track_activation_threshold: 0.25, lost_track_buffer: 150, minimum_matching_threshold: 0.7, minimum_consecutive_frames: 3 },
@@ -63,7 +76,7 @@ describe("SettingsPage", () => {
     });
     mocks.validateConfig.mockResolvedValue({ valid: true, errors: [], warnings: [] });
     mocks.saveConfig.mockResolvedValue({ valid: true, errors: [], warnings: [], saved_path: "config/validation_rectangle_roi.yaml", config_name: "validation_rectangle_roi.yaml", yaml_text: "saved: true\n" });
-    mocks.roiPreviewUrl.mockReturnValue("/api/configs/validation_rectangle_roi.yaml/roi-preview?camera_id=CAM_001");
+    mocks.roiPreviewDraftUrl.mockReturnValue("/api/configs/validation_rectangle_roi.yaml/roi-preview");
   });
 
   it("loads config values into structured controls and saves numeric edits", async () => {
@@ -98,12 +111,12 @@ describe("SettingsPage", () => {
     fireEvent(stage, new MouseEvent("pointerdown", { bubbles: true, clientX: 100, clientY: 200 }));
     fireEvent(stage, new MouseEvent("pointermove", { bubbles: true, clientX: 900, clientY: 375 }));
     fireEvent(stage, new MouseEvent("pointerup", { bubbles: true }));
-    await waitFor(() => expect(screen.getByLabelText("x min")).toHaveValue(0.1));
+    await waitFor(() => expect(screen.getByLabelText("CAM_001 x min")).toHaveValue(0.1));
 
     fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
     await waitFor(() => expect(mocks.saveConfig).toHaveBeenCalled());
     const savedConfig = mocks.saveConfig.mock.calls[0][1];
-    expect(savedConfig.tracking_roi.rectangle).toEqual({
+    expect(savedConfig.input.cameras[0].tracking_roi.rectangle).toEqual({
       x_min_fraction: 0.1,
       y_min_fraction: 0.4,
       x_max_fraction: 0.9,
@@ -113,7 +126,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Full Frame" }));
     fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
     await waitFor(() => expect(mocks.saveConfig).toHaveBeenCalledTimes(2));
-    expect(mocks.saveConfig.mock.calls[1][1].tracking_roi.rectangle).toEqual({
+    expect(mocks.saveConfig.mock.calls[1][1].input.cameras[0].tracking_roi.rectangle).toEqual({
       x_min_fraction: 0,
       y_min_fraction: 0,
       x_max_fraction: 1,
@@ -135,5 +148,186 @@ describe("SettingsPage", () => {
 
     expect(await screen.findByText("tracking_roi.rectangle.y_min_fraction")).toBeInTheDocument();
     expect(screen.getByText(/Must be less than y_max_fraction/)).toBeInTheDocument();
+  });
+
+  it("renders all cameras returned by the API", async () => {
+    mocks.getConfig.mockResolvedValueOnce({
+      config_name: "validation_rectangle_roi.yaml",
+      path: "config/validation_rectangle_roi.yaml",
+      config: {
+        ...structuredClone(baseConfig),
+        input: {
+          cameras: [
+            { camera_id: "CAM_001", source_type: "video", source: "D:/cam1.mp4", enabled: true },
+            { camera_id: "CAM_002", source_type: "video", source: "D:/cam2.mp4", enabled: true },
+            { camera_id: "CAM_003", source_type: "video", source: "D:/cam3.mp4", enabled: false },
+          ],
+        },
+      },
+      yaml_text: "",
+      validation: { valid: true, errors: [], warnings: [] },
+      inventory: [],
+    });
+
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    expect(await screen.findByDisplayValue("D:/cam1.mp4")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("D:/cam2.mp4")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("D:/cam3.mp4")).toBeInTheDocument();
+  });
+
+  it("adds and removes cameras without altering the others", async () => {
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    await screen.findByDisplayValue("CAM_001");
+    fireEvent.click(screen.getByRole("button", { name: "Add Camera" }));
+    expect(screen.getByDisplayValue("CAM_002")).toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue("CAM_002"), { target: { value: "CAM_099" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove" })[1]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+
+    await waitFor(() => expect(mocks.saveConfig).toHaveBeenCalled());
+    const savedConfig = mocks.saveConfig.mock.calls[0][1];
+    expect(savedConfig.input.cameras).toHaveLength(1);
+    expect(savedConfig.input.cameras[0].camera_id).toBe("CAM_001");
+    expect(savedConfig.input.cameras[0].source).toBe("D:/video.mp4");
+  });
+
+  it("keeps ROI edits isolated to the selected camera", async () => {
+    mocks.getConfig.mockResolvedValueOnce({
+      config_name: "validation_rectangle_roi.yaml",
+      path: "config/validation_rectangle_roi.yaml",
+      config: {
+        ...structuredClone(baseConfig),
+        input: {
+          cameras: [
+            structuredClone(baseConfig.input.cameras[0]),
+            {
+              camera_id: "CAM_002",
+              source_type: "video",
+              source: "D:/cam2.mp4",
+              enabled: true,
+              tracking_roi: {
+                enabled: false,
+                mode: "rectangle",
+                rectangle: { x_min_fraction: 0.3, y_min_fraction: 0.2, x_max_fraction: 0.75, y_max_fraction: 0.9 },
+                anchor: "bottom_center",
+              },
+            },
+          ],
+        },
+      },
+      yaml_text: "",
+      validation: { valid: true, errors: [], warnings: [] },
+      inventory: [],
+    });
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    fireEvent.change(await screen.findByLabelText("CAM_001 x min"), { target: { value: "0.12" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+
+    await waitFor(() => expect(mocks.saveConfig).toHaveBeenCalled());
+    const savedConfig = mocks.saveConfig.mock.calls[0][1];
+    expect(savedConfig.input.cameras[0].tracking_roi.rectangle.x_min_fraction).toBe(0.12);
+    expect(savedConfig.input.cameras[1].tracking_roi.rectangle.x_min_fraction).toBe(0.3);
+    expect(savedConfig.input.cameras[1].tracking_roi.enabled).toBe(false);
+  });
+
+  it("keeps CAM_003 ROI edits isolated from CAM_001 and CAM_002", async () => {
+    mocks.getConfig.mockResolvedValueOnce({
+      config_name: "validation_rectangle_roi.yaml",
+      path: "config/validation_rectangle_roi.yaml",
+      config: {
+        ...structuredClone(baseConfig),
+        input: {
+          cameras: [
+            structuredClone(baseConfig.input.cameras[0]),
+            {
+              ...structuredClone(baseConfig.input.cameras[0]),
+              camera_id: "CAM_002",
+              source: "D:/cam2.mp4",
+              tracking_roi: {
+                enabled: true,
+                mode: "rectangle",
+                rectangle: { x_min_fraction: 0.2, y_min_fraction: 0.2, x_max_fraction: 0.8, y_max_fraction: 0.8 },
+                anchor: "bottom_center",
+              },
+            },
+            {
+              ...structuredClone(baseConfig.input.cameras[0]),
+              camera_id: "CAM_003",
+              source: "D:/cam3.mp4",
+              tracking_roi: {
+                enabled: true,
+                mode: "rectangle",
+                rectangle: { x_min_fraction: 0.3, y_min_fraction: 0.3, x_max_fraction: 0.9, y_max_fraction: 0.9 },
+                anchor: "bottom_center",
+              },
+            },
+          ],
+        },
+      },
+      yaml_text: "",
+      validation: { valid: true, errors: [], warnings: [] },
+      inventory: [],
+    });
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    fireEvent.change(await screen.findByLabelText("CAM_003 x min"), { target: { value: "0.35" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Save" })[0]);
+
+    await waitFor(() => expect(mocks.saveConfig).toHaveBeenCalled());
+    const savedConfig = mocks.saveConfig.mock.calls[0][1];
+    expect(savedConfig.input.cameras[0].tracking_roi.rectangle.x_min_fraction).toBe(0);
+    expect(savedConfig.input.cameras[1].tracking_roi.rectangle.x_min_fraction).toBe(0.2);
+    expect(savedConfig.input.cameras[2].tracking_roi.rectangle.x_min_fraction).toBe(0.35);
+  });
+
+  it("loads preview frames with newly added unsaved camera details", async () => {
+    mocks.getConfig.mockResolvedValueOnce({
+      config_name: "validation_rectangle_roi.yaml",
+      path: "config/validation_rectangle_roi.yaml",
+      config: {
+        ...structuredClone(baseConfig),
+        input: {
+          cameras: [
+            structuredClone(baseConfig.input.cameras[0]),
+            { ...structuredClone(baseConfig.input.cameras[0]), camera_id: "CAM_002", source: "D:/cam2.mp4" },
+          ],
+        },
+      },
+      yaml_text: "",
+      validation: { valid: true, errors: [], warnings: [] },
+      inventory: [],
+    });
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    await screen.findByDisplayValue("CAM_001");
+    fireEvent.click(screen.getByRole("button", { name: "Add Camera" }));
+    fireEvent.change(screen.getAllByLabelText("Source")[2], { target: { value: "D:/cam3.mp4" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Load frame" })[2]);
+
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    const [_url, options] = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(options.body)).toEqual({
+      camera: expect.objectContaining({
+        camera_id: "CAM_003",
+        source_type: "video",
+        source: "D:/cam3.mp4",
+      }),
+    });
+  });
+
+  it("loads preview with the edited source before save", async () => {
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    const source = await screen.findByDisplayValue("D:/video.mp4");
+    fireEvent.change(source, { target: { value: "D:/new-source.mp4" } });
+    fireEvent.click(screen.getByRole("button", { name: "Load frame" }));
+
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    const [_url, options] = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(options.body).camera.source).toBe("D:/new-source.mp4");
   });
 });

@@ -1,6 +1,6 @@
-import { PointerEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { MutableRefObject, PointerEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { cloneConfig, getConfig, listConfigs, roiPreviewUrl, saveConfig, validateConfig } from "../api/configs";
+import { cloneConfig, getConfig, listConfigs, roiPreviewDraftUrl, saveConfig, validateConfig } from "../api/configs";
 import type { ConfigInventoryItem, ConfigListItem, ConfigValidationError, ConfigValidationResult, PipelineConfig } from "../types/config";
 
 type RoiRectangle = {
@@ -91,7 +91,8 @@ export function SettingsPage() {
     }
   }, [cameraId, cameras]);
 
-  const roi = readRoi(config);
+  const selectedCameraIndex = Math.max(0, cameras.findIndex((camera) => String(camera.camera_id ?? "") === cameraId));
+  const roi = readRoi(config, selectedCameraIndex);
   const validationErrors = validation?.errors ?? [];
 
   async function loadSelectedConfig(configName: string) {
@@ -129,12 +130,43 @@ export function SettingsPage() {
     setStatus(null);
   }
 
-  function updateRoi(next: RoiRectangle) {
+  function updateRoi(cameraIndex: number, next: RoiRectangle) {
     const rounded = normalizeRoi(next);
-    updateValue(["tracking_roi", "enabled"], true);
-    updateValue(["tracking_roi", "mode"], "rectangle");
-    updateValue(["tracking_roi", "anchor"], "bottom_center");
-    updateValue(["tracking_roi", "rectangle"], rounded);
+    updateValue(["input", "cameras", cameraIndex, "tracking_roi", "enabled"], true);
+    updateValue(["input", "cameras", cameraIndex, "tracking_roi", "mode"], "rectangle");
+    updateValue(["input", "cameras", cameraIndex, "tracking_roi", "anchor"], "bottom_center");
+    updateValue(["input", "cameras", cameraIndex, "tracking_roi", "rectangle"], rounded);
+  }
+
+  function handleAddCamera() {
+    const existingIds = new Set(cameras.map((camera) => String(camera.camera_id ?? "")));
+    let nextNumber = cameras.length + 1;
+    let nextId = formatCameraId(nextNumber);
+    while (existingIds.has(nextId)) {
+      nextNumber += 1;
+      nextId = formatCameraId(nextNumber);
+    }
+    const nextCamera = {
+      camera_id: nextId,
+      source_type: "video",
+      source: "",
+      enabled: false,
+      tracking_roi: {
+        enabled: false,
+        mode: "rectangle",
+        rectangle: DEFAULT_ROI,
+        anchor: "bottom_center",
+      },
+    };
+    updateValue(["input", "cameras"], [...cameras, nextCamera]);
+    setCameraId(nextId);
+  }
+
+  function handleRemoveCamera(index: number) {
+    const nextCameras = cameras.filter((_, cameraIndex) => cameraIndex !== index);
+    updateValue(["input", "cameras"], nextCameras);
+    const nextSelected = nextCameras[Math.min(index, nextCameras.length - 1)];
+    setCameraId(nextSelected ? String(nextSelected.camera_id ?? "") : "");
   }
 
   async function handleValidate() {
@@ -211,13 +243,22 @@ export function SettingsPage() {
     setStatus("Changes reset.");
   }
 
-  async function handleLoadFrame() {
-    if (!selectedConfig || !cameraId) {
+  async function handleLoadFrame(targetCameraId = cameraId) {
+    if (!selectedConfig || !targetCameraId) {
       return;
     }
+    setCameraId(targetCameraId);
     setPreviewError(null);
     try {
-      const response = await fetch(`${roiPreviewUrl(selectedConfig, cameraId)}&cache=${Date.now()}`);
+      const camera = cameras.find((item) => String(item.camera_id ?? "") === targetCameraId);
+      if (!camera) {
+        throw new Error(`Camera not found in current settings: ${targetCameraId}`);
+      }
+      const response = await fetch(`${roiPreviewDraftUrl(selectedConfig)}?cache=${Date.now()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ camera }),
+      });
       if (!response.ok) {
         throw new Error(await previewErrorMessage(response));
       }
@@ -256,7 +297,7 @@ export function SettingsPage() {
     }
     (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
     startDrag({ mode: "draw", startX: point.x, startY: point.y });
-    updateRoi({
+    updateRoi(selectedCameraIndex, {
       x_min_fraction: point.x,
       y_min_fraction: point.y,
       x_max_fraction: point.x,
@@ -284,16 +325,16 @@ export function SettingsPage() {
       return;
     }
     if (activeDrag.mode === "draw") {
-      updateRoi(fromCorners(activeDrag.startX, activeDrag.startY, point.x, point.y));
+      updateRoi(selectedCameraIndex, fromCorners(activeDrag.startX, activeDrag.startY, point.x, point.y));
       return;
     }
     if (activeDrag.mode === "move") {
       const dx = point.x - activeDrag.startX;
       const dy = point.y - activeDrag.startY;
-      updateRoi(moveRoi(activeDrag.original, dx, dy));
+      updateRoi(selectedCameraIndex, moveRoi(activeDrag.original, dx, dy));
       return;
     }
-    updateRoi(resizeRoi(activeDrag.original, activeDrag.handle, point.x - activeDrag.startX, point.y - activeDrag.startY));
+    updateRoi(selectedCameraIndex, resizeRoi(activeDrag.original, activeDrag.handle, point.x - activeDrag.startX, point.y - activeDrag.startY));
   }
 
   function startDrag(next: DragState) {
@@ -363,13 +404,49 @@ export function SettingsPage() {
         <div className="settings-main">
           <ConfigSection title="Input / Camera" level="safe">
             {cameras.map((camera, index) => (
-              <div className="settings-subgrid" key={String(camera.camera_id ?? index)}>
-                <TextControl label="Camera ID" value={String(camera.camera_id ?? "")} onChange={(value) => updateValue(["input", "cameras", index, "camera_id"], value)} />
-                <SelectControl label="Source type" value={String(camera.source_type ?? "video")} options={["video", "rtsp", "webcam"]} onChange={(value) => updateValue(["input", "cameras", index, "source_type"], value)} />
-                <TextControl label="Source" value={String(camera.source ?? "")} onChange={(value) => updateValue(["input", "cameras", index, "source"], value)} />
-                <ToggleControl label="Enabled" checked={Boolean(camera.enabled)} onChange={(value) => updateValue(["input", "cameras", index, "enabled"], value)} />
+              <div className="camera-config-card" key={String(camera.camera_id ?? index)}>
+                <div className="camera-config-heading">
+                  <h3>{String(camera.camera_id ?? `Camera ${index + 1}`)}</h3>
+                  <button className="secondary-button" onClick={() => handleRemoveCamera(index)} disabled={cameras.length <= 1}>Remove</button>
+                </div>
+                <div className="settings-subgrid">
+                  <TextControl
+                    label="Camera ID"
+                    value={String(camera.camera_id ?? "")}
+                    onChange={(value) => {
+                      const wasSelected = String(camera.camera_id ?? "") === cameraId;
+                      updateValue(["input", "cameras", index, "camera_id"], value);
+                      if (wasSelected) {
+                        setCameraId(value);
+                      }
+                    }}
+                  />
+                  <SelectControl label="Source type" value={String(camera.source_type ?? "video")} options={["video", "rtsp", "webcam"]} onChange={(value) => updateValue(["input", "cameras", index, "source_type"], value)} />
+                  <TextControl label="Source" value={String(camera.source ?? "")} onChange={(value) => updateValue(["input", "cameras", index, "source"], value)} />
+                  <ToggleControl label="Enabled" checked={Boolean(camera.enabled)} onChange={(value) => updateValue(["input", "cameras", index, "enabled"], value)} />
+                </div>
+                <CameraRoiControls
+                  camera={camera}
+                  cameraIndex={index}
+                  config={config}
+                  originalConfig={originalConfig}
+                  previewUrl={previewUrl}
+                  previewError={previewError}
+                  selected={String(camera.camera_id ?? "") === cameraId}
+                  imageRef={imageRef}
+                  roi={readRoi(config, index)}
+                  onSelectCamera={(value) => setCameraId(value)}
+                  onLoadFrame={() => void handleLoadFrame(String(camera.camera_id ?? ""))}
+                  onImagePointerDown={handleImagePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerEnd={endDrag}
+                  onOverlayPointerDown={handleOverlayPointerDown}
+                  onUpdateValue={updateValue}
+                  onUpdateRoi={updateRoi}
+                />
               </div>
             ))}
+            <button className="secondary-button" onClick={handleAddCamera}>Add Camera</button>
           </ConfigSection>
 
           <ConfigSection title="Detection" level="advanced">
@@ -390,66 +467,6 @@ export function SettingsPage() {
               <NumberControl label="Lost track buffer" value={numberPath(config, ["tracking", "lost_track_buffer"])} step={1} min={0} onChange={(value) => updateValue(["tracking", "lost_track_buffer"], Math.round(value))} />
               <NumberControl label="Minimum matching threshold" value={numberPath(config, ["tracking", "minimum_matching_threshold"])} step={0.01} min={0} max={1} onChange={(value) => updateValue(["tracking", "minimum_matching_threshold"], value)} />
               <NumberControl label="Minimum consecutive frames" value={numberPath(config, ["tracking", "minimum_consecutive_frames"])} step={1} min={1} onChange={(value) => updateValue(["tracking", "minimum_consecutive_frames"], Math.round(value))} />
-            </SettingGrid>
-          </ConfigSection>
-
-          <ConfigSection title="Tracking ROI" level="safe">
-            <div className="roi-controls">
-              <ToggleControl label="ROI enabled" checked={booleanPath(config, ["tracking_roi", "enabled"])} onChange={(value) => updateValue(["tracking_roi", "enabled"], value)} />
-              <SelectControl label="Mode" value={stringPath(config, ["tracking_roi", "mode"]) || "rectangle"} options={["rectangle", "horizontal"]} onChange={(value) => updateValue(["tracking_roi", "mode"], value)} />
-              <TextControl label="Anchor" value={stringPath(config, ["tracking_roi", "anchor"]) || "bottom_center"} onChange={(value) => updateValue(["tracking_roi", "anchor"], value)} />
-              <label>
-                <span>Preview camera</span>
-                <select value={cameraId} onChange={(event) => setCameraId(event.target.value)}>
-                  {cameras.map((camera) => (
-                    <option key={String(camera.camera_id)} value={String(camera.camera_id)}>{String(camera.camera_id)}{camera.enabled === false ? " (disabled)" : ""}</option>
-                  ))}
-                </select>
-              </label>
-              <button className="secondary-button" onClick={() => void handleLoadFrame()}>Load frame</button>
-            </div>
-            <p className="muted">A detection is accepted when the bottom-center point of its bounding box falls inside the tracking ROI.</p>
-            {previewError ? <div className="track-detail-state error">{previewError}</div> : null}
-            <div
-              className="roi-stage"
-              onPointerDown={handleImagePointerDown}
-              onPointerMove={handlePointerMove}
-              onPointerUp={endDrag}
-              onPointerCancel={endDrag}
-            >
-              {previewUrl ? (
-                <img ref={imageRef} src={previewUrl} alt="ROI preview frame" onError={() => setPreviewError("Preview frame could not be loaded for this camera/source.")} />
-              ) : (
-                <div className="roi-placeholder">Load a frame to draw the ROI</div>
-              )}
-              {previewUrl ? (
-                <div
-                  className="roi-rectangle"
-                  style={roiStyle(roi)}
-                  onPointerDown={(event) => handleOverlayPointerDown(event, "move")}
-                >
-                  {(["tl", "tr", "bl", "br"] as const).map((handle) => (
-                    <button
-                      aria-label={`Resize ROI ${handle}`}
-                      className={`roi-handle ${handle}`}
-                      key={handle}
-                      onPointerDown={(event) => handleOverlayPointerDown(event, "resize", handle)}
-                    />
-                  ))}
-                </div>
-              ) : null}
-            </div>
-            <div className="roi-button-row">
-              <button className="secondary-button" onClick={() => updateRoi(originalConfig ? readRoi(originalConfig) : DEFAULT_ROI)}>Reset ROI</button>
-              <button className="secondary-button" onClick={() => updateRoi(DEFAULT_ROI)}>Full Frame</button>
-              <button className="secondary-button" onClick={() => updateValue(["tracking_roi", "enabled"], false)}>Clear ROI</button>
-              <button className="secondary-button" onClick={() => updateRoi(roi)}>Redraw</button>
-            </div>
-            <SettingGrid>
-              <NumberControl label="x min" value={roi.x_min_fraction} step={0.001} min={0} max={1} onChange={(value) => updateRoi({ ...roi, x_min_fraction: value })} />
-              <NumberControl label="y min" value={roi.y_min_fraction} step={0.001} min={0} max={1} onChange={(value) => updateRoi({ ...roi, y_min_fraction: value })} />
-              <NumberControl label="x max" value={roi.x_max_fraction} step={0.001} min={0} max={1} onChange={(value) => updateRoi({ ...roi, x_max_fraction: value })} />
-              <NumberControl label="y max" value={roi.y_max_fraction} step={0.001} min={0} max={1} onChange={(value) => updateRoi({ ...roi, y_max_fraction: value })} />
             </SettingGrid>
           </ConfigSection>
 
@@ -532,6 +549,105 @@ function ConfigSection({ title, level, children }: { title: string; level: strin
       </div>
       {children}
     </section>
+  );
+}
+
+function CameraRoiControls({
+  camera,
+  cameraIndex,
+  config,
+  originalConfig,
+  previewUrl,
+  previewError,
+  selected,
+  imageRef,
+  roi,
+  onSelectCamera,
+  onLoadFrame,
+  onImagePointerDown,
+  onPointerMove,
+  onPointerEnd,
+  onOverlayPointerDown,
+  onUpdateValue,
+  onUpdateRoi,
+}: {
+  camera: Record<string, unknown>;
+  cameraIndex: number;
+  config: PipelineConfig;
+  originalConfig: PipelineConfig | null;
+  previewUrl: string | null;
+  previewError: string | null;
+  selected: boolean;
+  imageRef: MutableRefObject<HTMLImageElement | null>;
+  roi: RoiRectangle;
+  onSelectCamera: (cameraId: string) => void;
+  onLoadFrame: () => void;
+  onImagePointerDown: (event: PointerEvent) => void;
+  onPointerMove: (event: PointerEvent) => void;
+  onPointerEnd: () => void;
+  onOverlayPointerDown: (event: PointerEvent, mode: "move" | "resize", handle?: "tl" | "tr" | "bl" | "br") => void;
+  onUpdateValue: (path: Array<string | number>, value: unknown) => void;
+  onUpdateRoi: (cameraIndex: number, next: RoiRectangle) => void;
+}) {
+  const cameraId = String(camera.camera_id ?? "");
+  const roiPath = ["input", "cameras", cameraIndex, "tracking_roi"];
+  return (
+    <div className="camera-roi-panel">
+      <div className="roi-controls">
+        <ToggleControl label="ROI enabled" checked={booleanPath(config, [...roiPath, "enabled"])} onChange={(value) => onUpdateValue([...roiPath, "enabled"], value)} />
+        <SelectControl label="Mode" value={stringPath(config, [...roiPath, "mode"]) || "rectangle"} options={["rectangle", "horizontal"]} onChange={(value) => onUpdateValue([...roiPath, "mode"], value)} />
+        <TextControl label="Anchor" value={stringPath(config, [...roiPath, "anchor"]) || "bottom_center"} onChange={(value) => onUpdateValue([...roiPath, "anchor"], value)} />
+        <button
+          className="secondary-button"
+          onClick={() => {
+            onSelectCamera(cameraId);
+            onLoadFrame();
+          }}
+        >
+          Load frame
+        </button>
+      </div>
+      {selected && previewError ? <div className="track-detail-state error">{previewError}</div> : null}
+      {selected ? (
+        <div
+          className="roi-stage"
+          onPointerDown={onImagePointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerEnd}
+          onPointerCancel={onPointerEnd}
+        >
+          {previewUrl ? (
+            <img ref={imageRef} src={previewUrl} alt="ROI preview frame" />
+          ) : (
+            <div className="roi-placeholder">Load a frame to draw the ROI</div>
+          )}
+          {previewUrl ? (
+            <div className="roi-rectangle" style={roiStyle(roi)} onPointerDown={(event) => onOverlayPointerDown(event, "move")}>
+              {(["tl", "tr", "bl", "br"] as const).map((handle) => (
+                <button
+                  aria-label={`Resize ROI ${handle}`}
+                  className={`roi-handle ${handle}`}
+                  key={handle}
+                  onPointerDown={(event) => onOverlayPointerDown(event, "resize", handle)}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="roi-button-row">
+        <button className="secondary-button" onClick={() => onUpdateRoi(cameraIndex, originalConfig ? readRoi(originalConfig, cameraIndex) : DEFAULT_ROI)}>Reset ROI</button>
+        <button className="secondary-button" onClick={() => onUpdateRoi(cameraIndex, DEFAULT_ROI)}>Full Frame</button>
+        <button className="secondary-button" onClick={() => onUpdateValue([...roiPath, "enabled"], false)}>Clear ROI</button>
+        <button className="secondary-button" onClick={() => onUpdateRoi(cameraIndex, roi)}>Redraw</button>
+      </div>
+      <SettingGrid>
+        <NumberControl label={`${cameraId} x min`} value={roi.x_min_fraction} step={0.001} min={0} max={1} onChange={(value) => onUpdateRoi(cameraIndex, { ...roi, x_min_fraction: value })} />
+        <NumberControl label={`${cameraId} y min`} value={roi.y_min_fraction} step={0.001} min={0} max={1} onChange={(value) => onUpdateRoi(cameraIndex, { ...roi, y_min_fraction: value })} />
+        <NumberControl label={`${cameraId} x max`} value={roi.x_max_fraction} step={0.001} min={0} max={1} onChange={(value) => onUpdateRoi(cameraIndex, { ...roi, x_max_fraction: value })} />
+        <NumberControl label={`${cameraId} y max`} value={roi.y_max_fraction} step={0.001} min={0} max={1} onChange={(value) => onUpdateRoi(cameraIndex, { ...roi, y_max_fraction: value })} />
+      </SettingGrid>
+    </div>
   );
 }
 
@@ -629,8 +745,9 @@ function setPath(payload: PipelineConfig, path: Array<string | number>, value: u
   return root;
 }
 
-function readRoi(config: PipelineConfig | null): RoiRectangle {
-  const raw = getPath(config, ["tracking_roi", "rectangle"]);
+function readRoi(config: PipelineConfig | null, cameraIndex?: number): RoiRectangle {
+  const cameraRaw = typeof cameraIndex === "number" ? getPath(config, ["input", "cameras", cameraIndex, "tracking_roi", "rectangle"]) : undefined;
+  const raw = isRecord(cameraRaw) ? cameraRaw : getPath(config, ["tracking_roi", "rectangle"]);
   if (!isRecord(raw)) {
     return DEFAULT_ROI;
   }
@@ -744,6 +861,10 @@ function round6(value: number): number {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function formatCameraId(value: number): string {
+  return `CAM_${String(value).padStart(3, "0")}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

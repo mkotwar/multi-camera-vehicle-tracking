@@ -98,6 +98,69 @@ def test_config_service_rejects_invalid_roi_with_field_error(tmp_path: Path) -> 
     assert result["errors"][0]["path"] == "tracking_roi.rectangle.y_min_fraction"
 
 
+def test_config_service_preserves_five_cameras_and_camera_specific_roi(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    service = ConfigService(tmp_path)
+    config = service.load_config("validation_rectangle_roi.yaml")["config"]
+    config["input"]["cameras"] = [
+        {
+            "camera_id": f"CAM_{index:03d}",
+            "source_type": "video",
+            "source": str(tmp_path / f"source_{index}.mp4"),
+            "enabled": index <= 3,
+            "tracking_roi": {
+                "enabled": index % 2 == 1,
+                "mode": "rectangle",
+                "rectangle": {
+                    "x_min_fraction": 0.01 * index,
+                    "y_min_fraction": 0.10,
+                    "x_max_fraction": 0.80,
+                    "y_max_fraction": 0.90,
+                },
+                "anchor": "bottom_center",
+            },
+        }
+        for index in range(1, 6)
+    ]
+
+    result = service.save_config("validation_rectangle_roi.yaml", config)
+    reloaded = service.load_config("validation_rectangle_roi.yaml")["config"]
+
+    assert result["valid"] is True
+    assert [camera["camera_id"] for camera in reloaded["input"]["cameras"]] == ["CAM_001", "CAM_002", "CAM_003", "CAM_004", "CAM_005"]
+    assert reloaded["input"]["cameras"][2]["tracking_roi"]["rectangle"]["x_min_fraction"] == 0.03
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["input"]["cameras"][4]["camera_id"] == "CAM_005"
+
+
+def test_config_service_rejects_duplicate_camera_ids(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    service = ConfigService(tmp_path)
+    config = service.load_config("validation_rectangle_roi.yaml")["config"]
+    config["input"]["cameras"].append(dict(config["input"]["cameras"][0]))
+
+    result = service.validate_config("validation_rectangle_roi.yaml", config)
+
+    assert result["valid"] is False
+    assert any(error["path"] == "input.cameras.1.camera_id" for error in result["errors"])
+
+
+def test_config_service_rejects_invalid_camera_roi_with_camera_path(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    service = ConfigService(tmp_path)
+    config = service.load_config("validation_rectangle_roi.yaml")["config"]
+    config["input"]["cameras"][0]["tracking_roi"] = {
+        "enabled": True,
+        "mode": "rectangle",
+        "rectangle": {"x_min_fraction": 0.9, "y_min_fraction": 0.2, "x_max_fraction": 0.8, "y_max_fraction": 0.9},
+        "anchor": "bottom_center",
+    }
+
+    result = service.validate_config("validation_rectangle_roi.yaml", config)
+
+    assert result["valid"] is False
+    assert result["errors"][0]["path"] == "input.cameras.CAM_001.tracking_roi.rectangle.x_min_fraction"
+
+
 def test_config_service_rejects_plate_ocr_with_blank_detector_model_path(tmp_path: Path) -> None:
     _write_config(tmp_path)
     service = ConfigService(tmp_path)

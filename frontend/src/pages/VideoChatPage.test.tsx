@@ -696,7 +696,7 @@ describe("VideoChatPage", () => {
     );
 
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
-    expect(screen.getByLabelText("Video chat run")).toHaveValue("RUN_A");
+    expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]);
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "how many of those are visible for more than 2 seconds?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledTimes(1));
@@ -738,7 +738,7 @@ describe("VideoChatPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue("RUN_A"));
+    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "How many cars were there?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect((await screen.findAllByText("Run A had 8 cars.")).length).toBeGreaterThan(0);
@@ -790,7 +790,7 @@ describe("VideoChatPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue("RUN_A"));
+    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
     const history = screen.getByLabelText("Video analytics chat history");
     expect(within(history).getByText("First stored question")).toBeInTheDocument();
     expect(within(history).getAllByText("First stored answer").length).toBeGreaterThan(0);
@@ -915,5 +915,35 @@ describe("VideoChatPage", () => {
     expect(screen.getByText("TRACK_5")).toBeInTheDocument();
     expect(screen.getAllByText("WHITE").length).toBeGreaterThan(0);
     expect(screen.getByText("All 1 matching vehicles shown.")).toBeInTheDocument();
+  });
+
+  it("sends all selected runs to the backend", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
+    const selector = screen.getByLabelText("Video chat run") as HTMLSelectElement;
+    Array.from(selector.options).forEach((option) => {
+      option.selected = option.value === "RUN_A" || option.value === "RUN_B";
+    });
+    fireEvent.change(selector);
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "show cars across all selected runs" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledTimes(1));
+    expect(sendVideoChatMessage.mock.calls[0][0]).toMatchObject({
+      run_id: "RUN_A",
+      run_ids: ["RUN_A", "RUN_B"],
+      message: "show cars across all selected runs",
+    });
+    expect(screen.getAllByText("All selected runs").length).toBeGreaterThan(0);
   });
 });

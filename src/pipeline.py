@@ -256,11 +256,11 @@ def _validate_capture_zone_profile(profile: dict[str, Any], context: str) -> dic
     return normalized
 
 
-def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
+def _normalize_tracking_roi_config(raw_tracking_roi: Any, *, context: str = "tracking_roi") -> dict[str, Any]:
     if raw_tracking_roi is None:
         raw_tracking_roi = {}
     if not isinstance(raw_tracking_roi, dict):
-        raise ConfigurationError("tracking_roi must be a mapping.")
+        raise ConfigurationError(f"{context} must be a mapping.")
     mode = str(raw_tracking_roi.get("mode", "horizontal")).strip().lower() or "horizontal"
     normalized = {
         "enabled": bool(raw_tracking_roi.get("enabled", False)),
@@ -270,21 +270,21 @@ def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
         "anchor": str(raw_tracking_roi.get("anchor", "bottom_center")).strip() or "bottom_center",
     }
     if normalized["anchor"] != "bottom_center":
-        raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+        raise ConfigurationError(f"{context}.anchor must be bottom_center.")
     if normalized["mode"] not in {"horizontal", "rectangle"}:
-        raise ConfigurationError("tracking_roi.mode must be horizontal or rectangle.")
+        raise ConfigurationError(f"{context}.mode must be horizontal or rectangle.")
     if not 0.0 <= normalized["top_fraction"] < 1.0:
-        raise ConfigurationError("tracking_roi.top_fraction must satisfy 0 <= top_fraction < 1.")
+        raise ConfigurationError(f"{context}.top_fraction must satisfy 0 <= top_fraction < 1.")
     if not 0.0 <= normalized["bottom_fraction"] < 1.0:
-        raise ConfigurationError("tracking_roi.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
+        raise ConfigurationError(f"{context}.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
     if normalized["top_fraction"] + normalized["bottom_fraction"] >= 1.0:
-        raise ConfigurationError("tracking_roi top_fraction + bottom_fraction must be less than 1.")
+        raise ConfigurationError(f"{context} top_fraction + bottom_fraction must be less than 1.")
     normalized["bottom_limit_fraction"] = 1.0 - normalized["bottom_fraction"]
     rectangle = raw_tracking_roi.get("rectangle")
     if rectangle is None:
         rectangle = {}
     if not isinstance(rectangle, dict):
-        raise ConfigurationError("tracking_roi.rectangle must be a mapping.")
+        raise ConfigurationError(f"{context}.rectangle must be a mapping.")
     normalized_rectangle = {
         "x_min_fraction": float(rectangle.get("x_min_fraction", 0.0)),
         "y_min_fraction": float(rectangle.get("y_min_fraction", 0.0)),
@@ -293,11 +293,11 @@ def _normalize_tracking_roi_config(raw_tracking_roi: Any) -> dict[str, Any]:
     }
     if normalized["mode"] == "rectangle":
         if "rectangle" not in raw_tracking_roi:
-            raise ConfigurationError("tracking_roi.rectangle must be provided when mode=rectangle.")
+            raise ConfigurationError(f"{context}.rectangle must be provided when mode=rectangle.")
         if not 0.0 <= normalized_rectangle["x_min_fraction"] < normalized_rectangle["x_max_fraction"] <= 1.0:
-            raise ConfigurationError("tracking_roi.rectangle x fractions must satisfy 0 <= x_min_fraction < x_max_fraction <= 1.")
+            raise ConfigurationError(f"{context}.rectangle x fractions must satisfy 0 <= x_min_fraction < x_max_fraction <= 1.")
         if not 0.0 <= normalized_rectangle["y_min_fraction"] < normalized_rectangle["y_max_fraction"] <= 1.0:
-            raise ConfigurationError("tracking_roi.rectangle y fractions must satisfy 0 <= y_min_fraction < y_max_fraction <= 1.")
+            raise ConfigurationError(f"{context}.rectangle y fractions must satisfy 0 <= y_min_fraction < y_max_fraction <= 1.")
     normalized["rectangle"] = normalized_rectangle
     return normalized
 
@@ -406,7 +406,8 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
                 raise ConfigurationError(f"source is required for camera '{camera_id}'.")
             if source_type == "video":
                 normalized_source = str(Path(normalized_source).expanduser().resolve())
-        normalized_cameras.append(
+        normalized_camera = dict(camera)
+        normalized_camera.update(
             {
                 "camera_id": camera_id,
                 "source_type": source_type,
@@ -414,6 +415,12 @@ def _validate_config(raw_config: dict[str, Any], config_path: Path) -> dict[str,
                 "enabled": enabled,
             }
         )
+        if "tracking_roi" in camera and camera.get("tracking_roi") is not None:
+            normalized_camera["tracking_roi"] = _normalize_tracking_roi_config(
+                camera.get("tracking_roi"),
+                context=f"input.cameras.{camera_id}.tracking_roi",
+            )
+        normalized_cameras.append(normalized_camera)
         if enabled:
             enabled_count += 1
     if enabled_count < 1:

@@ -138,16 +138,23 @@ class ConfigService:
         camera_id: str,
         *,
         frame_number: int | None = None,
+        camera_config: dict[str, Any] | None = None,
     ) -> tuple[bytes, dict[str, str]]:
         path = self._resolve_config_path(config_name, must_exist=True)
         config = normalize_config_for_ui(self._read_yaml(path))
-        camera = self._camera_for_config(config, camera_id)
-        if not bool(camera.get("enabled", False)):
+        camera = dict(camera_config) if camera_config is not None else self._camera_for_config(config, camera_id)
+        if camera_config is None and not bool(camera.get("enabled", False)):
             raise ConfigServiceError(f"Camera is disabled: {camera_id}", status_code=400)
+        configured_camera_id = clean_config_string(camera.get("camera_id")) or camera_id
+        if configured_camera_id != camera_id:
+            raise ConfigServiceError(f"Preview camera_id mismatch: requested {camera_id}, got {configured_camera_id}.", status_code=400)
         source_type = str(camera.get("source_type") or "").strip().lower()
         if source_type != "video":
             raise ConfigServiceError(f"ROI preview supports video sources only; {camera_id} is {source_type or '<empty>'}.", status_code=400)
-        source_path = Path(clean_config_string(camera.get("source"))).expanduser()
+        raw_source = clean_config_string(camera.get("source"))
+        if not raw_source:
+            raise ConfigServiceError(f"Video source is required for {camera_id}.", status_code=400)
+        source_path = Path(raw_source).expanduser()
         if not source_path.is_absolute():
             source_path = (path.parent / source_path).resolve()
         else:
@@ -312,59 +319,27 @@ class ConfigService:
         return errors
 
     def _validate_roi(self, config: dict[str, Any]) -> list[ConfigValidationError]:
-        roi = config.get("tracking_roi")
-        if roi is None:
-            return []
-        if not isinstance(roi, dict):
-            return [ConfigValidationError("mapping", "tracking_roi", "tracking_roi must be a mapping.", "mapping", type(roi).__name__)]
-        mode = str(roi.get("mode", "horizontal")).strip().lower()
         errors: list[ConfigValidationError] = []
-        if mode not in {"horizontal", "rectangle"}:
-            errors.append(ConfigValidationError("enum", "tracking_roi.mode", "Must be horizontal or rectangle.", "horizontal|rectangle", roi.get("mode")))
-        if str(roi.get("anchor", "bottom_center")).strip() != "bottom_center":
-            errors.append(ConfigValidationError("enum", "tracking_roi.anchor", "Must be bottom_center.", "bottom_center", roi.get("anchor")))
-        if mode != "rectangle":
-            return errors
-        rectangle = roi.get("rectangle")
-        if not isinstance(rectangle, dict):
-            return [*errors, ConfigValidationError("mapping", "tracking_roi.rectangle", "Rectangle ROI settings are required.", "mapping", type(rectangle).__name__)]
-        names = ("x_min_fraction", "y_min_fraction", "x_max_fraction", "y_max_fraction")
-        values: dict[str, float] = {}
-        for name in names:
-            value = rectangle.get(name)
-            if not _is_number_between(value, 0.0, 1.0):
-                errors.append(
-                    ConfigValidationError(
-                        "roi.fraction",
-                        f"tracking_roi.rectangle.{name}",
-                        "Must be a number between 0.0 and 1.0.",
-                        "0.0 <= value <= 1.0",
-                        value,
-                    )
-                )
-            else:
-                values[name] = float(value)
-        if len(values) == 4:
-            if values["x_min_fraction"] >= values["x_max_fraction"]:
-                errors.append(
-                    ConfigValidationError(
-                        "roi.x_order",
-                        "tracking_roi.rectangle.x_min_fraction",
-                        "Must be less than x_max_fraction.",
-                        "< x_max_fraction",
-                        values["x_min_fraction"],
-                    )
-                )
-            if values["y_min_fraction"] >= values["y_max_fraction"]:
-                errors.append(
-                    ConfigValidationError(
-                        "roi.y_order",
-                        "tracking_roi.rectangle.y_min_fraction",
-                        "Must be less than y_max_fraction.",
-                        "< y_max_fraction",
-                        values["y_min_fraction"],
-                    )
-                )
+        roi = config.get("tracking_roi")
+        if roi is not None:
+            errors.extend(_validate_roi_payload(roi, "tracking_roi"))
+        cameras = dict(config.get("input", {}) or {}).get("cameras", [])
+        if isinstance(cameras, list):
+            seen_camera_ids: set[str] = set()
+            for index, camera in enumerate(cameras):
+                path_prefix = f"input.cameras.{index}"
+                if not isinstance(camera, dict):
+                    errors.append(ConfigValidationError("mapping", path_prefix, "Camera entry must be a mapping.", "mapping", type(camera).__name__))
+                    continue
+                camera_id = str(camera.get("camera_id", "")).strip()
+                camera_label = camera_id or f"index {index}"
+                if not camera_id:
+                    errors.append(ConfigValidationError("required", f"{path_prefix}.camera_id", "camera_id is required for every camera.", "non-empty string", camera.get("camera_id")))
+                elif camera_id in seen_camera_ids:
+                    errors.append(ConfigValidationError("unique", f"{path_prefix}.camera_id", f"Duplicate camera_id found: {camera_id}", "unique camera_id", camera_id))
+                seen_camera_ids.add(camera_id)
+                if "tracking_roi" in camera and camera.get("tracking_roi") is not None:
+                    errors.extend(_validate_roi_payload(camera.get("tracking_roi"), f"input.cameras.{camera_label}.tracking_roi"))
         return errors
 
     def _error_from_exception(self, exc: ConfigurationError) -> ConfigValidationError:
@@ -380,6 +355,60 @@ class ConfigService:
             warnings.append({"path": "vehicle_identity.stationary_recovery.enabled", "message": "Stationary recovery is experimental and should be validated on a new run."})
         warnings.append({"path": ".env", "message": "Secrets such as DATABASE_URL, passwords, tokens, and API keys are intentionally not editable here."})
         return warnings
+
+
+def _validate_roi_payload(roi: Any, path: str) -> list[ConfigValidationError]:
+    if not isinstance(roi, dict):
+        return [ConfigValidationError("mapping", path, f"{path} must be a mapping.", "mapping", type(roi).__name__)]
+    mode = str(roi.get("mode", "horizontal")).strip().lower()
+    errors: list[ConfigValidationError] = []
+    if mode not in {"horizontal", "rectangle"}:
+        errors.append(ConfigValidationError("enum", f"{path}.mode", "Must be horizontal or rectangle.", "horizontal|rectangle", roi.get("mode")))
+    if str(roi.get("anchor", "bottom_center")).strip() != "bottom_center":
+        errors.append(ConfigValidationError("enum", f"{path}.anchor", "Must be bottom_center.", "bottom_center", roi.get("anchor")))
+    if mode != "rectangle":
+        return errors
+    rectangle = roi.get("rectangle")
+    if not isinstance(rectangle, dict):
+        return [*errors, ConfigValidationError("mapping", f"{path}.rectangle", "Rectangle ROI settings are required.", "mapping", type(rectangle).__name__)]
+    names = ("x_min_fraction", "y_min_fraction", "x_max_fraction", "y_max_fraction")
+    values: dict[str, float] = {}
+    for name in names:
+        value = rectangle.get(name)
+        if not _is_number_between(value, 0.0, 1.0):
+            errors.append(
+                ConfigValidationError(
+                    "roi.fraction",
+                    f"{path}.rectangle.{name}",
+                    "Must be a number between 0.0 and 1.0.",
+                    "0.0 <= value <= 1.0",
+                    value,
+                )
+            )
+        else:
+            values[name] = float(value)
+    if len(values) == 4:
+        if values["x_min_fraction"] >= values["x_max_fraction"]:
+            errors.append(
+                ConfigValidationError(
+                    "roi.x_order",
+                    f"{path}.rectangle.x_min_fraction",
+                    "Must be less than x_max_fraction.",
+                    "< x_max_fraction",
+                    values["x_min_fraction"],
+                )
+            )
+        if values["y_min_fraction"] >= values["y_max_fraction"]:
+            errors.append(
+                ConfigValidationError(
+                    "roi.y_order",
+                    f"{path}.rectangle.y_min_fraction",
+                    "Must be less than y_max_fraction.",
+                    "< y_max_fraction",
+                    values["y_min_fraction"],
+                )
+            )
+    return errors
 
 
 def build_config_inventory(config: dict[str, Any]) -> list[dict[str, Any]]:

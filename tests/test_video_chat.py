@@ -8,7 +8,7 @@ import pytest
 
 from src.ollama_qwen_provider import OllamaQwenChatLLMProvider
 from src.run_repository import RunRepository
-from src.vehicle_analytics import load_vehicle_records_from_tracks_json
+from src.vehicle_analytics import VehicleRecord, load_vehicle_records_from_tracks_json
 from src.vehicle_nlp import VehicleQueryParseError
 from src.video_chat import execute_chat_vehicle_query, handle_video_chat, parse_chat_vehicle_query, parse_chat_vehicle_query_detailed
 
@@ -614,6 +614,205 @@ def test_video_chat_accepts_common_summary_typo() -> None:
 
     assert parser_used == "rule_based"
     assert parsed.intent == "SUMMARY"
+
+
+class _CameraScopeRepository:
+    def __init__(self, cameras_by_run: dict[str, list[str]]) -> None:
+        self.cameras_by_run = cameras_by_run
+
+    def list_cameras(self, *, run_id: str | None = None) -> list[dict]:
+        return [{"run_id": run_id, "camera_id": camera_id} for camera_id in self.cameras_by_run.get(str(run_id), [])]
+
+    def get_physical_vehicle(self, *, vehicle_id: str, run_id: str) -> dict | None:
+        return None
+
+    def get_track(self, *, camera_id: str, track_id: str, run_id: str) -> dict | None:
+        return {
+            "run_id": run_id,
+            "camera_id": camera_id,
+            "track_id": track_id,
+            "local_track_id": f"{camera_id}:{track_id}",
+            "vehicle_class": "CAR",
+            "colour": "WHITE",
+            "first_seen_seconds": 1.0,
+            "last_seen_seconds": 2.0,
+            "best_crop_parts": None,
+        }
+
+    def resolve_media_path(self, *, run_id: str, category: str, relative_parts: list[str]) -> Path | None:
+        return None
+
+
+def _record(run_id: str, camera_id: str, track_id: str, vehicle_class: str = "CAR", colour: str = "WHITE") -> VehicleRecord:
+    local_track_id = f"{camera_id}:{track_id}"
+    return VehicleRecord(
+        run_id=run_id,
+        vehicle_id=local_track_id,
+        local_track_id=local_track_id,
+        camera_id=camera_id,
+        vehicle_class=vehicle_class,
+        colour=colour,
+        first_seen_seconds=1.0,
+        last_seen_seconds=2.0,
+        observation_count=3,
+        status="COMPLETED",
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("show cars from CAM_001", ["CAM_001"]),
+        ("show cars from cam_001", ["CAM_001"]),
+        ("show cars from camera 1", ["CAM_001"]),
+        ("show cars from cam 1", ["CAM_001"]),
+        ("show cars from first camera", ["CAM_001"]),
+        ("show cars from camera one", ["CAM_001"]),
+        ("show bikes from second camera", ["CAM_002"]),
+        ("show vehicles from cameras 1 and 3", ["CAM_001", "CAM_003"]),
+        ("show vehicles from all cameras", []),
+    ],
+)
+def test_video_chat_camera_reference_normalization(message: str, expected: list[str]) -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002", "CAM_003"]})
+    response = handle_video_chat(
+        message=message,
+        run_id="RUN_A",
+        records=[
+            _record("RUN_A", "CAM_001", "TRACK_1", "CAR"),
+            _record("RUN_A", "CAM_002", "TRACK_2", "MOTORCYCLE"),
+            _record("RUN_A", "CAM_003", "TRACK_3", "CAR"),
+        ],
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["include_camera_ids"] == expected
+
+
+def test_video_chat_arbitrary_camera_and_invalid_camera_scope() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_005"]})
+    response = handle_video_chat(
+        message="show vehicles from camera 5",
+        run_id="RUN_A",
+        records=[_record("RUN_A", "CAM_005", "TRACK_5")],
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["include_camera_ids"] == ["CAM_005"]
+    assert response["analytics_result"]["total"] == 1
+    with pytest.raises(VehicleQueryParseError, match="CAM_004 is not present in this run"):
+        handle_video_chat(
+            message="show vehicles from camera 4",
+            run_id="RUN_A",
+            records=[_record("RUN_A", "CAM_005", "TRACK_5")],
+            repository=repository,  # type: ignore[arg-type]
+            llm_provider=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected"),
+    [
+        ("2 wheeler", "MOTORCYCLE"),
+        ("2-wheeler", "MOTORCYCLE"),
+        ("two wheeler", "MOTORCYCLE"),
+        ("bike", "MOTORCYCLE"),
+        ("motorbike", "MOTORCYCLE"),
+        ("3 wheeler", "3WHEELER"),
+        ("auto rickshaw", "3WHEELER"),
+    ],
+)
+def test_video_chat_class_aliases_normalize_to_canonical_classes(phrase: str, expected: str) -> None:
+    parsed, _ = parse_chat_vehicle_query(message=f"show {phrase}", context={}, llm_provider=None)
+
+    assert parsed.include_classes == [expected]
+
+
+def test_video_chat_negative_bike_alias_normalizes_to_exclusion() -> None:
+    parsed, _ = parse_chat_vehicle_query(message="show everything except bikes", context={}, llm_provider=None)
+
+    assert parsed.exclude_classes == ["MOTORCYCLE"]
+
+
+def test_video_chat_multi_run_keeps_same_track_id_distinct_and_groups() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_003"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_7", "MOTORCYCLE", "BLACK"),
+    ]
+
+    all_runs = handle_video_chat(
+        message="show white cars across all selected runs",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    by_camera = handle_video_chat(
+        message="count vehicles by camera",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    second_run = handle_video_chat(
+        message="show vehicles from the second selected run",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert all_runs["analytics_result"]["total"] == 2
+    assert set(all_runs["matching_vehicle_ids"]) == {"RUN_A::CAM_001:TRACK_1", "RUN_B::CAM_001:TRACK_1"}
+    assert by_camera["parsed_query"]["group_by"] == "camera"
+    assert by_camera["analytics_result"]["by_camera"] == {"CAM_001": 2, "CAM_003": 1}
+    assert second_run["parsed_query"]["selected_run_ids"] == ["RUN_B"]
+    assert second_run["analytics_result"]["total"] == 2
+
+
+def test_video_chat_multi_run_camera_scope_allows_camera_where_present() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_003"]})
+    response = handle_video_chat(
+        message="show vehicles from camera 3",
+        run_ids=["RUN_A", "RUN_B"],
+        records=[_record("RUN_A", "CAM_001", "TRACK_1"), _record("RUN_B", "CAM_003", "TRACK_3")],
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["include_camera_ids"] == ["CAM_003"]
+    assert response["analytics_result"]["total"] == 1
+
+
+def test_video_chat_follow_up_preserves_camera_and_run_scope() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_002"]})
+    records = [
+        _record("RUN_A", "CAM_002", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_002", "TRACK_2", "CAR", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_3", "CAR", "BLACK"),
+    ]
+    first = handle_video_chat(
+        message="show white cars from camera 2",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    follow_up = handle_video_chat(
+        message="only the black ones",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context=first["next_context"],
+        llm_provider=None,
+    )
+
+    assert follow_up["parsed_query"]["include_camera_ids"] == ["CAM_002"]
+    assert follow_up["parsed_query"]["selected_run_ids"] == ["RUN_A", "RUN_B"]
 
 
 def test_semantic_query_evaluation_fixture_final_plans() -> None:

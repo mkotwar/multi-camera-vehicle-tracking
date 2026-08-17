@@ -6,10 +6,11 @@ import { TrackDetailPanel, type TrackSelection } from "../components/track/Track
 import type { RunSummary } from "../types/run";
 import type { ChatMessage, EvidencePage, VideoChatResponse, VehicleEvidence } from "../types/videoChat";
 import {
-  getOrCreateVideoChatSessionForRun,
+  getOrCreateVideoChatSessionForRunIds,
+  loadActiveVideoChatRunIds,
   loadActiveVideoChatRunId,
-  replaceVideoChatSessionForRun,
-  saveActiveVideoChatRunId,
+  replaceVideoChatSessionForRunIds,
+  saveActiveVideoChatRunIds,
   saveVideoChatSessionForRun,
 } from "../utils/videoChatPersistence";
 import { formatVideoTime } from "../utils/time";
@@ -22,9 +23,10 @@ const PROMPT_SUGGESTIONS = [
 ];
 
 export function VideoChatPage() {
-  const [chatSession, setChatSession] = useState(() => getOrCreateVideoChatSessionForRun(loadActiveVideoChatRunId() ?? "latest"));
+  const initialRunIds = loadActiveVideoChatRunIds() ?? [loadActiveVideoChatRunId() ?? "latest"];
+  const [chatSession, setChatSession] = useState(() => getOrCreateVideoChatSessionForRunIds(initialRunIds));
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [runId, setRunId] = useState(chatSession.run_id);
+  const [runIds, setRunIds] = useState<string[]>(chatSession.run_ids?.length ? chatSession.run_ids : [chatSession.run_id]);
   const [messages, setMessages] = useState<ChatMessage[]>(chatSession.messages);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -38,8 +40,8 @@ export function VideoChatPage() {
     void fetchRuns()
       .then((items) => {
         setRuns(items);
-        if (items[0]?.run_id && messages.length === 0 && chatSession.run_id === "latest") {
-          loadRunSession(items[0].run_id);
+        if (items[0]?.run_id && messages.length === 0 && runIds.includes("latest")) {
+          loadRunSession([items[0].run_id]);
         }
       })
       .catch(() => setRuns([]));
@@ -51,7 +53,8 @@ export function VideoChatPage() {
     }
   }, [messages, isSending, userIsReading]);
 
-  const selectedRun = useMemo(() => runs.find((item) => item.run_id === runId), [runId, runs]);
+  const selectedRuns = useMemo(() => runIds.map((runId) => runs.find((item) => item.run_id === runId)).filter(Boolean) as RunSummary[], [runIds, runs]);
+  const selectedRun = selectedRuns.length === 1 ? selectedRuns[0] : undefined;
   const latestAssistantMessage = useMemo(() => [...messages].reverse().find((message) => message.role === "assistant"), [messages]);
 
   const handleScroll = () => {
@@ -72,7 +75,7 @@ export function VideoChatPage() {
     setError(null);
     setIsSending(true);
     try {
-      const response = await sendVideoChatMessage({ message: text, run_id: runId, session_id: sessionId });
+      const response = await sendVideoChatMessage({ message: text, run_id: runIds[0], run_ids: runIds, session_id: sessionId });
       persistMessages((current) => [...current, responseToMessage(response)]);
     } catch (chatError) {
       setError(describeChatError(chatError));
@@ -93,10 +96,10 @@ export function VideoChatPage() {
     setSelectedTrack(track);
   };
 
-  const startNewChat = (nextRunId = runId) => {
-    const nextSession = replaceVideoChatSessionForRun(nextRunId);
+  const startNewChat = (nextRunIds = runIds) => {
+    const nextSession = replaceVideoChatSessionForRunIds(nextRunIds);
     setChatSession(nextSession);
-    setRunId(nextRunId);
+    setRunIds(nextRunIds);
     setMessages([]);
     setSelectedTrack(null);
     setInput("");
@@ -104,19 +107,20 @@ export function VideoChatPage() {
     setUserIsReading(false);
   };
 
-  const changeRun = (nextRunId: string) => {
-    loadRunSession(nextRunId);
+  const changeRuns = (nextRunIds: string[]) => {
+    loadRunSession(nextRunIds);
   };
 
-  function loadRunSession(nextRunId: string) {
-    const nextSession = getOrCreateVideoChatSessionForRun(nextRunId);
+  function loadRunSession(nextRunIds: string[]) {
+    const cleaned = nextRunIds.length ? nextRunIds : ["latest"];
+    const nextSession = getOrCreateVideoChatSessionForRunIds(cleaned);
     setChatSession(nextSession);
-    setRunId(nextRunId);
+    setRunIds(cleaned);
     setMessages(nextSession.messages);
     setSelectedTrack(null);
     setError(null);
     setUserIsReading(false);
-    saveActiveVideoChatRunId(nextRunId);
+    saveActiveVideoChatRunIds(cleaned);
     if (nextSession.messages.length === 0) {
       saveVideoChatSessionForRun(nextSession);
     }
@@ -125,7 +129,7 @@ export function VideoChatPage() {
   function persistMessages(updater: (current: ChatMessage[]) => ChatMessage[]) {
     setMessages((current) => {
       const nextMessages = updater(current);
-      const nextSession = { ...chatSession, run_id: runId, messages: nextMessages };
+      const nextSession = { ...chatSession, run_id: runIds[0], run_ids: runIds, messages: nextMessages };
       setChatSession(nextSession);
       saveVideoChatSessionForRun(nextSession);
       return nextMessages;
@@ -133,10 +137,10 @@ export function VideoChatPage() {
   }
 
   const runBadges = [
-    { label: "Run", value: selectedRun?.run_id ?? runId },
-    { label: "Cameras", value: selectedRun?.camera_count ?? "Any" },
-    { label: "Duration", value: selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Saved run" },
-    { label: "Vehicles", value: selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable" },
+    { label: "Run", value: selectedRuns.length > 1 ? `${selectedRuns.length} selected` : selectedRun?.run_id ?? runIds[0] },
+    { label: "Cameras", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.camera_count ?? 0), 0) : "Any" },
+    { label: "Duration", value: selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : selectedRuns.length > 1 ? "Multiple runs" : "Saved run" },
+    { label: "Vehicles", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.physical_vehicle_count ?? run.track_count ?? 0), 0) : "Unavailable" },
   ];
 
   return (
@@ -164,8 +168,16 @@ export function VideoChatPage() {
         <section className="chat-panel" aria-label="Video analytics assistant">
           <div className="chat-panel-toolbar">
             <label>
-              <span>Run / video</span>
-              <select value={runId} onChange={(event) => changeRun(event.target.value)} aria-label="Video chat run">
+              <span>Runs / videos</span>
+              <select
+                multiple
+                value={runIds}
+                onChange={(event) => {
+                  const values = Array.from(event.target.selectedOptions).map((option) => option.value);
+                  changeRuns(values.length ? values : [event.target.value]);
+                }}
+                aria-label="Video chat run"
+              >
                 {runs.length === 0 ? <option value="latest">Latest</option> : null}
                 {runs.map((run) => (
                   <option key={run.run_id} value={run.run_id}>
@@ -174,7 +186,7 @@ export function VideoChatPage() {
                 ))}
               </select>
             </label>
-            <span className="status status-completed">{selectedRun?.status ?? "Latest"}</span>
+            <span className="status status-completed">{selectedRuns.length > 1 ? "All selected runs" : selectedRun?.status ?? "Latest"}</span>
             <button type="button" className="secondary-button compact-action" onClick={() => startNewChat()}>
               New Chat
             </button>
@@ -208,7 +220,9 @@ export function VideoChatPage() {
 
         <VideoContextPanel
           selectedRun={selectedRun}
-          runId={runId}
+          runId={runIds[0]}
+          selectedRunIds={runIds}
+          selectedRuns={selectedRuns}
           latestMessage={latestAssistantMessage}
           selectedTrack={selectedTrack}
         />
@@ -432,10 +446,13 @@ function EvidenceGrid({
             )}
             <div className="evidence-card-body">
               <strong>{item.vehicle_id}</strong>
+              <span className="evidence-seen">Run: {item.run_id ?? runId ?? "Unknown"}</span>
+              <span className="evidence-seen">Camera: {item.camera_id}</span>
               <div className="evidence-badge-row">
                 <span>{item.vehicle_class}</span>
                 <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
               </div>
+              <span className="evidence-seen">Track: {displayTrack}</span>
               <span className="evidence-seen">{displayTrack}</span>
               <span className={`evidence-plate ${item.plate_text ? "readable" : ""}`}>Plate: {plateText}</span>
               <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
@@ -516,11 +533,15 @@ function ChatComposer({
 function VideoContextPanel({
   selectedRun,
   runId,
+  selectedRunIds,
+  selectedRuns,
   latestMessage,
   selectedTrack,
 }: {
   selectedRun?: RunSummary;
   runId: string;
+  selectedRunIds: string[];
+  selectedRuns: RunSummary[];
   latestMessage?: ChatMessage;
   selectedTrack: TrackSelection | null;
 }) {
@@ -529,6 +550,7 @@ function VideoContextPanel({
         ...latestMessage.debug.parsed_query.include_classes,
         ...latestMessage.debug.parsed_query.include_colours,
         latestMessage.debug.parsed_query.camera_id,
+        ...(latestMessage.debug.parsed_query.include_camera_ids ?? []),
       ].filter(Boolean)
     : [];
   const matches = latestMessage?.debug?.matching_vehicle_ids.length ?? latestMessage?.evidence_page?.matching_total ?? 0;
@@ -545,9 +567,10 @@ function VideoContextPanel({
             <h2>Current Video</h2>
             <dl className="context-list">
               <div><dt>Run</dt><dd>{selectedRun?.run_id ?? runId}</dd></div>
-              <div><dt>Status</dt><dd>{selectedRun?.status ?? "Latest"}</dd></div>
+              <div><dt>Scope</dt><dd>{selectedRunIds.length > 1 ? "All selected runs" : selectedRun?.run_id ?? runId}</dd></div>
+              <div><dt>Status</dt><dd>{selectedRunIds.length > 1 ? `${selectedRunIds.length} runs` : selectedRun?.status ?? "Latest"}</dd></div>
               <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Unavailable"}</dd></div>
-              <div><dt>Completed vehicles</dt><dd>{selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable"}</dd></div>
+              <div><dt>Completed vehicles</dt><dd>{selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.physical_vehicle_count ?? run.track_count ?? 0), 0) : selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable"}</dd></div>
               {selectedRun?.raw_track_count != null && selectedRun.raw_track_count !== (selectedRun.physical_vehicle_count ?? selectedRun.track_count) ? (
                 <div><dt>Raw tracks</dt><dd>{selectedRun.raw_track_count}</dd></div>
               ) : null}
@@ -584,6 +607,7 @@ function VideoContextPanel({
 }
 
 function runIdFromEvidence(item: VehicleEvidence): string | null {
+  if (item.run_id) return item.run_id;
   try {
     const url = new URL(item.track_detail_url, "http://local");
     return url.searchParams.get("run_id");

@@ -157,8 +157,12 @@ def _config(
     tracking_backend: str = "supervision_bytetrack",
     image_size: int | None = None,
     tracking_roi: dict | None = None,
+    cameras: list[dict] | None = None,
 ) -> dict:
     config = {
+        "input": {
+            "cameras": cameras or [],
+        },
         "detection": {
             "backend": detection_backend,
             "model_path": model_path,
@@ -201,6 +205,7 @@ def _build_tracker(
     tracking_backend: str = "supervision_bytetrack",
     image_size: int | None = None,
     tracking_roi: dict | None = None,
+    cameras: list[dict] | None = None,
 ):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"x")
@@ -223,6 +228,7 @@ def _build_tracker(
             tracking_backend=tracking_backend,
             image_size=image_size,
             tracking_roi=tracking_roi,
+            cameras=cameras,
         ),
         _logger(),
         model_loader=lambda _: model,
@@ -609,6 +615,65 @@ def test_rectangle_tracking_roi_preserves_original_bbox(tmp_path: Path) -> None:
     result = detector_tracker.process_frame(_frame_packet(width=800, height=720))
     assert result.detections[0].bbox_xyxy == pytest.approx(bbox)
     assert created_trackers[0].calls[0].xyxy.tolist() == [bbox]
+
+
+def test_camera_specific_tracking_roi_is_resolved_by_camera_id(tmp_path: Path) -> None:
+    detector_tracker, model, created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_rectangle_roi_config(rectangle={"x_min_fraction": 0.0, "y_min_fraction": 0.0, "x_max_fraction": 1.0, "y_max_fraction": 1.0}),
+        cameras=[
+            {
+                "camera_id": "CAM_001",
+                "tracking_roi": _rectangle_roi_config(rectangle={"x_min_fraction": 0.0, "y_min_fraction": 0.0, "x_max_fraction": 0.5, "y_max_fraction": 1.0}),
+            },
+            {
+                "camera_id": "CAM_002",
+                "tracking_roi": _rectangle_roi_config(rectangle={"x_min_fraction": 0.5, "y_min_fraction": 0.0, "x_max_fraction": 1.0, "y_max_fraction": 1.0}),
+            },
+        ],
+    )
+    model.next_result = FakeResult(xyxy=[[600, 100, 700, 200]], cls=[0], conf=[0.9])
+    cam_001 = detector_tracker.process_frame(_frame_packet(camera_id="CAM_001", width=1000, height=500))
+    model.next_result = FakeResult(xyxy=[[600, 100, 700, 200]], cls=[0], conf=[0.9])
+    cam_002 = detector_tracker.process_frame(_frame_packet(camera_id="CAM_002", frame_number=1, width=1000, height=500))
+
+    assert len(cam_001.detections) == 0
+    assert len(cam_002.detections) == 1
+    assert len(created_trackers[0].calls[0].xyxy) == 0
+    assert len(created_trackers[1].calls[0].xyxy) == 1
+
+
+def test_camera_roi_disabled_does_not_disable_other_camera_roi(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_rectangle_roi_config(rectangle={"x_min_fraction": 0.0, "y_min_fraction": 0.0, "x_max_fraction": 1.0, "y_max_fraction": 1.0}),
+        cameras=[
+            {"camera_id": "CAM_001", "tracking_roi": _rectangle_roi_config(enabled=False)},
+            {"camera_id": "CAM_002", "tracking_roi": _rectangle_roi_config(rectangle={"x_min_fraction": 0.0, "y_min_fraction": 0.0, "x_max_fraction": 0.5, "y_max_fraction": 1.0})},
+        ],
+    )
+    model.next_result = FakeResult(xyxy=[[600, 100, 700, 200]], cls=[0], conf=[0.9])
+    cam_001 = detector_tracker.process_frame(_frame_packet(camera_id="CAM_001", width=1000, height=500))
+    model.next_result = FakeResult(xyxy=[[600, 100, 700, 200]], cls=[0], conf=[0.9])
+    cam_002 = detector_tracker.process_frame(_frame_packet(camera_id="CAM_002", frame_number=1, width=1000, height=500))
+
+    assert len(cam_001.detections) == 1
+    assert len(cam_002.detections) == 0
+
+
+def test_global_tracking_roi_fallback_still_applies_without_camera_roi(tmp_path: Path) -> None:
+    detector_tracker, model, _created_trackers = _build_tracker(
+        tmp_path,
+        bbox_quality=_bbox_quality_config(minimum_width_pixels=5, minimum_height_pixels=5, minimum_area_ratio=0.0, reject_edge_truncated=False),
+        tracking_roi=_rectangle_roi_config(rectangle={"x_min_fraction": 0.0, "y_min_fraction": 0.0, "x_max_fraction": 0.5, "y_max_fraction": 1.0}),
+        cameras=[{"camera_id": "CAM_003"}],
+    )
+    model.next_result = FakeResult(xyxy=[[600, 100, 700, 200]], cls=[0], conf=[0.9])
+    result = detector_tracker.process_frame(_frame_packet(camera_id="CAM_003", width=1000, height=500))
+
+    assert len(result.detections) == 0
 
 
 def test_tracking_roi_without_mode_keeps_horizontal_semantics(tmp_path: Path) -> None:

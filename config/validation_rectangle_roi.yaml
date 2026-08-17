@@ -8,10 +8,34 @@ input:
     source_type: video
     source: D:/old_files/vinfocom/WhatsApp Video 2026-08-13 at 18.20.26.mp4
     enabled: true
+    tracking_roi:
+      enabled: true
   - camera_id: CAM_002
     source_type: video
-    source: D:\old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4
-    enabled: false
+    source: D:/old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4
+    enabled: true
+    tracking_roi:
+      enabled: true
+      mode: rectangle
+      anchor: bottom_center
+      rectangle:
+        x_min_fraction: 0.063188
+        y_min_fraction: 0.59875
+        x_max_fraction: 0.968462
+        y_max_fraction: 0.754355
+  - camera_id: CAM_003
+    source_type: video
+    source: D:/old_files/vinfocom/Raw2.mp4
+    enabled: true
+    tracking_roi:
+      enabled: true
+      mode: rectangle
+      rectangle:
+        x_min_fraction: 0.101652
+        y_min_fraction: 0.533497
+        x_max_fraction: 0.868015
+        y_max_fraction: 0.690179
+      anchor: bottom_center
   max_frames_per_camera: null
 ingestion:
   worker_count: 3

@@ -31,11 +31,17 @@ class VehicleSearchRequest(BaseModel):
 class VideoChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     run_id: str | None = "latest"
+    run_ids: list[str] | None = None
     session_id: str | None = None
 
 
 class ConfigPayloadRequest(BaseModel):
     config: dict[str, Any]
+
+
+class ConfigRoiPreviewRequest(BaseModel):
+    camera: dict[str, Any]
+    frame_number: int | None = None
 
 
 class ConfigCloneRequest(BaseModel):
@@ -420,23 +426,38 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
 
     @app.post("/api/video-chat")
     def video_chat(request: VideoChatRequest) -> dict[str, Any]:
-        resolved_run_id = repository.resolve_run_id(request.run_id)
-        if resolved_run_id is None:
+        requested_run_ids = request.run_ids if request.run_ids else [request.run_id]
+        resolved_run_ids: list[str] = []
+        for requested_run_id in requested_run_ids:
+            resolved = repository.resolve_run_id(requested_run_id)
+            if resolved is None:
+                raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": f"Run not found: {requested_run_id}"})
+            if resolved not in resolved_run_ids:
+                resolved_run_ids.append(resolved)
+        if not resolved_run_ids:
             raise HTTPException(status_code=404, detail={"error": "run_not_found", "detail": "Run not found"})
-        tracks_path = repository.tracks_json_path(resolved_run_id)
-        if tracks_path is not None and not tracks_path.exists():
+        missing_tracks = [
+            resolved_run_id
+            for resolved_run_id in resolved_run_ids
+            if (repository.tracks_json_path(resolved_run_id) is not None and not repository.tracks_json_path(resolved_run_id).exists())
+        ]
+        if missing_tracks:
             raise HTTPException(
                 status_code=500,
-                detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {resolved_run_id}"},
+                detail={"error": "tracks_json_missing", "detail": f"tracks.json not found for run {missing_tracks[0]}"},
             )
         session_id = str(request.session_id or "default").strip() or "default"
         context = chat_sessions.get(session_id, {})
+        records = []
+        for resolved_run_id in resolved_run_ids:
+            records.extend(repository.list_vehicle_records(run_id=resolved_run_id))
         try:
             payload = handle_video_chat(
                 message=request.message,
-                run_id=resolved_run_id,
+                run_id=resolved_run_ids[0],
+                run_ids=resolved_run_ids,
                 repository=repository,
-                records=repository.list_vehicle_records(run_id=resolved_run_id),
+                records=records,
                 session_context=context,
                 llm_provider=chat_llm_provider,
             )
@@ -445,7 +466,7 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
         except ValueError as exc:
             raise HTTPException(status_code=500, detail={"error": "video_chat_failed", "detail": str(exc)}) from exc
         chat_sessions[session_id] = dict(payload.pop("next_context", {}) or {})
-        return {"run_id": resolved_run_id, "session_id": session_id, **payload}
+        return {"run_id": resolved_run_ids[0], "run_ids": resolved_run_ids, "session_id": session_id, **payload}
 
     @app.get("/api/filter-options")
     def get_filter_options(run_id: str | None = None) -> dict[str, Any]:
@@ -494,6 +515,19 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
     @app.get("/api/configs/{config_name}/roi-preview")
     def get_config_roi_preview(config_name: str, camera_id: str, frame_number: int | None = Query(default=None)) -> Any:
         frame_bytes, headers = config_service.read_roi_preview_frame(config_name, camera_id, frame_number=frame_number)
+        return Response(content=frame_bytes, media_type="image/jpeg", headers=headers)
+
+    @app.post("/api/configs/{config_name}/roi-preview")
+    def post_config_roi_preview(config_name: str, request: ConfigRoiPreviewRequest) -> Any:
+        camera_id = str(request.camera.get("camera_id") or "").strip()
+        if not camera_id:
+            raise HTTPException(status_code=400, detail="camera.camera_id is required")
+        frame_bytes, headers = config_service.read_roi_preview_frame(
+            config_name,
+            camera_id,
+            frame_number=request.frame_number,
+            camera_config=request.camera,
+        )
         return Response(content=frame_bytes, media_type="image/jpeg", headers=headers)
 
     @app.get("/api/runtime-settings/db-auto-import")

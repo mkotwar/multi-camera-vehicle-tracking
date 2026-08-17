@@ -2,6 +2,7 @@ export type ChatRole = "user" | "assistant";
 
 export type VehicleEvidence = {
   vehicle_id: string;
+  run_id?: string;
   camera_id: string;
   track_id: string;
   member_track_ids?: string[];
@@ -17,6 +18,9 @@ export type VehicleEvidence = {
 
 export type ChatVehicleQuery = {
   intent: string;
+  selected_run_ids?: string[];
+  include_camera_ids?: string[];
+  exclude_camera_ids?: string[];
   include_classes: string[];
   exclude_classes: string[];
   include_colours: string[];
@@ -44,11 +48,13 @@ export type EvidencePage = {
 export type VideoChatRequest = {
   message: string;
   run_id?: string;
+  run_ids?: string[];
   session_id: string;
 };
 
 export type VideoChatResponse = {
   run_id: string;
+  run_ids?: string[];
   session_id: string;
   original_query: string;
   answer: string;
@@ -91,6 +97,7 @@ export type PersistedVideoChatSession = {
   version: 1;
   session_id: string;
   run_id: string;
+  run_ids?: string[];
   created_at: string;
   updated_at: string;
   messages: ChatMessage[];

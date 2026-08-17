@@ -27,6 +27,7 @@ class VehicleRecord:
     status: str
     member_track_ids: tuple[str, ...] = ()
     plate_text: str | None = None
+    run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,9 +52,11 @@ def vehicle_records_from_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRec
         local_track_id = str(track.get("local_track_id") or "").strip()
         if not local_track_id:
             continue
-        if local_track_id in seen_completed_ids:
+        run_id = str(track.get("run_id") or "").strip() or None
+        unique_key = f"{run_id or ''}\0{local_track_id}"
+        if unique_key in seen_completed_ids:
             raise ValueError(f"Duplicate completed local_track_id: {local_track_id}")
-        seen_completed_ids.add(local_track_id)
+        seen_completed_ids.add(unique_key)
         records.append(
             VehicleRecord(
                 vehicle_id=local_track_id,
@@ -66,6 +69,7 @@ def vehicle_records_from_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRec
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
                 plate_text=_extract_track_plate_text(track),
+                run_id=run_id,
             )
         )
     return records
@@ -82,9 +86,11 @@ def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list
         local_track_id = str(track.get("local_track_id") or "").strip()
         if not local_track_id:
             continue
-        if local_track_id in seen_completed_ids:
+        run_id = str(track.get("run_id") or "").strip() or None
+        unique_key = f"{run_id or ''}\0{local_track_id}"
+        if unique_key in seen_completed_ids:
             raise ValueError(f"Duplicate completed local_track_id: {local_track_id}")
-        seen_completed_ids.add(local_track_id)
+        seen_completed_ids.add(unique_key)
         records.append(
             VehicleRecord(
                 vehicle_id=local_track_id,
@@ -97,6 +103,7 @@ def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
                 plate_text=str(track.get("plate_text") or "").strip().upper() or None,
+                run_id=run_id,
             )
         )
     return records
@@ -109,9 +116,11 @@ def vehicle_records_from_physical_vehicles(vehicles: list[dict[str, Any]]) -> li
         if not isinstance(vehicle, dict):
             continue
         vehicle_id = str(vehicle.get("vehicle_id") or vehicle.get("vehicle_key") or "").strip()
-        if not vehicle_id or vehicle_id in seen_ids:
+        run_id = str(vehicle.get("run_id") or "").strip() or None
+        unique_key = f"{run_id or ''}\0{vehicle_id}"
+        if not vehicle_id or unique_key in seen_ids:
             continue
-        seen_ids.add(vehicle_id)
+        seen_ids.add(unique_key)
         member_track_ids = tuple(str(item) for item in list(vehicle.get("member_track_ids") or vehicle.get("member_tracks") or []) if item)
         records.append(
             VehicleRecord(
@@ -126,6 +135,7 @@ def vehicle_records_from_physical_vehicles(vehicles: list[dict[str, Any]]) -> li
                 status=str(vehicle.get("identity_status") or "PHYSICAL_VEHICLE"),
                 member_track_ids=member_track_ids,
                 plate_text=str(vehicle.get("consensus_plate_text") or "") or None,
+                run_id=run_id,
             )
         )
     return records

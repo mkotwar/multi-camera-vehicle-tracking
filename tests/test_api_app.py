@@ -528,6 +528,50 @@ def test_api_video_chat_count_multi_class_colour_and_time_queries(tmp_path: Path
     assert len(time_response.json()["evidence"]) == 5
 
 
+def test_api_video_chat_accepts_multi_run_scope_and_keeps_track_ids_distinct(tmp_path: Path) -> None:
+    for run_id, colour in [("RUN_A", "WHITE"), ("RUN_B", "WHITE")]:
+        run_dir = tmp_path / run_id
+        _write_json(run_dir / "summary.json", {"run_id": run_id, "status": "COMPLETED", "configured_camera_count": 1})
+        _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 1})
+        _write_json(
+            run_dir / "tracks.json",
+            [
+                {
+                    "run_id": run_id,
+                    "local_track_id": "CAM_001:TRACK_1",
+                    "camera_id": "CAM_001",
+                    "status": "COMPLETED",
+                    "first_timestamp_seconds": 1.0,
+                    "last_timestamp_seconds": 2.0,
+                    "observation_count": 4,
+                    "final_class": "car",
+                }
+            ],
+        )
+        _write_json(
+            run_dir / "vehicle_enrichment.json",
+            [
+                {
+                    "local_track_id": "CAM_001:TRACK_1",
+                    "camera_id": "CAM_001",
+                    "vehicle_class": "CAR",
+                    "vehicle_colour": {"label": colour, "status": "completed"},
+                    "status": "completed",
+                }
+            ],
+        )
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    response = client.post("/api/video-chat", json={"message": "show white cars across all selected runs", "run_ids": ["RUN_A", "RUN_B"], "session_id": "multi-run"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_ids"] == ["RUN_A", "RUN_B"]
+    assert payload["analytics_result"]["total"] == 2
+    assert set(payload["matching_vehicle_ids"]) == {"RUN_A::CAM_001:TRACK_1", "RUN_B::CAM_001:TRACK_1"}
+    assert {item["run_id"] for item in payload["evidence"]} == {"RUN_A", "RUN_B"}
+
+
 def test_api_video_chat_unknown_vehicle_filters_unknown_class(tmp_path: Path) -> None:
     run_id = _build_vehicle_search_run(tmp_path)
     client = TestClient(create_app(outputs_root=tmp_path))

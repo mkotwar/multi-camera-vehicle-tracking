@@ -488,6 +488,46 @@ def test_validate_config_accepts_rectangle_tracking_roi_and_preserves_effective_
     }
 
 
+@pytest.mark.parametrize("camera_count", [1, 2, 3, 5])
+def test_validate_config_accepts_dynamic_camera_counts_with_camera_roi(tmp_path: Path, camera_count: int) -> None:
+    video_path = _create_test_video(tmp_path / "sample.mp4", frame_count=2)
+    model_path = tmp_path / "model.pt"
+    model_path.write_bytes(b"x")
+    config_path = tmp_path / f"config_{camera_count}_cameras.yaml"
+    cameras = [
+        {
+            "camera_id": f"CAM_{index:03d}",
+            "source_type": "video",
+            "source": str(video_path),
+            "enabled": True,
+            "tracking_roi": {
+                "enabled": index % 2 == 1,
+                "mode": "rectangle",
+                "rectangle": {
+                    "x_min_fraction": 0.01 * index,
+                    "y_min_fraction": 0.20,
+                    "x_max_fraction": 0.90,
+                    "y_max_fraction": 0.80,
+                },
+                "anchor": "bottom_center",
+            },
+        }
+        for index in range(1, camera_count + 1)
+    ]
+    _write_config(
+        config_path,
+        cameras=cameras,
+        output_root=str(tmp_path / "runs"),
+        model_path=str(model_path),
+        max_frames_per_camera=2,
+    )
+
+    validated = _validate_config(_load_raw_config(config_path), config_path)
+
+    assert [camera["camera_id"] for camera in validated["input"]["cameras"]] == [f"CAM_{index:03d}" for index in range(1, camera_count + 1)]
+    assert validated["input"]["cameras"][-1]["tracking_roi"]["rectangle"]["x_min_fraction"] == pytest.approx(0.01 * camera_count)
+
+
 @pytest.mark.parametrize(
     "tracking_roi",
     [

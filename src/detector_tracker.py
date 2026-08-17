@@ -198,6 +198,17 @@ class VehicleDetectorTracker:
         self.capture_zone_visualization_enabled = bool(dict(visualization_config.get("capture_zone", {}) or {}).get("enabled", False))
         self.capture_zone_config = dict(dict(self.config.get("evidence", {}) or {}).get("capture_zone", {}) or {})
         self.tracking_roi = self._parse_tracking_roi_config(dict(self.config.get("tracking_roi", {}) or {}))
+        self._camera_tracking_roi: dict[str, TrackingROIConfig] = {}
+        for camera in list(dict(self.config.get("input", {}) or {}).get("cameras", []) or []):
+            if not isinstance(camera, dict):
+                continue
+            camera_id = str(camera.get("camera_id", "")).strip()
+            if not camera_id or "tracking_roi" not in camera or camera.get("tracking_roi") is None:
+                continue
+            self._camera_tracking_roi[camera_id] = self._parse_tracking_roi_config(
+                dict(camera.get("tracking_roi", {}) or {}),
+                context=f"input.cameras.{camera_id}.tracking_roi",
+            )
         self._model_loader = model_loader or YOLO
         self._tracker_factory = tracker_factory or self._create_tracker
         self._model: Any | None = None
@@ -542,28 +553,30 @@ class VehicleDetectorTracker:
         return accepted_detections, diagnostics
 
     def filter_detections_by_tracking_roi(self, packet: FramePacket, detections: list[Detection]) -> list[Detection]:
-        if not self.tracking_roi.enabled:
+        tracking_roi = self._tracking_roi_for_camera(packet.camera_id)
+        if not tracking_roi.enabled:
             return list(detections)
         return [detection for detection in detections if self.is_detection_inside_tracking_roi(packet, detection)]
 
     def is_detection_inside_tracking_roi(self, packet: FramePacket, detection: Detection) -> bool:
-        if not self.tracking_roi.enabled:
+        tracking_roi = self._tracking_roi_for_camera(packet.camera_id)
+        if not tracking_roi.enabled:
             return True
-        if self.tracking_roi.anchor != "bottom_center":
+        if tracking_roi.anchor != "bottom_center":
             raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
         frame_width = int(packet.source_frame_width or packet.frame.shape[1])
         frame_height = int(packet.source_frame_height or packet.frame.shape[0])
         x1, _y1, x2, y2 = detection.bbox_xyxy
         anchor_x = (float(x1) + float(x2)) / 2.0
         anchor_y = float(y2)
-        if self.tracking_roi.mode == "rectangle":
-            roi_x_min = frame_width * self.tracking_roi.x_min_fraction
-            roi_x_max = frame_width * self.tracking_roi.x_max_fraction
-            roi_y_min = frame_height * self.tracking_roi.y_min_fraction
-            roi_y_max = frame_height * self.tracking_roi.y_max_fraction
+        if tracking_roi.mode == "rectangle":
+            roi_x_min = frame_width * tracking_roi.x_min_fraction
+            roi_x_max = frame_width * tracking_roi.x_max_fraction
+            roi_y_min = frame_height * tracking_roi.y_min_fraction
+            roi_y_max = frame_height * tracking_roi.y_max_fraction
             return roi_x_min <= anchor_x <= roi_x_max and roi_y_min <= anchor_y <= roi_y_max
-        roi_top = int(frame_height * self.tracking_roi.top_fraction)
-        roi_bottom = int(frame_height * self.tracking_roi.bottom_limit_fraction)
+        roi_top = int(frame_height * tracking_roi.top_fraction)
+        roi_bottom = int(frame_height * tracking_roi.bottom_limit_fraction)
         return float(roi_top) <= anchor_y <= float(roi_bottom)
 
     def track_detections(self, packet: FramePacket, detections: list[Detection], raw_result: Any | None = None) -> list[TrackedDetection]:
@@ -651,7 +664,7 @@ class VehicleDetectorTracker:
 
     def annotate_tracked_frame(self, frame: np.ndarray, camera_id: str, tracked_detections: list[TrackedDetection]) -> np.ndarray:
         annotated = frame.copy()
-        self._draw_tracking_roi_overlay(annotated)
+        self._draw_tracking_roi_overlay(annotated, camera_id)
         self._draw_capture_zone_overlay(annotated, camera_id, tracked_detections)
         for tracked in tracked_detections:
             x1, y1, x2, y2 = [int(round(value)) for value in tracked.bbox_xyxy]
@@ -683,30 +696,31 @@ class VehicleDetectorTracker:
             trigger_y = int(round(tracked.bbox_xyxy[3]))
             cv2.circle(frame, (trigger_x, trigger_y), 4, (0, 90, 255), -1)
 
-    def _draw_tracking_roi_overlay(self, frame: np.ndarray) -> None:
-        if not self.tracking_roi.enabled:
+    def _draw_tracking_roi_overlay(self, frame: np.ndarray, camera_id: str) -> None:
+        tracking_roi = self._tracking_roi_for_camera(camera_id)
+        if not tracking_roi.enabled:
             return
         height, width = frame.shape[:2]
-        if self.tracking_roi.mode == "rectangle":
-            x_min = int(round(width * self.tracking_roi.x_min_fraction))
-            y_min = int(round(height * self.tracking_roi.y_min_fraction))
-            x_max = int(round(width * self.tracking_roi.x_max_fraction))
-            y_max = int(round(height * self.tracking_roi.y_max_fraction))
+        if tracking_roi.mode == "rectangle":
+            x_min = int(round(width * tracking_roi.x_min_fraction))
+            y_min = int(round(height * tracking_roi.y_min_fraction))
+            x_max = int(round(width * tracking_roi.x_max_fraction))
+            y_max = int(round(height * tracking_roi.y_max_fraction))
             overlay = frame.copy()
             cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), (60, 180, 255), -1)
             cv2.addWeighted(overlay, 0.08, frame, 0.92, 0.0, frame)
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (60, 180, 255), 2)
             cv2.putText(frame, "TRACKING ROI", (x_min + 8, max(24, y_min - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
             return
-        roi_top = int(height * self.tracking_roi.top_fraction)
-        roi_bottom = int(height * self.tracking_roi.bottom_limit_fraction)
+        roi_top = int(height * tracking_roi.top_fraction)
+        roi_bottom = int(height * tracking_roi.bottom_limit_fraction)
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, roi_top), (width - 1, roi_bottom), (60, 180, 255), -1)
         cv2.addWeighted(overlay, 0.08, frame, 0.92, 0.0, frame)
         cv2.line(frame, (0, roi_top), (width - 1, roi_top), (60, 180, 255), 2)
         cv2.line(frame, (0, roi_bottom), (width - 1, roi_bottom), (60, 180, 255), 2)
-        cv2.putText(frame, f"ROI START - {self.tracking_roi.top_fraction:.0%}", (12, max(24, roi_top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
-        cv2.putText(frame, f"ROI END - {self.tracking_roi.bottom_limit_fraction:.0%}", (12, min(height - 8, roi_bottom + 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
+        cv2.putText(frame, f"ROI START - {tracking_roi.top_fraction:.0%}", (12, max(24, roi_top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
+        cv2.putText(frame, f"ROI END - {tracking_roi.bottom_limit_fraction:.0%}", (12, min(height - 8, roi_bottom + 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 180, 255), 2)
 
     def build_detected_label(self, detection: Detection) -> str:
         return f"{self._normalize_class_name(detection.class_name).upper()} {detection.confidence:.2f}"
@@ -756,23 +770,26 @@ class VehicleDetectorTracker:
             self.bbox_quality_enabled,
         )
 
+    def _tracking_roi_for_camera(self, camera_id: str) -> TrackingROIConfig:
+        return self._camera_tracking_roi.get(str(camera_id), self.tracking_roi)
+
     @staticmethod
-    def _parse_tracking_roi_config(payload: dict[str, Any]) -> TrackingROIConfig:
+    def _parse_tracking_roi_config(payload: dict[str, Any], *, context: str = "tracking_roi") -> TrackingROIConfig:
         enabled = bool(payload.get("enabled", False))
         mode = str(payload.get("mode", "horizontal")).strip().lower() or "horizontal"
         top_fraction = float(payload.get("top_fraction", 0.0))
         bottom_fraction = float(payload.get("bottom_fraction", 0.0))
         anchor = str(payload.get("anchor", "bottom_center")).strip() or "bottom_center"
         if anchor != "bottom_center":
-            raise ConfigurationError("tracking_roi.anchor must be bottom_center.")
+            raise ConfigurationError(f"{context}.anchor must be bottom_center.")
         if mode not in {"horizontal", "rectangle"}:
-            raise ConfigurationError("tracking_roi.mode must be horizontal or rectangle.")
+            raise ConfigurationError(f"{context}.mode must be horizontal or rectangle.")
         if not 0.0 <= top_fraction < 1.0:
-            raise ConfigurationError("tracking_roi.top_fraction must satisfy 0 <= top_fraction < 1.")
+            raise ConfigurationError(f"{context}.top_fraction must satisfy 0 <= top_fraction < 1.")
         if not 0.0 <= bottom_fraction < 1.0:
-            raise ConfigurationError("tracking_roi.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
+            raise ConfigurationError(f"{context}.bottom_fraction must satisfy 0 <= bottom_fraction < 1.")
         if top_fraction + bottom_fraction >= 1.0:
-            raise ConfigurationError("tracking_roi top_fraction + bottom_fraction must be less than 1.")
+            raise ConfigurationError(f"{context} top_fraction + bottom_fraction must be less than 1.")
         rectangle = dict(payload.get("rectangle", {}) or {})
         x_min_fraction = float(rectangle.get("x_min_fraction", 0.0))
         y_min_fraction = float(rectangle.get("y_min_fraction", 0.0))
@@ -780,11 +797,11 @@ class VehicleDetectorTracker:
         y_max_fraction = float(rectangle.get("y_max_fraction", 1.0))
         if mode == "rectangle":
             if "rectangle" not in payload or not isinstance(payload.get("rectangle"), dict):
-                raise ConfigurationError("tracking_roi.rectangle must be provided when mode=rectangle.")
+                raise ConfigurationError(f"{context}.rectangle must be provided when mode=rectangle.")
             if not 0.0 <= x_min_fraction < x_max_fraction <= 1.0:
-                raise ConfigurationError("tracking_roi.rectangle x fractions must satisfy 0 <= x_min_fraction < x_max_fraction <= 1.")
+                raise ConfigurationError(f"{context}.rectangle x fractions must satisfy 0 <= x_min_fraction < x_max_fraction <= 1.")
             if not 0.0 <= y_min_fraction < y_max_fraction <= 1.0:
-                raise ConfigurationError("tracking_roi.rectangle y fractions must satisfy 0 <= y_min_fraction < y_max_fraction <= 1.")
+                raise ConfigurationError(f"{context}.rectangle y fractions must satisfy 0 <= y_min_fraction < y_max_fraction <= 1.")
         return TrackingROIConfig(
             enabled=enabled,
             mode=mode,

@@ -25,3 +25,7 @@ export function cloneConfig(configName: string, newName: string, config: Pipelin
 export function roiPreviewUrl(configName: string, cameraId: string): string {
   return apiUrl(`/api/configs/${encodeURIComponent(configName)}/roi-preview?camera_id=${encodeURIComponent(cameraId)}`);
 }
+
+export function roiPreviewDraftUrl(configName: string): string {
+  return apiUrl(`/api/configs/${encodeURIComponent(configName)}/roi-preview`);
+}

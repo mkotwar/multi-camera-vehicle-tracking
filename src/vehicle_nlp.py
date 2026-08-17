@@ -16,10 +16,10 @@ from .vehicle_analytics import (
 SUPPORTED_INTENTS = {"COUNT", "LIST", "SUMMARY", "UNIQUE_CLASSES", "UNIQUE_COLOURS"}
 
 CLASS_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "MOTORCYCLE": ("motorcycle", "motorcycles", "motorbike", "motorbikes", "bike", "bikes", "two wheeler", "two wheelers", "two-wheeler", "two-wheelers"),
-    "3WHEELER": ("three wheeler", "three wheelers", "three-wheeler", "three-wheelers", "3wheeler", "3wheelers", "auto-rickshaw", "auto-rickshaws", "auto rickshaw", "auto rickshaws", "rickshaw", "rickshaws", "auto", "autos"),
-    "CAR": ("car", "cars"),
-    "TRUCK": ("truck", "trucks"),
+    "MOTORCYCLE": ("motorcycle", "motorcycles", "motor cycle", "motor cycles", "motorbike", "motorbikes", "bike", "bikes", "two wheeler", "two wheelers", "two-wheeler", "two-wheelers", "2 wheeler", "2 wheelers", "2-wheeler", "2-wheelers", "2wheeler", "2wheelers"),
+    "3WHEELER": ("three wheeler", "three wheelers", "three-wheeler", "three-wheelers", "3 wheeler", "3 wheelers", "3-wheeler", "3-wheelers", "3wheeler", "3wheelers", "auto-rickshaw", "auto-rickshaws", "auto rickshaw", "auto rickshaws", "autorickshaw", "autorickshaws", "rickshaw", "rickshaws", "auto", "autos"),
+    "CAR": ("car", "cars", "automobile", "automobiles", "sedan", "sedans"),
+    "TRUCK": ("truck", "trucks", "lorry", "lorries"),
     "BUS": ("bus", "buses"),
     "UNKNOWN": ("unknown vehicle", "unknown vehicles", "unknown class", "unknown classes", "unclassified vehicle", "unclassified vehicles"),
 }
