@@ -55,6 +55,7 @@ class _PhysicalEvidenceRepository:
                 "vehicle_class": "CAR",
                 "vehicle_colour": "WHITE",
                 "primary_camera_id": "CAM_001",
+                "consensus_plate_text": "MP09AB1234",
                 "first_seen_seconds": 1.0,
                 "last_seen_seconds": 9.0,
                 "member_track_ids": ["CAM_001:TRACK_11", "CAM_001:TRACK_22"],
@@ -93,6 +94,7 @@ class _PhysicalEvidenceRepository:
                 "local_track_id": "CAM_001:TRACK_22",
                 "vehicle_class": "CAR",
                 "colour": "WHITE",
+                "plate_text": "DL8CAF5030",
                 "first_seen_seconds": 2.0,
                 "last_seen_seconds": 8.0,
                 "best_crop_parts": {
@@ -100,6 +102,19 @@ class _PhysicalEvidenceRepository:
                     "run_id": run_id,
                     "parts": ["CAM_001", "TRACK_22", "frame_000022_MIDDLE.jpg"],
                 },
+            }
+        if camera_id == "CAM_001" and track_id == "TRACK_33":
+            return {
+                "run_id": run_id,
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "local_track_id": "CAM_001:TRACK_33",
+                "vehicle_class": "MOTORCYCLE",
+                "colour": "BLACK",
+                "plate_text": "MH12XY9876",
+                "first_seen_seconds": 10.0,
+                "last_seen_seconds": 12.0,
+                "best_crop_parts": None,
             }
         return None
 
@@ -587,8 +602,11 @@ def test_video_chat_physical_vehicle_show_them_resolves_member_track_evidence(tm
     assert response["answer"] == "2 vehicles were observed. Showing 2 of 2."
     assert response["evidence"][0]["vehicle_id"] == "VEHICLE_001"
     assert response["evidence"][0]["member_track_ids"] == ["CAM_001:TRACK_11", "CAM_001:TRACK_22"]
+    assert response["evidence"][0]["plate_text"] == "MP09AB1234"
     assert response["evidence"][0]["best_crop_url"] == f"/api/media/florence_selected_crops/{run_id}/CAM_001/TRACK_22/frame_000022_MIDDLE.jpg"
     assert response["evidence"][0]["image_url"] == response["evidence"][0]["best_crop_url"]
+    assert response["evidence"][1]["vehicle_id"] == "VEHICLE_002"
+    assert response["evidence"][1]["plate_text"] == "MH12XY9876"
 
 
 def test_video_chat_accepts_common_summary_typo() -> None:

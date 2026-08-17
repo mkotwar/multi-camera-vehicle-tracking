@@ -294,8 +294,10 @@ class VehicleDetectorTracker:
     def process_frames(self, packets: list[FramePacket]) -> list[DetectorTrackerResult]:
         if not packets:
             return []
+        self._synchronize_cuda_for_timing()
         started_at = time.perf_counter()
         raw_results = self._infer_raw_results_batch(packets)
+        self._synchronize_cuda_for_timing()
         batch_inference_time_ms = (time.perf_counter() - started_at) * 1000.0
         batch_size = len(packets)
         per_frame_inference_time_ms = batch_inference_time_ms / float(batch_size)
@@ -313,8 +315,10 @@ class VehicleDetectorTracker:
             self._metrics["bbox_quality_accepted_detections"] += len(accepted_detections)
             self._metrics["roi_eligible_detections"] += len(roi_eligible_detections)
             self._metrics["roi_filtered_detections"] += roi_filtered_detection_count
+            self._synchronize_cuda_for_timing()
             tracker_started_at = time.perf_counter()
             tracked_detections = self.track_detections(packet, roi_eligible_detections, raw_result=raw_result)
+            self._synchronize_cuda_for_timing()
             tracker_update_ms = (time.perf_counter() - tracker_started_at) * 1000.0
             self._metrics["inference_times_ms"].append(per_frame_inference_time_ms)
             self._metrics["preprocess_times_ms"].append(stage_timings["preprocess_ms"])
@@ -417,6 +421,10 @@ class VehicleDetectorTracker:
         self._metrics["yolo_frames_processed"] += batch_size
         self._metrics["yolo_inference_time_total_ms"] += float(batch_inference_time_ms)
         self._metrics["yolo_inference_time_per_batch_ms"].append(float(batch_inference_time_ms))
+
+    def _synchronize_cuda_for_timing(self) -> None:
+        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
 
     def _infer_raw_results_batch(self, packets: list[FramePacket]) -> list[Any]:
         if not packets:

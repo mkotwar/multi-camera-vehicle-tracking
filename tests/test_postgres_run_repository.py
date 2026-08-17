@@ -235,6 +235,7 @@ def test_postgres_repository_completed_analytics_semantics(tmp_path: Path) -> No
     assert count_by_class(records)["CAR"] == 1
     assert count_by_colour(records)["WHITE"] == 1
     assert count_by_colour(records)["BLACK"] == 1
+    assert records[0].plate_text == "DL8CAF5030"
 
 
 def test_postgres_repository_uses_physical_vehicle_counts_and_records_when_available(tmp_path: Path) -> None:
@@ -285,6 +286,7 @@ def test_postgres_repository_uses_physical_vehicle_counts_and_records_when_avail
     assert len(records) == 1
     assert records[0].vehicle_id == "VEHICLE_001"
     assert records[0].member_track_ids == ("CAM_001:TRACK_5", "CAM_001:TRACK_6")
+    assert records[0].plate_text is None
 
 
 def test_postgres_repository_connection_failure_is_clear(tmp_path: Path) -> None:

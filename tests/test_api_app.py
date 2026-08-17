@@ -180,6 +180,8 @@ def _build_physical_vehicle_run(tmp_path: Path) -> str:
                 "camera_id": "CAM_001",
                 "vehicle_class": "MOTORCYCLE",
                 "vehicle_colour": {"label": "BLACK", "status": "completed"},
+                "plate_text": "MH12XY9876",
+                "plate_detected": True,
                 "evidence_used": [{"vehicle_crop_path": str(fallback_crop), "selected_for_colour": True}],
                 "selected_crop_paths": [str(fallback_crop)],
                 "status": "completed",
@@ -195,6 +197,7 @@ def _build_physical_vehicle_run(tmp_path: Path) -> str:
                     "vehicle_key": "VEHICLE_001",
                     "vehicle_class": "CAR",
                     "vehicle_colour": "WHITE",
+                    "consensus_plate_text": "MP09AB1234",
                     "first_seen_seconds": 1.0,
                     "last_seen_seconds": 4.0,
                     "member_track_ids": ["CAM_001:TRACK_1", "CAM_001:TRACK_2"],
@@ -386,7 +389,9 @@ def test_api_app_physical_vehicle_counts_and_video_chat_evidence(tmp_path: Path)
     assert payload["answer"] == "2 vehicles were observed. Showing 2 of 2."
     evidence_by_id = {item["vehicle_id"]: item for item in payload["evidence"]}
     assert evidence_by_id["VEHICLE_001"]["member_track_ids"] == ["CAM_001:TRACK_1", "CAM_001:TRACK_2"]
+    assert evidence_by_id["VEHICLE_001"]["plate_text"] == "MP09AB1234"
     assert evidence_by_id["VEHICLE_001"]["best_crop_url"].startswith(f"/api/media/evidence/{run_id}/")
+    assert evidence_by_id["VEHICLE_002"]["plate_text"] == "MH12XY9876"
     assert evidence_by_id["VEHICLE_002"]["best_crop_url"].startswith(f"/api/media/florence_selected_crops/{run_id}/")
 
 

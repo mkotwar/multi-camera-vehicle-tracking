@@ -7,6 +7,7 @@ export type VehicleEvidence = {
   member_track_ids?: string[];
   vehicle_class: string;
   colour: string;
+  plate_text?: string | null;
   first_seen_seconds?: number | null;
   last_seen_seconds?: number | null;
   best_crop_url?: string | null;

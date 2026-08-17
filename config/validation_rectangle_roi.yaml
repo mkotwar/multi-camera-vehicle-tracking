@@ -6,11 +6,11 @@ input:
   cameras:
   - camera_id: CAM_001
     source_type: video
-    source: D:/old_files/vinfocom/Raw2.mp4
+    source: D:/old_files/vinfocom/WhatsApp Video 2026-08-13 at 18.20.26.mp4
     enabled: true
   - camera_id: CAM_002
     source_type: video
-    source: D:/old_files/vinfocom/traffic_far_video/test_traffic_4min.mp4
+    source: D:\old_files/vinfocom/traffic_far_video/fa_traff_1min.mp4
     enabled: false
   max_frames_per_camera: null
 ingestion:
@@ -65,10 +65,10 @@ tracking_roi:
   enabled: true
   mode: rectangle
   rectangle:
-    x_min_fraction: 0
-    y_min_fraction: 0.544884
-    x_max_fraction: 0.91904
-    y_max_fraction: 0.817806
+    x_min_fraction: 0.397657
+    y_min_fraction: 0.59875
+    x_max_fraction: 0.86435
+    y_max_fraction: 0.754355
   anchor: bottom_center
 vehicle_identity:
   enabled: true
@@ -127,11 +127,11 @@ visualization:
   detected_frames:
     enabled: true
     save_every_n_frames: 1
-    max_saved_frames_per_camera: 600
+    max_saved_frames_per_camera: 20000
   tracked_frames:
     enabled: true
     save_every_n_frames: 1
-    max_saved_frames_per_camera: 600
+    max_saved_frames_per_camera: 20000
 output:
   root_directory: ../outputs/runs
   save_run_config: true
@@ -264,9 +264,9 @@ vehicle_enrichment:
         run_only_when_plate_detected: false
         florence:
           enabled: true
-          base_model_id: "D:/project/models/Florence-2-base-ft"
-          processor_path: "D:/project/models/Florence-2-base-ft"
-          adapter_path: "D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT"
+          base_model_id: D:/project/models/Florence-2-base-ft
+          processor_path: D:/project/models/Florence-2-base-ft
+          adapter_path: D:/project/models/OCR_MUKUL/OCR_MUKUL/adaptor_florance_baseFT
           adapter_enabled: true
           device: auto
           dtype: auto

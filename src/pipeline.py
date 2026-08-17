@@ -13,6 +13,7 @@ import shutil
 from typing import Any
 
 import numpy as np
+import torch
 import yaml
 
 from .detector_tracker import VehicleDetectorTracker
@@ -37,6 +38,9 @@ from .track_manager import TrackManager
 from .tracking_fix_experiment import RuntimeTrackingFixExperiment
 from .vehicle_identity import build_physical_vehicle_identity_for_run, normalize_vehicle_identity_config
 from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enrichment_config
+
+
+LATENCY_PROFILER_WARMUP_FRAMES = 20
 
 
 def _normalize_bbox_quality_section(raw_bbox_quality: Any) -> dict[str, Any]:
@@ -134,6 +138,83 @@ def _build_distribution_stats(values: list[float]) -> dict[str, float]:
         "p95": float(np.percentile(array, 95)),
         "max": float(array.max()),
     }
+
+
+class _FrameLatencyProfiler:
+    def __init__(self, *, warmup_frames: int = LATENCY_PROFILER_WARMUP_FRAMES) -> None:
+        self.warmup_frames = max(0, int(warmup_frames))
+        self._records: list[dict[str, float]] = []
+
+    @property
+    def records(self) -> list[dict[str, float]]:
+        return list(self._records)
+
+    def record(
+        self,
+        *,
+        frame_index: int,
+        camera_id: str,
+        frame_number: int,
+        read_ms: float,
+        yolo_ms: float,
+        tracking_ms: float,
+        enrichment_ms: float,
+        logger: Any,
+    ) -> None:
+        if frame_index <= self.warmup_frames:
+            return
+        total_ms = float(read_ms + yolo_ms + tracking_ms + enrichment_ms)
+        self._records.append(
+            {
+                "frame_index": float(frame_index),
+                "frame_number": float(frame_number),
+                "read_ms": float(read_ms),
+                "yolo_ms": float(yolo_ms),
+                "tracking_ms": float(tracking_ms),
+                "enrichment_ms": float(enrichment_ms),
+                "total_ms": total_ms,
+            }
+        )
+        logger.info(
+            "camera=%s frame=%s read=%.1fms yolo=%.1fms tracking=%.1fms enrichment=%.1fms total=%.1fms",
+            camera_id,
+            frame_number,
+            read_ms,
+            yolo_ms,
+            tracking_ms,
+            enrichment_ms,
+            total_ms,
+        )
+
+    def summary(self) -> dict[str, Any]:
+        if not self._records:
+            return {
+                "warmup_frames_ignored": self.warmup_frames,
+                "profiled_frames": 0,
+                "effective_fps": 0.0,
+                "read_latency_ms": _build_distribution_stats([]),
+                "yolo_latency_ms": _build_distribution_stats([]),
+                "tracking_latency_ms": _build_distribution_stats([]),
+                "enrichment_latency_ms": _build_distribution_stats([]),
+                "total_latency_ms": _build_distribution_stats([]),
+            }
+        total_values = [record["total_ms"] for record in self._records]
+        total_seconds = float(sum(total_values) / 1000.0)
+        return {
+            "warmup_frames_ignored": self.warmup_frames,
+            "profiled_frames": len(self._records),
+            "effective_fps": float(len(self._records) / total_seconds) if total_seconds > 0.0 else 0.0,
+            "read_latency_ms": _build_distribution_stats([record["read_ms"] for record in self._records]),
+            "yolo_latency_ms": _build_distribution_stats([record["yolo_ms"] for record in self._records]),
+            "tracking_latency_ms": _build_distribution_stats([record["tracking_ms"] for record in self._records]),
+            "enrichment_latency_ms": _build_distribution_stats([record["enrichment_ms"] for record in self._records]),
+            "total_latency_ms": _build_distribution_stats(total_values),
+        }
+
+
+def _synchronize_cuda_for_timing(device_name: str | None = None) -> None:
+    if torch.cuda.is_available() and (device_name is None or str(device_name).startswith("cuda")):
+        torch.cuda.synchronize()
 
 
 def _build_runtime_local_track_id(camera_id: str, tracker_namespace: str, native_tracker_id: int) -> str:
@@ -948,6 +1029,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         detection_latency_ms: list[float] = []
         frame_order_violations = 0
         last_processed_frame_by_camera: dict[str, int] = {}
+        frame_latency_profiler = _FrameLatencyProfiler()
 
         while True:
             try:
@@ -1015,10 +1097,27 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 for tracked_item in result.tracked_detections:
                     unique_native_track_ids_by_camera[packet.camera_id].add(tracked_item.tracker_id)
                 evidence_collector.register_frame(packet, result.tracked_detections)
+                track_manager_started_at = time.perf_counter()
                 completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
+                track_manager_update_ms = (time.perf_counter() - track_manager_started_at) * 1000.0
                 lifecycle_completed_tracks.extend(completed_now)
                 finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
-                enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
+                _synchronize_cuda_for_timing()
+                enrichment_started_at = time.perf_counter()
+                enrichment_now = vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now)
+                _synchronize_cuda_for_timing()
+                enrichment_ms = (time.perf_counter() - enrichment_started_at) * 1000.0
+                enrichment_results.extend(enrichment_now)
+                frame_latency_profiler.record(
+                    frame_index=int(metadata.processed_frames),
+                    camera_id=str(packet.camera_id),
+                    frame_number=int(packet.frame_number),
+                    read_ms=float(getattr(packet, "read_latency_ms", 0.0) or 0.0),
+                    yolo_ms=float(getattr(result, "total_detection_ms", 0.0) or 0.0),
+                    tracking_ms=float(getattr(result, "tracker_update_ms", 0.0) or 0.0) + track_manager_update_ms,
+                    enrichment_ms=enrichment_ms,
+                    logger=logger,
+                )
                 runtime_detection_rows: list[dict[str, Any]] = []
                 for tracked_item in result.tracked_detections:
                     local_track_id = _build_runtime_local_track_id(packet.camera_id, tracked_item.tracker_namespace, int(tracked_item.tracker_id))
@@ -1181,6 +1280,21 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
         result_conversion_stage_time_ms = float(sum(result_conversion_times)) if result_conversion_times else 0.0
         result_routing_stage_time_ms = float(sum(result_routing_times)) if result_routing_times else 0.0
         tracker_update_stage_time_ms = float(sum(tracker_update_times)) if tracker_update_times else 0.0
+        frame_latency_profile = frame_latency_profiler.summary()
+        logger.info(
+            "Frame latency profile warmup_frames=%s profiled_frames=%s effective_fps=%.2f read_avg=%.1fms yolo_avg=%.1fms tracking_avg=%.1fms enrichment_avg=%.1fms total_avg=%.1fms total_p50=%.1fms total_p95=%.1fms total_max=%.1fms",
+            frame_latency_profile["warmup_frames_ignored"],
+            frame_latency_profile["profiled_frames"],
+            frame_latency_profile["effective_fps"],
+            frame_latency_profile["read_latency_ms"]["mean"],
+            frame_latency_profile["yolo_latency_ms"]["mean"],
+            frame_latency_profile["tracking_latency_ms"]["mean"],
+            frame_latency_profile["enrichment_latency_ms"]["mean"],
+            frame_latency_profile["total_latency_ms"]["mean"],
+            frame_latency_profile["total_latency_ms"]["p50"],
+            frame_latency_profile["total_latency_ms"]["p95"],
+            frame_latency_profile["total_latency_ms"]["max"],
+        )
         detection_tracking_metrics = {
             "detection_backend": validated_config["detection"]["backend"],
             "tracking_backend": validated_config["tracking"]["backend"],
@@ -1272,6 +1386,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             "detection_latency_ms_p50": float(np.percentile(np.asarray(detection_latency_ms, dtype=np.float64), 50)) if detection_latency_ms else 0.0,
             "detection_latency_ms_p95": float(np.percentile(np.asarray(detection_latency_ms, dtype=np.float64), 95)) if detection_latency_ms else 0.0,
             "detection_latency_ms_max": float(max(detection_latency_ms)) if detection_latency_ms else 0.0,
+            "frame_latency_profile": frame_latency_profile,
             "frame_order_violations": frame_order_violations,
             "gpu_memory_allocated_mb": tracker_metrics.get("gpu_memory_allocated_mb"),
             "gpu_memory_reserved_mb": tracker_metrics.get("gpu_memory_reserved_mb"),

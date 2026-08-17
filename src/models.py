@@ -54,6 +54,7 @@ class FramePacket:
     worker_id: int
     captured_at: str
     source_type: str
+    read_latency_ms: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)

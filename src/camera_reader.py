@@ -86,7 +86,9 @@ class VideoCameraReader:
         if self._ended:
             return None
         self._throttle_if_needed()
+        read_started_at = time.perf_counter()
         ok, frame = self._capture.read()
+        read_latency_ms = (time.perf_counter() - read_started_at) * 1000.0
         if not ok:
             self._ended = True
             return None
@@ -109,6 +111,7 @@ class VideoCameraReader:
             worker_id=int(worker_id),
             captured_at=captured_at,
             source_type=self.source_type,
+            read_latency_ms=read_latency_ms,
         )
 
     def close(self) -> None:

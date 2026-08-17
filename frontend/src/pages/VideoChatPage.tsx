@@ -417,6 +417,7 @@ function EvidenceGrid({
         const imageUrl = item.best_crop_url ?? item.image_url;
         const memberTracks = item.member_track_ids ?? [];
         const displayTrack = memberTracks.length > 1 ? `${memberTracks.length} tracklets` : item.track_id;
+        const plateText = item.plate_text?.trim() || "Not detected";
         const isSelected =
           selectedTrack?.cameraId === item.camera_id &&
           selectedTrack?.trackId === item.track_id &&
@@ -436,6 +437,7 @@ function EvidenceGrid({
                 <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
               </div>
               <span className="evidence-seen">{displayTrack}</span>
+              <span className={`evidence-plate ${item.plate_text ? "readable" : ""}`}>Plate: {plateText}</span>
               <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
               {onSelectTrack ? (
                 <button

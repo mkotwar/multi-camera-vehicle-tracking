@@ -62,6 +62,8 @@ def test_run_repository_lists_runs_and_tracks(tmp_path: Path) -> None:
     assert track is not None
     assert track["local_track_id"] == "CAM_001:TRACK_1"
     assert track["plate_text_confidence"] == 0.86
+    records = repository.list_vehicle_records(run_id="20260808_120000")
+    assert records[0].plate_text == "DL8CAF5030"
 
 
 def test_run_repository_resolve_media_path_blocks_traversal(tmp_path: Path) -> None:

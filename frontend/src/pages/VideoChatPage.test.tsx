@@ -210,6 +210,7 @@ describe("VideoChatPage", () => {
           track_id: "TRACK_13",
           vehicle_class: "CAR",
           colour: "WHITE",
+          plate_text: "MP09AB1234",
           first_seen_seconds: 6.2,
           last_seen_seconds: 8.4,
           image_url: "/api/media/florence_selected_crops/20260812_113742/CAM_001/TRACK_13/frame.jpg",
@@ -232,6 +233,7 @@ describe("VideoChatPage", () => {
     expect((await screen.findAllByText("TRACK_13")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("CAR").length).toBeGreaterThan(0);
     expect(screen.getAllByText("WHITE").length).toBeGreaterThan(0);
+    expect(screen.getByText("Plate: MP09AB1234")).toBeInTheDocument();
     expect(screen.getByText("Showing 1 of 2 vehicles")).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: "View Track" })[0]);
     await waitFor(() => expect(fetchTrack).toHaveBeenCalledWith("CAM_001", "TRACK_13", "20260812_113742"));
@@ -269,6 +271,7 @@ describe("VideoChatPage", () => {
           member_track_ids: ["CAM_001:TRACK_134"],
           vehicle_class: "CAR",
           colour: "BLACK",
+          plate_text: null,
           first_seen_seconds: 59.5,
           last_seen_seconds: 59.9,
           best_crop_url: "/api/media/evidence/20260815_170454/CAM_001/CAM_001_TRACK_134/crops/frame_001791.jpg",
@@ -293,6 +296,7 @@ describe("VideoChatPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("VEHICLE_108")).toBeInTheDocument();
+    expect(screen.getByText("Plate: Not detected")).toBeInTheDocument();
     expect(screen.getByText("Showing 6 of 108 vehicles")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "CAR BLACK crop for VEHICLE_108" })).toHaveAttribute(
       "src",

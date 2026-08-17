@@ -406,6 +406,7 @@ def resolve_vehicle_evidence(
                 "member_track_ids": [str(track.get("local_track_id") or vehicle_id)],
                 "vehicle_class": str(track.get("vehicle_class") or "UNKNOWN").upper(),
                 "colour": str(track.get("colour") or "UNKNOWN").upper(),
+                "plate_text": _clean_plate_text(track.get("plate_text")),
                 "first_seen_seconds": track.get("first_seen_seconds"),
                 "last_seen_seconds": track.get("last_seen_seconds"),
                 "best_crop_url": image_url,
@@ -431,6 +432,7 @@ def _physical_vehicle_evidence(*, repository: RunRepository, run_id: str, vehicl
     camera_id = str(vehicle.get("primary_camera_id") or (list(vehicle.get("camera_ids") or []) or [""])[0] or _split_vehicle_id(primary_track_id)[0] or "")
     track_id = str(_split_vehicle_id(primary_track_id)[1] or primary_track_id or vehicle_id)
     image_url = _physical_vehicle_image_url(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids)
+    plate_text = _physical_vehicle_plate_text(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids)
     return {
         "vehicle_id": vehicle_id,
         "camera_id": camera_id,
@@ -438,12 +440,51 @@ def _physical_vehicle_evidence(*, repository: RunRepository, run_id: str, vehicl
         "member_track_ids": member_track_ids,
         "vehicle_class": str(vehicle.get("vehicle_class") or vehicle.get("final_class") or "UNKNOWN").upper(),
         "colour": str(vehicle.get("vehicle_colour") or vehicle.get("colour") or "UNKNOWN").upper(),
+        "plate_text": plate_text,
         "first_seen_seconds": vehicle.get("first_seen_seconds") or vehicle.get("first_timestamp_seconds"),
         "last_seen_seconds": vehicle.get("last_seen_seconds") or vehicle.get("last_timestamp_seconds"),
         "best_crop_url": image_url,
         "image_url": image_url,
         "track_detail_url": f"/tracks/{camera_id}/{track_id}?run_id={run_id}" if camera_id and track_id else "",
     }
+
+
+def _physical_vehicle_plate_text(
+    *,
+    repository: RunRepository,
+    run_id: str,
+    vehicle: dict[str, Any],
+    member_track_ids: list[str],
+) -> str | None:
+    plate_payload = vehicle.get("plate")
+    consensus = _clean_plate_text(
+        vehicle.get("consensus_plate_text")
+        or (plate_payload.get("consensus_text") if isinstance(plate_payload, dict) else None)
+    )
+    if consensus:
+        return consensus
+    for item in list(vehicle.get("representative_evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        plate_text = _clean_plate_text(item.get("plate_text") or item.get("normalized_plate_text"))
+        if plate_text:
+            return plate_text
+    for local_track_id in member_track_ids:
+        camera_id, track_id = _split_vehicle_id(local_track_id)
+        if not camera_id or not track_id:
+            continue
+        track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
+        if not track:
+            continue
+        plate_text = _clean_plate_text(track.get("plate_text"))
+        if plate_text:
+            return plate_text
+    return None
+
+
+def _clean_plate_text(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    return text or None
 
 
 def _physical_vehicle_image_url(

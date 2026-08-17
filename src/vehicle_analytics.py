@@ -65,6 +65,7 @@ def vehicle_records_from_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRec
                 last_seen_seconds=_coerce_float(track.get("last_timestamp_seconds")),
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
+                plate_text=_extract_track_plate_text(track),
             )
         )
     return records
@@ -95,6 +96,7 @@ def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list
                 last_seen_seconds=_coerce_float(track.get("last_seen_seconds") or track.get("last_seen")),
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
+                plate_text=str(track.get("plate_text") or "").strip().upper() or None,
             )
         )
     return records
@@ -318,6 +320,13 @@ def _extract_track_colour(track: dict[str, Any]) -> str:
         if isinstance(colour, dict):
             return _normalize_colour(colour.get("label"))
     return VEHICLE_COLOUR_UNKNOWN
+
+
+def _extract_track_plate_text(track: dict[str, Any]) -> str | None:
+    enrichment = track.get("vehicle_enrichment")
+    value = enrichment.get("plate_text") if isinstance(enrichment, dict) else track.get("plate_text")
+    text = str(value or "").strip().upper()
+    return text or None
 
 
 def _normalize_vehicle_class(value: Any) -> str:
