@@ -224,6 +224,13 @@ def _build_runtime_local_track_id(camera_id: str, tracker_namespace: str, native
     return f"{camera_id}:{normalized_namespace.upper()}:TRACK_{native_tracker_id}"
 
 
+def _runtime_local_track_id_for_detection(camera_id: str, tracked_detection: Any) -> str:
+    local_track_id = str(getattr(tracked_detection, "local_track_id", "") or "").strip()
+    if local_track_id:
+        return local_track_id
+    return _build_runtime_local_track_id(camera_id, tracked_detection.tracker_namespace, int(tracked_detection.tracker_id))
+
+
 def _short_track_id(local_track_id: str) -> str:
     parts = str(local_track_id).split(":")
     return parts[-1] if parts else local_track_id
@@ -1103,9 +1110,15 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                         rejected_by_reason[diagnostic.rejection_reason] = rejected_by_reason.get(diagnostic.rejection_reason, 0) + 1
                 for tracked_item in result.tracked_detections:
                     unique_native_track_ids_by_camera[packet.camera_id].add(tracked_item.tracker_id)
-                evidence_collector.register_frame(packet, result.tracked_detections)
+                logical_tracked_detections = track_manager.assign_logical_track_ids(
+                    packet.camera_id,
+                    packet.frame_number,
+                    result.tracked_detections,
+                )
+                result.tracked_detections = logical_tracked_detections
+                evidence_collector.register_frame(packet, logical_tracked_detections)
                 track_manager_started_at = time.perf_counter()
-                completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, result.tracked_detections)
+                completed_now = track_manager.update_frame(packet.camera_id, packet.frame_number, logical_tracked_detections)
                 track_manager_update_ms = (time.perf_counter() - track_manager_started_at) * 1000.0
                 lifecycle_completed_tracks.extend(completed_now)
                 finalized_evidence_now = evidence_collector.finalize_tracks(completed_now)
@@ -1127,7 +1140,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
                 )
                 runtime_detection_rows: list[dict[str, Any]] = []
                 for tracked_item in result.tracked_detections:
-                    local_track_id = _build_runtime_local_track_id(packet.camera_id, tracked_item.tracker_namespace, int(tracked_item.tracker_id))
+                    local_track_id = _runtime_local_track_id_for_detection(packet.camera_id, tracked_item)
                     short_track_id = _short_track_id(local_track_id)
                     colour_value = None
                     colour_status = "pending"

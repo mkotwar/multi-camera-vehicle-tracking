@@ -226,6 +226,7 @@ def handle_video_chat(
             "include_camera_ids": parsed.include_camera_ids,
             "exclude_camera_ids": parsed.exclude_camera_ids,
             "selected_run_ids": parsed.selected_run_ids,
+            "group_by": parsed.group_by,
         },
         "previous_vehicle_ids": matching_vehicle_ids,
         "evidence_offset": next_evidence_offset,
@@ -852,6 +853,8 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     context_reference = _context_reference(text)
     if context_reference == "previous_results" and not context.get("previous_vehicle_ids"):
         context_reference = None
+    if context_reference is None and context.get("previous_vehicle_ids") and _is_follow_up_refinement(text):
+        context_reference = "previous_results"
     previous_filters = dict(context.get("previous_filters", {}) or {}) if context_reference else {}
     explicit_mentions = _extract_explicit_filter_mentions(text)
     show_evidence = bool(re.search(r"\b(show|show me|find|which ones|let me see|want to see|see|evidence|display|show them)\b", text))
@@ -864,7 +867,9 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
         start_time = previous_filters.get("start_time")
         end_time = previous_filters.get("end_time")
     include_camera_ids = _parse_camera_ids(text) or list(previous_filters.get("include_camera_ids", []) or [])
+    exclude_camera_ids = _parse_excluded_camera_ids(text) or list(previous_filters.get("exclude_camera_ids", []) or [])
     camera_id = include_camera_ids[0] if len(include_camera_ids) == 1 else (_parse_camera_id(text) or previous_filters.get("camera_id"))
+    previous_group_by = _normalize_group_by(previous_filters.get("group_by"))
 
     if _is_show_previous(text) and context.get("previous_vehicle_ids"):
         return ChatVehicleQuery(intent="LIST", show_evidence=True, context_reference="previous_results", evidence_navigation="next")
@@ -879,24 +884,37 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             end_time=end_time,
             camera_id=camera_id,
             include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
             show_evidence=show_evidence,
             context_reference=context_reference,
         )
     if (include_classes or exclude_classes) and _is_colour_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
     if (include_colours or exclude_colours) and _is_class_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
     if _is_class_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if _is_colour_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     group_by_scope = _parse_scope_group_by(text)
     if group_by_scope is not None:
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by=group_by_scope)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by=group_by_scope)
+    if context_reference == "previous_results" and previous_group_by is not None and _is_follow_up_refinement(text) and not show_evidence:
+        return ChatVehicleQuery(
+            intent="GROUP",
+            include_classes=include_classes,
+            exclude_classes=exclude_classes,
+            include_colours=include_colours,
+            exclude_colours=exclude_colours,
+            include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
+            group_by=previous_group_by,
+            context_reference=context_reference,
+        )
     if "most" in text and re.search(r"\b(vehicle\s+)?(class|type|category)\b", text):
         return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, group_by="class", sort_by="count_desc", limit=1)
     if _is_summary_query(text):
-        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     interval_query = _parse_interval_comparison_query(text)
     if interval_query is not None:
         return interval_query
@@ -906,15 +924,15 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             raise VehicleQueryParseError("Compare queries need two vehicle classes.")
         return ChatVehicleQuery(intent="COMPARE", comparison={"left": classes[0], "right": classes[1]})
     if re.search(r"\b(types?|classes?|kinds?)\s+of\s+vehicles?\s+(?:are\s+)?present\b", text):
-        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if _is_colour_group_query(text) or ("most" in text and re.search(r"\bcolou?r\b", text)):
         if include_classes:
-            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
-        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, context_reference=context_reference)
+            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
+        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if re.search(r"\b(group|breakdown)\s+by\s+class\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if re.search(r"\b(group|breakdown)\s+by\s+colou?r\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     if include_classes and re.fullmatch(r"(unknown|unclassified)\s+vehicles?", text):
         return ChatVehicleQuery(intent="LIST", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, show_evidence=True)
     if show_evidence or re.search(r"\b(which vehicles|appeared|list|display|want to see)\b", text):
@@ -928,6 +946,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             end_time=end_time,
             camera_id=camera_id,
             include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
             show_evidence=True,
             sort_by=None,
             limit=None,
@@ -944,6 +963,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             end_time=end_time,
             camera_id=camera_id,
             include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
             context_reference=context_reference,
         )
     if include_classes or exclude_classes or include_colours or exclude_colours:
@@ -957,6 +977,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             end_time=end_time,
             camera_id=camera_id,
             include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
             show_evidence=True,
             context_reference=context_reference,
         )
@@ -1295,6 +1316,7 @@ def _query_filters(parsed: ChatVehicleQuery) -> dict[str, Any]:
         "start_time": parsed.start_time,
         "end_time": parsed.end_time,
         "camera_id": parsed.camera_id,
+        "group_by": parsed.group_by,
     }
 
 
@@ -1310,6 +1332,7 @@ def _payload_filters(payload: dict[str, Any]) -> dict[str, Any]:
         "start_time": payload.get("start_time"),
         "end_time": payload.get("end_time"),
         "camera_id": None,
+        "group_by": _normalize_group_by(payload.get("group_by")),
     }
 
 
@@ -1330,6 +1353,10 @@ def _reject_suspicious_llm_payload(payload: dict[str, Any], text: str, context: 
     if _is_colour_wise_query(text):
         if intent != "GROUP" or _normalize_group_by(payload.get("group_by")) != "colour" or (not mentioned_classes and _upper_list(payload.get("classes"))):
             raise VehicleQueryParseError("incorrect_group_by:expected_colour")
+    expected_scope_group_by = _parse_scope_group_by(text)
+    if expected_scope_group_by is not None:
+        if intent != "GROUP" or _normalize_group_by(payload.get("group_by")) != expected_scope_group_by:
+            raise VehicleQueryParseError(f"incorrect_group_by:expected_{expected_scope_group_by}")
     if payload.get("context_reference") is not None and not _context_reference(text):
         raise VehicleQueryParseError("invented_context_reference")
     if (payload.get("start_time") == 0 or payload.get("end_time") == 0) and not re.search(r"\b(0|zero|first|between|after|before|from|to|\d)\b", text):
@@ -1547,7 +1574,17 @@ def _contains_phrase(text: str, phrase: str) -> bool:
 def _context_reference(text: str) -> str | None:
     if re.search(r"\b(those|them|that|these|ones)\b", text):
         return "previous_results"
+    if _is_follow_up_refinement(text):
+        return "previous_results"
     return None
+
+
+def _is_follow_up_refinement(text: str) -> bool:
+    return bool(
+        re.match(r"^(only|just)\b", text)
+        or re.match(r"^(except|excluding|without)\b", text)
+        or re.match(r"^(and|also)\s+(only|just)\b", text)
+    )
 
 
 def _is_show_previous(text: str) -> bool:
@@ -1626,27 +1663,47 @@ def _parse_camera_id(text: str) -> str | None:
 
 
 def _parse_camera_ids(text: str) -> list[str]:
+    return [camera_id for _start, camera_id, is_negative in _parse_camera_mentions(text) if not is_negative]
+
+
+def _parse_excluded_camera_ids(text: str) -> list[str]:
+    return [camera_id for _start, camera_id, is_negative in _parse_camera_mentions(text) if is_negative]
+
+
+def _parse_camera_mentions(text: str) -> list[tuple[int, str, bool]]:
     if _all_cameras_requested(text):
         return []
-    ids: list[str] = []
-    for start, end in re.findall(r"\bcameras?\s+(\d+)\s*(?:to|-|through)\s*(\d+)\b", text):
+    mentions: list[tuple[int, str, bool]] = []
+    for match in re.finditer(r"\bcameras?\s+(\d+)\s*(?:to|-|through)\s*(\d+)\b", text):
+        start, end = match.groups()
         first = int(start)
         last = int(end)
         step = 1 if last >= first else -1
-        ids.extend(_canonical_camera_id(index) for index in range(first, last + step, step))
-    for group in re.findall(r"\bcameras?\s+((?:\d+\s*(?:,|and)?\s*){2,})\b", text):
-        ids.extend(_canonical_camera_id(int(number)) for number in re.findall(r"\d+", group))
-    for raw in re.findall(r"\bcam[_\s-]*(\d+)\b|\bcameras?\s+(\d+)\b", text):
+        mentions.extend((match.start(), _canonical_camera_id(index), _is_negative_mention(text, match.start())) for index in range(first, last + step, step))
+    for match in re.finditer(r"\bcameras?\s+((?:\d+\s*(?:,|and)?\s*){2,})\b", text):
+        group = match.group(1)
+        mentions.extend((match.start(), _canonical_camera_id(int(number)), _is_negative_mention(text, match.start())) for number in re.findall(r"\d+", group))
+    for match in re.finditer(r"\bcam[_\s-]*(\d+)\b|\bcameras?\s+(\d+)\b", text):
+        raw = match.groups()
         number = next((item for item in raw if item), "")
         if number:
-            ids.append(_canonical_camera_id(int(number)))
+            mentions.append((match.start(), _canonical_camera_id(int(number)), _is_negative_mention(text, match.start())))
     for word, number in {**NUMBER_WORDS, **ORDINAL_WORDS}.items():
-        if re.search(rf"\b(?:camera|cam)\s+{word}\b|\b{word}\s+camera\b", text):
-            ids.append(_canonical_camera_id(number))
-    ordinal_pairs = re.findall(r"\b(" + "|".join(ORDINAL_WORDS) + r")\s+and\s+(" + "|".join(ORDINAL_WORDS) + r")\s+cameras?\b", text)
-    for first, second in ordinal_pairs:
-        ids.extend([_canonical_camera_id(ORDINAL_WORDS[first]), _canonical_camera_id(ORDINAL_WORDS[second])])
-    return _dedupe(ids)
+        for match in re.finditer(rf"\b(?:camera|cam)\s+{word}\b|\b{word}\s+camera\b", text):
+            mentions.append((match.start(), _canonical_camera_id(number), _is_negative_mention(text, match.start())))
+    for match in re.finditer(r"\b(" + "|".join(ORDINAL_WORDS) + r")\s+and\s+(" + "|".join(ORDINAL_WORDS) + r")\s+cameras?\b", text):
+        first, second = match.groups()
+        mentions.append((match.start(), _canonical_camera_id(ORDINAL_WORDS[first]), _is_negative_mention(text, match.start())))
+        mentions.append((match.start(), _canonical_camera_id(ORDINAL_WORDS[second]), _is_negative_mention(text, match.start())))
+    ordered: list[tuple[int, str, bool]] = []
+    seen: set[tuple[str, bool]] = set()
+    for start, camera_id, is_negative in sorted(mentions, key=lambda item: (item[0], item[1], item[2])):
+        key = (camera_id, is_negative)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((start, camera_id, is_negative))
+    return ordered
 
 
 def _canonical_camera_id(number: int) -> str:
@@ -1658,8 +1715,28 @@ def _all_cameras_requested(text: str) -> bool:
 
 
 def _parse_scope_group_by(text: str) -> str | None:
-    by_camera = bool(re.search(r"\b(by|per|compare)\s+cameras?\b|\bcameras?\s+(?:wise|breakdown)\b", text))
-    by_run = bool(re.search(r"\b(by|per|compare)\s+runs?\b|\bruns?\s+(?:wise|breakdown)\b", text))
+    if re.search(r"\b(?:by|per|compare)\s+run\s+and\s+camera\b|\b(?:by|per|compare)\s+camera\s+and\s+run\b", text):
+        return "run_camera"
+    by_camera = bool(
+        re.search(
+            r"\b(by|per|compare)\s+cameras?\b|"
+            r"\bcameras?\s*(?:-| )wise\b|"
+            r"\bcamera\s+breakdown\b|"
+            r"\bcount\s+cameras?\s*(?:-| )wise\b|"
+            r"\bin\s+(?:each|every)\s+camera\b|"
+            r"\bhow\s+many\s+vehicles?\s+in\s+(?:each|every)\s+camera\b",
+            text,
+        )
+    )
+    by_run = bool(
+        re.search(
+            r"\b(by|per|compare)\s+runs?\b|"
+            r"\bruns?\s*(?:-| )wise\b|"
+            r"\brun\s+breakdown\b|"
+            r"\bin\s+(?:each|every)\s+run\b",
+            text,
+        )
+    )
     if by_camera and by_run:
         return "run_camera"
     if by_camera:
@@ -1680,16 +1757,32 @@ def _apply_run_and_camera_scope(
     scoped_run_ids = _parse_run_ids(text, selected_run_ids) or list(parsed.selected_run_ids) or list(selected_run_ids)
     previous_filters = dict(context.get("previous_filters", {}) or {})
     explicit_camera_ids = _parse_camera_ids(text)
+    explicit_excluded_camera_ids = _parse_excluded_camera_ids(text)
     include_camera_ids = explicit_camera_ids or list(parsed.include_camera_ids or [])
+    exclude_camera_ids = explicit_excluded_camera_ids or list(parsed.exclude_camera_ids or [])
     if not include_camera_ids and parsed.context_reference == "previous_results":
         include_camera_ids = list(previous_filters.get("include_camera_ids", []) or [])
+    if not explicit_excluded_camera_ids and parsed.context_reference == "previous_results":
+        exclude_camera_ids = list(previous_filters.get("exclude_camera_ids", []) or exclude_camera_ids)
     if include_camera_ids:
         _validate_camera_scope(include_camera_ids, scoped_run_ids, repository)
+    if exclude_camera_ids:
+        _validate_camera_scope(exclude_camera_ids, scoped_run_ids, repository)
+    previous_group_by = _normalize_group_by(previous_filters.get("group_by"))
+    explicit_group_by = _parse_scope_group_by(text)
+    group_by = explicit_group_by or parsed.group_by
+    if group_by is None and parsed.context_reference == "previous_results" and _is_follow_up_refinement(text):
+        group_by = previous_group_by
+    intent = parsed.intent
+    if group_by is not None and intent == "COUNT":
+        intent = "GROUP"
+    if group_by is not None and intent == "LIST" and parsed.context_reference == "previous_results" and _is_follow_up_refinement(text):
+        intent = "GROUP"
     return ChatVehicleQuery(
-        intent=parsed.intent,
+        intent=intent,
         selected_run_ids=scoped_run_ids,
         include_camera_ids=include_camera_ids,
-        exclude_camera_ids=list(parsed.exclude_camera_ids),
+        exclude_camera_ids=exclude_camera_ids,
         include_classes=list(parsed.include_classes),
         exclude_classes=list(parsed.exclude_classes),
         include_colours=list(parsed.include_colours),
@@ -1697,7 +1790,7 @@ def _apply_run_and_camera_scope(
         start_time=parsed.start_time,
         end_time=parsed.end_time,
         camera_id=include_camera_ids[0] if len(include_camera_ids) == 1 else parsed.camera_id,
-        group_by=parsed.group_by,
+        group_by=group_by,
         comparison=parsed.comparison,
         sort_by=parsed.sort_by,
         limit=parsed.limit,

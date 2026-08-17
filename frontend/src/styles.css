@@ -743,14 +743,29 @@ select {
   background: rgba(2, 6, 23, 0.14);
 }
 
-.chat-panel-toolbar label {
+.run-selector-shell {
   display: grid;
   gap: 0.35rem;
   min-width: min(360px, 100%);
 }
 
-.chat-panel-toolbar select {
-  width: 100%;
+.run-selector-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.run-selector-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+
+.run-selector-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.35rem 0.65rem;
   padding: 0.68rem 0.8rem;
   border-radius: 10px;
   border: 1px solid rgba(125, 179, 255, 0.24);
@@ -760,10 +775,32 @@ select {
   transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
 }
 
-.chat-panel-toolbar select:focus-visible {
+.run-selector-option input {
+  margin: 0;
+}
+
+.run-selector-option span,
+.run-selector-option small {
+  grid-column: 2;
+}
+
+.run-selector-option small {
+  color: rgba(191, 219, 254, 0.72);
+}
+
+.run-selector-option:has(input:checked) {
+  border-color: rgba(34, 211, 238, 0.55);
+  background: rgba(8, 47, 73, 0.62);
+}
+
+.run-selector-option:has(input:focus-visible) {
   outline: 0;
   border-color: rgba(34, 211, 238, 0.7);
   box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.14), 0 0 24px rgba(59, 130, 246, 0.12);
+}
+
+.run-selector-summary {
+  color: rgba(191, 219, 254, 0.72);
 }
 
 .chat-history {

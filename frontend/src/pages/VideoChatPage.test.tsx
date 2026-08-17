@@ -41,6 +41,18 @@ function LocationProbe() {
   return <span data-testid="location">{location.pathname}</span>;
 }
 
+function getRunCheckbox(runId: string) {
+  return screen.getByRole("checkbox", { name: new RegExp(`^${runId}\\b`) }) as HTMLInputElement;
+}
+
+function expectSelectedRuns(runIds: string[]) {
+  for (const checkbox of screen.getAllByRole("checkbox")) {
+    const input = checkbox as HTMLInputElement;
+    const label = input.nextElementSibling?.textContent ?? "";
+    expect(input.checked).toBe(runIds.includes(label));
+  }
+}
+
 describe("VideoChatPage", () => {
   afterEach(() => {
     cleanup();
@@ -696,7 +708,7 @@ describe("VideoChatPage", () => {
     );
 
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
-    expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]);
+    expectSelectedRuns(["RUN_A"]);
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "how many of those are visible for more than 2 seconds?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledTimes(1));
@@ -738,24 +750,27 @@ describe("VideoChatPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "How many cars were there?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect((await screen.findAllByText("Run A had 8 cars.")).length).toBeGreaterThan(0);
 
-    fireEvent.change(screen.getByLabelText("Video chat run"), { target: { value: "RUN_B" } });
+    fireEvent.click(getRunCheckbox("RUN_A"));
+    fireEvent.click(getRunCheckbox("RUN_B"));
     expect(screen.getByLabelText("Video analytics chat history").querySelectorAll(".chat-message-row")).toHaveLength(0);
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show motorcycles." } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     expect((await screen.findAllByText("Run B had 3 motorcycles.")).length).toBeGreaterThan(0);
 
-    fireEvent.change(screen.getByLabelText("Video chat run"), { target: { value: "RUN_A" } });
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    fireEvent.click(getRunCheckbox("RUN_A"));
     let history = screen.getByLabelText("Video analytics chat history");
     expect(within(history).getByText("How many cars were there?")).toBeInTheDocument();
     expect(within(history).getAllByText("Run A had 8 cars.").length).toBeGreaterThan(0);
     expect(within(history).queryByText("Show motorcycles.")).not.toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("Video chat run"), { target: { value: "RUN_B" } });
+    fireEvent.click(getRunCheckbox("RUN_A"));
+    fireEvent.click(getRunCheckbox("RUN_B"));
     history = screen.getByLabelText("Video analytics chat history");
     expect(within(history).getByText("Show motorcycles.")).toBeInTheDocument();
     expect(within(history).getAllByText("Run B had 3 motorcycles.").length).toBeGreaterThan(0);
@@ -790,7 +805,7 @@ describe("VideoChatPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
     const history = screen.getByLabelText("Video analytics chat history");
     expect(within(history).getByText("First stored question")).toBeInTheDocument();
     expect(within(history).getAllByText("First stored answer").length).toBeGreaterThan(0);
@@ -929,12 +944,8 @@ describe("VideoChatPage", () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(screen.getByLabelText("Video chat run")).toHaveValue(["RUN_A"]));
-    const selector = screen.getByLabelText("Video chat run") as HTMLSelectElement;
-    Array.from(selector.options).forEach((option) => {
-      option.selected = option.value === "RUN_A" || option.value === "RUN_B";
-    });
-    fireEvent.change(selector);
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    fireEvent.click(getRunCheckbox("RUN_B"));
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "show cars across all selected runs" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
@@ -945,5 +956,62 @@ describe("VideoChatPage", () => {
       message: "show cars across all selected runs",
     });
     expect(screen.getAllByText("All selected runs").length).toBeGreaterThan(0);
+  });
+
+  it("supports explicit checkbox multi-run selection and clearing", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+      { run_id: "RUN_C", status: "COMPLETED", track_count: 5, camera_count: 1, duration_seconds: 6 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    fireEvent.click(getRunCheckbox("RUN_C"));
+    expectSelectedRuns(["RUN_A", "RUN_B", "RUN_C"]);
+    expect(screen.getByText("3 runs selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expectSelectedRuns([]);
+    expect(screen.getAllByText("No runs selected").length).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "show cars" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(sendVideoChatMessage).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Select at least one run to start the chat.");
+  });
+
+  it("renders camera and run group breakdown rows", async () => {
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "RUN_A",
+      run_ids: ["RUN_A", "RUN_B"],
+      session_id: "session-grouped",
+      answer: "Grouped results ready.",
+      parser_used: "rule",
+      parsed_query: { intent: "GROUP", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: false, group_by: "run_camera" },
+      analytics_result: { total: 3, by_run_camera: { "RUN_A / CAM_001": 2, "RUN_B / CAM_003": 1 } },
+      matching_vehicle_ids: [],
+      evidence: [],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "count vehicles by run and camera" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("RUN A / CAM 001")).toBeInTheDocument();
+    expect(screen.getByText("RUN B / CAM 003")).toBeInTheDocument();
   });
 });

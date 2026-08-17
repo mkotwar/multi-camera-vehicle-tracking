@@ -265,6 +265,72 @@ def test_duplicate_completed_logical_track_identity_is_detected(tmp_path: Path) 
     assert any(issue.code == "duplicate_completed_logical_track_identity" for issue in report.issues)
 
 
+def test_reused_native_tracker_id_with_distinct_logical_ids_passes_integrity(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))
+    tracks[0]["native_tracker_id"] = 91
+    tracks.append(
+        {
+            **tracks[0],
+            "local_track_id": "CAM_001:TRACK_2",
+            "native_tracker_id": 91,
+            "first_frame": 20,
+            "last_frame": 24,
+            "first_timestamp_seconds": 2.0,
+            "last_timestamp_seconds": 2.4,
+        }
+    )
+    tracks[1] = {
+        **tracks[1],
+        "local_track_id": "CAM_001:TRACK_3",
+    }
+    _write_json(run_dir / "tracks.json", tracks)
+    _write_csv(
+        run_dir / "observations.csv",
+        [
+            {
+                "local_track_id": "CAM_001:TRACK_1",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 91,
+                "frame_number": 1,
+                "timestamp_seconds": 0.1,
+                "x1": 1,
+                "y1": 2,
+                "x2": 3,
+                "y2": 4,
+                "confidence": 0.9,
+                "raw_class_id": 2,
+                "raw_class_name": "car",
+            },
+            {
+                "local_track_id": "CAM_001:TRACK_2",
+                "camera_id": "CAM_001",
+                "tracker_namespace": "camera",
+                "native_tracker_id": 91,
+                "frame_number": 20,
+                "timestamp_seconds": 2.0,
+                "x1": 5,
+                "y1": 6,
+                "x2": 7,
+                "y2": 8,
+                "confidence": 0.8,
+                "raw_class_id": 2,
+                "raw_class_name": "car",
+            },
+        ],
+    )
+
+    report = build_dry_run(run_dir)
+
+    assert report.counts["issues"]["ERROR"] == 0
+    assert not any(issue.code == "duplicate_completed_logical_track_identity" for issue in report.issues)
+    assert [row.ref.local_track_id for row in report.rows.vehicle_tracks if row.track_status == "COMPLETED"] == [
+        "CAM_001:TRACK_1",
+        "CAM_001:TRACK_2",
+    ]
+
+
 def test_duplicate_discarded_track_identity_is_remapped_for_import(tmp_path: Path) -> None:
     run_dir = _base_run(tmp_path)
     tracks = json.loads((run_dir / "tracks.json").read_text(encoding="utf-8"))

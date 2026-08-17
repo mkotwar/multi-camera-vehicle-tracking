@@ -9,6 +9,7 @@ import pytest
 from src.models import (
     ConfigurationError,
     TRACK_STATUS_ACTIVE,
+    TRACK_STATUS_COMPLETED,
     TRACK_STATUS_DISCARDED,
     TRACK_STATUS_LOST,
     TRACK_STATUS_TENTATIVE,
@@ -300,3 +301,103 @@ def test_metrics_json_payload_is_created() -> None:
     metrics = manager.get_metrics()
     assert "tracks_created_by_camera" in metrics
     assert "duplicate_observation_count" in metrics
+
+
+def _complete_native_lifecycle(manager: TrackManager, *, native_id: int, start_frame: int, camera_id: str = "CAM_001") -> list:
+    manager.update_frame(camera_id, start_frame, [_tracked(camera_id=camera_id, frame_number=start_frame, tracker_id=native_id)])
+    manager.update_frame(camera_id, start_frame + 1, [_tracked(camera_id=camera_id, frame_number=start_frame + 1, tracker_id=native_id)])
+    manager.update_frame(camera_id, start_frame + 2, [_tracked(camera_id=camera_id, frame_number=start_frame + 2, tracker_id=native_id)])
+    assert manager.update_frame(camera_id, start_frame + 3, []) == []
+    return manager.update_frame(camera_id, start_frame + 4, [])
+
+
+def test_continuous_native_id_keeps_one_logical_track() -> None:
+    manager = TrackManager(_config(minimum_observations=3), _logger())
+
+    manager.update_frame("CAM_001", 0, [_tracked(frame_number=0, tracker_id=91)])
+    manager.update_frame("CAM_001", 1, [_tracked(frame_number=1, tracker_id=91)])
+    manager.update_frame("CAM_001", 2, [_tracked(frame_number=2, tracker_id=91)])
+    finalized = manager.flush_camera("CAM_001")
+
+    assert [track.local_track_id for track in finalized] == ["CAM_001:TRACK_1"]
+    assert finalized[0].native_tracker_id == 91
+    assert [item.local_track_id for item in finalized[0].observations] == ["CAM_001:TRACK_1"] * 3
+
+
+def test_temporary_lost_recovery_before_finalization_keeps_logical_track() -> None:
+    manager = TrackManager(_config(minimum_observations=3, maximum_lost_frames=2), _logger())
+
+    manager.update_frame("CAM_001", 0, [_tracked(frame_number=0, tracker_id=91)])
+    manager.update_frame("CAM_001", 1, [_tracked(frame_number=1, tracker_id=91)])
+    manager.update_frame("CAM_001", 2, [_tracked(frame_number=2, tracker_id=91)])
+    manager.update_frame("CAM_001", 3, [])
+    manager.update_frame("CAM_001", 4, [_tracked(frame_number=4, tracker_id=91)])
+    finalized = manager.flush_camera("CAM_001")
+
+    assert [track.local_track_id for track in finalized] == ["CAM_001:TRACK_1"]
+    assert finalized[0].observation_count == 4
+    assert manager.get_metrics()["lost_then_reactivated_count"] == 1
+
+
+def test_native_id_reused_after_completed_gets_new_logical_track() -> None:
+    manager = TrackManager(_config(minimum_observations=3, maximum_lost_frames=1), _logger())
+
+    first = _complete_native_lifecycle(manager, native_id=91, start_frame=0)
+    second = _complete_native_lifecycle(manager, native_id=91, start_frame=5)
+
+    assert [track.status for track in first + second] == [TRACK_STATUS_COMPLETED, TRACK_STATUS_COMPLETED]
+    assert [track.native_tracker_id for track in first + second] == [91, 91]
+    assert [track.local_track_id for track in first + second] == ["CAM_001:TRACK_1", "CAM_001:TRACK_2"]
+
+
+def test_native_id_reused_after_discarded_gets_new_logical_track() -> None:
+    manager = TrackManager(_config(minimum_observations=3, maximum_lost_frames=1), _logger())
+
+    manager.update_frame("CAM_001", 0, [_tracked(frame_number=0, tracker_id=126)])
+    discarded = manager.flush_camera("CAM_001")
+    manager.update_frame("CAM_001", 1, [_tracked(frame_number=1, tracker_id=126)])
+    manager.update_frame("CAM_001", 2, [_tracked(frame_number=2, tracker_id=126)])
+    manager.update_frame("CAM_001", 3, [_tracked(frame_number=3, tracker_id=126)])
+    completed = manager.flush_camera("CAM_001")
+
+    assert discarded[0].status == TRACK_STATUS_DISCARDED
+    assert discarded[0].local_track_id == "CAM_001:TRACK_1"
+    assert completed[0].status == TRACK_STATUS_COMPLETED
+    assert completed[0].local_track_id == "CAM_001:TRACK_2"
+    assert completed[0].native_tracker_id == 126
+
+
+def test_same_native_id_reused_three_times_creates_three_logical_ids() -> None:
+    manager = TrackManager(_config(minimum_observations=3, maximum_lost_frames=1), _logger())
+
+    completed = []
+    completed.extend(_complete_native_lifecycle(manager, native_id=91, start_frame=0))
+    completed.extend(_complete_native_lifecycle(manager, native_id=91, start_frame=5))
+    completed.extend(_complete_native_lifecycle(manager, native_id=91, start_frame=10))
+
+    assert [track.native_tracker_id for track in completed] == [91, 91, 91]
+    assert [track.local_track_id for track in completed] == ["CAM_001:TRACK_1", "CAM_001:TRACK_2", "CAM_001:TRACK_3"]
+    assert len({(track.camera_id, track.local_track_id) for track in completed}) == 3
+
+
+def test_two_cameras_same_native_id_have_isolated_allocators() -> None:
+    manager = TrackManager(_config(minimum_observations=3, maximum_lost_frames=1), _logger())
+
+    manager.update_frame("CAM_001", 0, [_tracked(camera_id="CAM_001", frame_number=0, tracker_id=5)])
+    manager.update_frame("CAM_002", 0, [_tracked(camera_id="CAM_002", frame_number=0, tracker_id=5)])
+
+    assert manager._tracks[("CAM_001", "camera", 5)].local_track_id == "CAM_001:TRACK_1"
+    assert manager._tracks[("CAM_002", "camera", 5)].local_track_id == "CAM_002:TRACK_1"
+    assert manager.get_metrics()["next_logical_track_number_by_camera"] == {"CAM_001": 2, "CAM_002": 2}
+
+
+def test_assign_logical_track_ids_attaches_identity_for_downstream_artifacts() -> None:
+    manager = TrackManager(_config(), _logger())
+
+    detections = manager.assign_logical_track_ids("CAM_001", 0, [_tracked(frame_number=0, tracker_id=91)])
+    completed = manager.update_frame("CAM_001", 0, detections)
+
+    assert completed == []
+    assert detections[0].tracker_id == 91
+    assert detections[0].local_track_id == "CAM_001:TRACK_1"
+    assert manager._tracks[("CAM_001", "camera", 91)].observations[0].local_track_id == "CAM_001:TRACK_1"

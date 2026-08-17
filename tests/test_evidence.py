@@ -833,6 +833,36 @@ def test_same_frame_number_across_cameras_remains_isolated_on_release(tmp_path: 
     assert ("CAM_002", 120) not in collector._frame_cache
 
 
+def test_evidence_collector_uses_assigned_logical_track_id_instead_of_native_id(tmp_path: Path) -> None:
+    collector, _output_manager = _collector(tmp_path)
+    frame = _make_frame(sharp=True)
+    raw_detection = _tracked(12, tracker_id=91)
+    logical_detection = TrackedDetection(
+        camera_id=raw_detection.camera_id,
+        tracker_namespace=raw_detection.tracker_namespace,
+        frame_number=raw_detection.frame_number,
+        timestamp_seconds=raw_detection.timestamp_seconds,
+        tracker_id=raw_detection.tracker_id,
+        bbox_xyxy=raw_detection.bbox_xyxy,
+        confidence=raw_detection.confidence,
+        raw_class_id=raw_detection.raw_class_id,
+        raw_class_name=raw_detection.raw_class_name,
+        local_track_id="CAM_001:TRACK_2",
+    )
+
+    collector.register_frame(_packet(12, frame), [logical_detection])
+    track = _track(
+        [_observation(12, tracker_id=91, local_track_id="CAM_001:TRACK_2")],
+        local_track_id="CAM_001:TRACK_2",
+        tracker_id=91,
+    )
+    evidence = collector.finalize_track(track)
+
+    assert evidence
+    assert {item.local_track_id for item in evidence} == {"CAM_001:TRACK_2"}
+    assert all("TRACK_91" not in str(item.crop_path) for item in evidence if item.crop_path)
+
+
 def test_missing_frame_fail_closed_raises_pipeline_runtime_error(tmp_path: Path) -> None:
     collector, _output_manager = _collector(tmp_path, fail_pipeline_on_error=True)
     collector.register_frame(_packet(0, _make_frame(fill=40)), [_tracked(0, confidence=0.95)])

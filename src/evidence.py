@@ -735,7 +735,7 @@ class EvidenceCollector:
     ) -> None:
         if not self._debug_track_crops_enabled:
             return
-        local_track_id = self._build_local_track_id(frame_packet.camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
+        local_track_id = self._logical_track_id(frame_packet.camera_id, tracked_detection)
         saved_count = int(self._debug_track_crop_counts.get(local_track_id, 0))
         if saved_count >= self._debug_track_crops_max_per_track:
             return
@@ -869,7 +869,7 @@ class EvidenceCollector:
         if not bool(camera_capture_zone.get("enabled", False)):
             return
         for tracked_detection in tracked_detections:
-            local_track_id = self._build_local_track_id(frame_packet.camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
+            local_track_id = self._logical_track_id(frame_packet.camera_id, tracked_detection)
             state = self._capture_zone_state.setdefault(local_track_id, _CaptureZoneTrackState())
             state.observation_count += 1
             trigger_x = float((tracked_detection.bbox_xyxy[0] + tracked_detection.bbox_xyxy[2]) / 2.0)
@@ -1105,7 +1105,7 @@ class EvidenceCollector:
             return None
         bbox_area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
         sharpness_score = self._compute_sharpness(crop) if self.config["sharpness_enabled"] else 0.0
-        local_track_id = self._build_local_track_id(frame_packet.camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
+        local_track_id = self._logical_track_id(frame_packet.camera_id, tracked_detection)
         candidate = EvidenceCandidate(
             local_track_id=local_track_id,
             camera_id=frame_packet.camera_id,
@@ -1688,6 +1688,12 @@ class EvidenceCollector:
         if normalized_namespace == "camera":
             return f"{camera_id}:TRACK_{native_tracker_id}"
         return f"{camera_id}:{normalized_namespace.upper()}:TRACK_{native_tracker_id}"
+
+    def _logical_track_id(self, camera_id: str, tracked_detection: TrackedDetection) -> str:
+        local_track_id = str(getattr(tracked_detection, "local_track_id", "") or "").strip()
+        if local_track_id:
+            return local_track_id
+        return self._build_local_track_id(camera_id, tracked_detection.tracker_namespace, tracked_detection.tracker_id)
 
     def _sanitize_track_id(self, local_track_id: str) -> str:
         safe = "".join(character if character.isalnum() or character in {"_", "-"} else "_" for character in local_track_id)

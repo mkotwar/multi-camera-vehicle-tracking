@@ -126,7 +126,7 @@ def chat_vehicle_query_json_schema() -> dict[str, Any]:
             "colour_exclude": {"type": "array", "items": {"type": "string", "enum": list(SUPPORTED_VEHICLE_COLOUR_LABELS)}},
             "start_time": {"anyOf": [{"type": "number"}, {"type": "null"}]},
             "end_time": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-            "group_by": {"anyOf": [{"type": "string", "enum": ["vehicle_class", "colour"]}, {"type": "null"}]},
+            "group_by": {"anyOf": [{"type": "string", "enum": ["vehicle_class", "colour", "camera", "run", "run_camera"]}, {"type": "null"}]},
             "operator": {"anyOf": [{"type": "string", "enum": [">", "<", "="]}, {"type": "null"}]},
             "show_evidence": {"type": "boolean"},
             "context_reference": {"anyOf": [{"type": "string", "enum": ["previous_result", "previous_filters"]}, {"type": "null"}]},
@@ -153,6 +153,9 @@ Rules:
 - overview, summary -> SUMMARY
 - class-wise, vehicle category counts, vehicle type counts, breakdown by class -> GROUP with group_by vehicle_class and no filters unless explicitly mentioned
 - colour-wise, vehicle colour counts, breakdown by colour -> GROUP with group_by colour and no filters unless explicitly mentioned
+- camera-wise, by camera, per camera, camera breakdown, in each camera -> GROUP with group_by camera
+- run-wise, by run, per run, run breakdown, in each run -> GROUP with group_by run
+- by run and camera, per run and camera, compare cameras across runs -> GROUP with group_by run_camera
 - colours of motorcycles/cars/three-wheelers/bikes -> GROUP with group_by colour and preserve the named class
 - vehicle classes/types were black/white/red/etc -> GROUP with group_by vehicle_class and preserve the named colour
 - what kinds/types -> GROUP with group_by vehicle_class
@@ -191,6 +194,15 @@ Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include"
 
 User: Show colour-wise counts.
 Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}
+
+User: Count vehicles camera wise.
+Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"camera","operator":null,"show_evidence":false,"context_reference":null}
+
+User: Count vehicles by run.
+Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"run","operator":null,"show_evidence":false,"context_reference":null}
+
+User: Count vehicles by run and camera.
+Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"run_camera","operator":null,"show_evidence":false,"context_reference":null}
 
 User: Give me the colours of motorcycles.
 Output: {"intent":"GROUP","class_include":["MOTORCYCLE"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}

@@ -815,6 +815,76 @@ def test_video_chat_follow_up_preserves_camera_and_run_scope() -> None:
     assert follow_up["parsed_query"]["selected_run_ids"] == ["RUN_A", "RUN_B"]
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_group_by", "expected_classes"),
+    [
+        ("count vehicles camera wise", "camera", []),
+        ("count vehicles camera-wise", "camera", []),
+        ("count vehicles by camera", "camera", []),
+        ("count vehicles per camera", "camera", []),
+        ("how many vehicles in each camera", "camera", []),
+        ("count 2 wheelers per camera", "camera", ["MOTORCYCLE"]),
+        ("count vehicles by run", "run", []),
+        ("count vehicles by run and camera", "run_camera", []),
+    ],
+)
+def test_video_chat_scope_grouping_phrases_map_to_multi_camera_grouping(message: str, expected_group_by: str, expected_classes: list[str]) -> None:
+    parsed, _ = parse_chat_vehicle_query(message=message, context={}, llm_provider=None)
+
+    assert parsed.intent == "GROUP"
+    assert parsed.group_by == expected_group_by
+    assert parsed.include_classes == expected_classes
+
+
+def test_video_chat_follow_up_preserves_grouping_scope_and_filters() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_002"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_002", "TRACK_2", "CAR", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_3", "CAR", "BLACK"),
+    ]
+    first = handle_video_chat(
+        message="count cars camera wise",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    follow_up = handle_video_chat(
+        message="only black",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context=first["next_context"],
+        llm_provider=None,
+    )
+
+    assert follow_up["parsed_query"]["intent"] == "GROUP"
+    assert follow_up["parsed_query"]["group_by"] == "camera"
+    assert follow_up["parsed_query"]["selected_run_ids"] == ["RUN_A", "RUN_B"]
+    assert follow_up["parsed_query"]["include_colours"] == ["BLACK"]
+    assert follow_up["analytics_result"]["by_camera"] == {"CAM_001": 1, "CAM_002": 1}
+
+
+def test_video_chat_rejects_llm_that_flattens_camera_group_query() -> None:
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_002", "TRACK_2", "MOTORCYCLE", "BLACK"),
+    ]
+    response = handle_video_chat(
+        message="count vehicles camera wise",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"]}),  # type: ignore[arg-type]
+        llm_provider=_FakeProvider(_valid_payload(intent="COUNT", classes=[], colours=[], show_evidence=False)),
+    )
+
+    assert response["parsed_query"]["intent"] == "GROUP"
+    assert response["parsed_query"]["group_by"] == "camera"
+    assert response["parser_used"] == "rule_based"
+    assert response["llm_rejection_reason"] == "incorrect_group_by:expected_camera"
+
+
 def test_semantic_query_evaluation_fixture_final_plans() -> None:
     fixtures = json.loads(Path("tests/fixtures/semantic_query_evaluation.json").read_text(encoding="utf-8"))
     assert len(fixtures) >= 50

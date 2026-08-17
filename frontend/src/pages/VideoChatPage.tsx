@@ -68,6 +68,10 @@ export function VideoChatPage() {
     event?.preventDefault();
     const text = (override ?? input).trim();
     if (!text || isSending) return;
+    if (runIds.length === 0) {
+      setError("Select at least one run to start the chat.");
+      return;
+    }
     const sessionId = chatSession.session_id;
     const userMessage: ChatMessage = { id: makeMessageId("user"), role: "user", text, timestamp: new Date().toISOString() };
     persistMessages((current) => [...current, userMessage]);
@@ -96,7 +100,7 @@ export function VideoChatPage() {
     setSelectedTrack(track);
   };
 
-  const startNewChat = (nextRunIds = runIds) => {
+  const startNewChat = (nextRunIds = runIds.length ? runIds : ["latest"]) => {
     const nextSession = replaceVideoChatSessionForRunIds(nextRunIds);
     setChatSession(nextSession);
     setRunIds(nextRunIds);
@@ -108,6 +112,14 @@ export function VideoChatPage() {
   };
 
   const changeRuns = (nextRunIds: string[]) => {
+    if (nextRunIds.length === 0) {
+      setRunIds([]);
+      setMessages([]);
+      setSelectedTrack(null);
+      setError(null);
+      setUserIsReading(false);
+      return;
+    }
     loadRunSession(nextRunIds);
   };
 
@@ -137,7 +149,7 @@ export function VideoChatPage() {
   }
 
   const runBadges = [
-    { label: "Run", value: selectedRuns.length > 1 ? `${selectedRuns.length} selected` : selectedRun?.run_id ?? runIds[0] },
+    { label: "Runs", value: selectedRuns.length > 1 ? `${selectedRuns.length} selected` : selectedRun?.run_id ?? runIds[0] ?? "None selected" },
     { label: "Cameras", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.camera_count ?? 0), 0) : "Any" },
     { label: "Duration", value: selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : selectedRuns.length > 1 ? "Multiple runs" : "Saved run" },
     { label: "Vehicles", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.physical_vehicle_count ?? run.track_count ?? 0), 0) : "Unavailable" },
@@ -156,7 +168,7 @@ export function VideoChatPage() {
         </div>
         <div className="run-badge-grid" aria-label="Current run context">
           {runBadges.map((badge) => (
-            <div key={badge.label} className={`run-badge ${badge.label === "Run" ? "active" : ""}`}>
+            <div key={badge.label} className={`run-badge ${badge.label === "Runs" ? "active" : ""}`}>
               <span>{badge.label}</span>
               <strong>{badge.value}</strong>
             </div>
@@ -167,26 +179,47 @@ export function VideoChatPage() {
       <section className="video-chat-workspace">
         <section className="chat-panel" aria-label="Video analytics assistant">
           <div className="chat-panel-toolbar">
-            <label>
+            <div className="run-selector-shell" aria-label="Video chat run">
               <span>Runs / videos</span>
-              <select
-                multiple
-                value={runIds}
-                onChange={(event) => {
-                  const values = Array.from(event.target.selectedOptions).map((option) => option.value);
-                  changeRuns(values.length ? values : [event.target.value]);
-                }}
-                aria-label="Video chat run"
-              >
-                {runs.length === 0 ? <option value="latest">Latest</option> : null}
-                {runs.map((run) => (
-                  <option key={run.run_id} value={run.run_id}>
-                    {run.run_id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <span className="status status-completed">{selectedRuns.length > 1 ? "All selected runs" : selectedRun?.status ?? "Latest"}</span>
+              <div className="run-selector-actions">
+                <button type="button" className="secondary-button compact-action" onClick={() => changeRuns(runs.map((run) => run.run_id))} disabled={runs.length === 0}>
+                  Select all
+                </button>
+                <button type="button" className="secondary-button compact-action" onClick={() => changeRuns([])} disabled={runIds.length === 0}>
+                  Clear
+                </button>
+              </div>
+              <div className="run-selector-list" role="group" aria-label="Video chat run">
+                {runs.length === 0 ? (
+                  <label className="run-selector-option">
+                    <input type="checkbox" checked readOnly />
+                    <span>Latest</span>
+                  </label>
+                ) : (
+                  runs.map((run) => {
+                    const checked = runIds.includes(run.run_id);
+                    return (
+                      <label key={run.run_id} className="run-selector-option">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            const nextRunIds = checked ? runIds.filter((runId) => runId !== run.run_id) : [...runIds, run.run_id];
+                            changeRuns(nextRunIds);
+                          }}
+                        />
+                        <span>{run.run_id}</span>
+                        <small>{run.status ?? "Saved run"}</small>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+              <small className="run-selector-summary">
+                {runIds.length === 0 ? "No runs selected" : `${runIds.length} run${runIds.length === 1 ? "" : "s"} selected`}
+              </small>
+            </div>
+            <span className="status status-completed">{runIds.length === 0 ? "Choose runs" : selectedRuns.length > 1 ? "All selected runs" : selectedRun?.status ?? "Latest"}</span>
             <button type="button" className="secondary-button compact-action" onClick={() => startNewChat()}>
               New Chat
             </button>
@@ -220,7 +253,7 @@ export function VideoChatPage() {
 
         <VideoContextPanel
           selectedRun={selectedRun}
-          runId={runIds[0]}
+          runId={runIds[0] ?? "latest"}
           selectedRunIds={runIds}
           selectedRuns={selectedRuns}
           latestMessage={latestAssistantMessage}
@@ -566,10 +599,10 @@ function VideoContextPanel({
           <section>
             <h2>Current Video</h2>
             <dl className="context-list">
-              <div><dt>Run</dt><dd>{selectedRun?.run_id ?? runId}</dd></div>
-              <div><dt>Scope</dt><dd>{selectedRunIds.length > 1 ? "All selected runs" : selectedRun?.run_id ?? runId}</dd></div>
-              <div><dt>Status</dt><dd>{selectedRunIds.length > 1 ? `${selectedRunIds.length} runs` : selectedRun?.status ?? "Latest"}</dd></div>
-              <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : "Unavailable"}</dd></div>
+              <div><dt>Run</dt><dd>{selectedRunIds.length > 1 ? `${selectedRunIds.length} selected` : selectedRun?.run_id ?? runId}</dd></div>
+              <div><dt>Scope</dt><dd>{selectedRunIds.length === 0 ? "No runs selected" : selectedRunIds.length > 1 ? "All selected runs" : selectedRun?.run_id ?? runId}</dd></div>
+              <div><dt>Status</dt><dd>{selectedRunIds.length === 0 ? "Choose runs" : selectedRunIds.length > 1 ? `${selectedRunIds.length} runs` : selectedRun?.status ?? "Latest"}</dd></div>
+              <div><dt>Duration</dt><dd>{selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : selectedRunIds.length > 1 ? "Multiple runs" : "Unavailable"}</dd></div>
               <div><dt>Completed vehicles</dt><dd>{selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.physical_vehicle_count ?? run.track_count ?? 0), 0) : selectedRun?.physical_vehicle_count ?? selectedRun?.track_count ?? "Unavailable"}</dd></div>
               {selectedRun?.raw_track_count != null && selectedRun.raw_track_count !== (selectedRun.physical_vehicle_count ?? selectedRun.track_count) ? (
                 <div><dt>Raw tracks</dt><dd>{selectedRun.raw_track_count}</dd></div>
@@ -638,11 +671,11 @@ function getResultMetrics(intent: string | undefined, analytics: Record<string, 
 }
 
 function getGroupRows(analytics: Record<string, unknown>) {
-  const source = analytics.by_type ?? analytics.by_class ?? analytics.by_colour ?? analytics.counts;
+  const source = analytics.by_run_camera ?? analytics.by_run ?? analytics.by_camera ?? analytics.by_type ?? analytics.by_class ?? analytics.by_colour ?? analytics.counts;
   if (!source || typeof source !== "object" || Array.isArray(source)) return [];
   return Object.entries(source as Record<string, unknown>)
     .filter(([, value]) => typeof value === "number" || typeof value === "string")
-    .slice(0, 8)
+    .slice(0, 12)
     .map(([label, value]) => ({ label: formatLabel(label), value: String(value) }));
 }
 

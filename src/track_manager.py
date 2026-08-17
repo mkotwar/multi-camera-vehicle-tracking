@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from copy import deepcopy
 from dataclasses import asdict
 from typing import Any
@@ -54,6 +55,10 @@ class TrackManager:
         self._tracks: dict[tuple[str, str, int], LocalTrack] = {}
         self._completed_tracks: list[LocalTrack] = []
         self._discarded_tracks: list[LocalTrack] = []
+        self._lock = threading.RLock()
+        self._next_logical_track_number_by_camera: dict[str, int] = {}
+        self._native_to_active_logical: dict[tuple[str, str, int], str] = {}
+        self._finalized_logical_identities: set[tuple[str, str]] = set()
         self._last_frame_by_camera: dict[str, int] = {}
         self._mixed_class_logged_tracks: set[str] = set()
         self._metrics: dict[str, Any] = {
@@ -70,6 +75,8 @@ class TrackManager:
             "duplicate_observation_count": 0,
             "out_of_order_frame_count": 0,
             "active_tracks_at_shutdown": 0,
+            "next_logical_track_number_by_camera": {},
+            "active_native_to_logical_count": 0,
             "minimum_observations": self.minimum_observations,
             "maximum_lost_frames": self.maximum_lost_frames,
             "minimum_winner_ratio": self.minimum_winner_ratio,
@@ -102,8 +109,18 @@ class TrackManager:
             observations.extend(track.observations)
         return observations
 
+    def assign_logical_track_ids(
+        self,
+        camera_id: str,
+        frame_number: int,
+        tracked_detections: list[TrackedDetection],
+    ) -> list[TrackedDetection]:
+        with self._lock:
+            return [self._with_logical_track_id(camera_id, frame_number, detection) for detection in tracked_detections]
+
     def get_metrics(self) -> dict[str, Any]:
-        completed_tracks = [track for track in self._completed_tracks if track.status == TRACK_STATUS_COMPLETED]
+        with self._lock:
+            completed_tracks = [track for track in self._completed_tracks if track.status == TRACK_STATUS_COMPLETED]
         average_observations = (
             float(sum(track.observation_count for track in completed_tracks) / len(completed_tracks))
             if completed_tracks
@@ -116,23 +133,27 @@ class TrackManager:
             TRACK_STATUS_COMPLETED: len(self._completed_tracks),
             TRACK_STATUS_DISCARDED: len(self._discarded_tracks),
         }
-        for track in self._tracks.values():
-            status_counts[track.status] = status_counts.get(track.status, 0) + 1
-        self._metrics["status_counts"] = status_counts
-        self._metrics["active_tracks_at_shutdown"] = len(
-            [track for track in self._tracks.values() if track.status in {TRACK_STATUS_TENTATIVE, TRACK_STATUS_ACTIVE, TRACK_STATUS_LOST}]
-        )
-        return {
-            **self._metrics,
-            "tracks_created_by_camera": dict(self._metrics["tracks_created_by_camera"]),
-            "tracks_completed_by_camera": dict(self._metrics["tracks_completed_by_camera"]),
-            "tracks_discarded_by_camera": dict(self._metrics["tracks_discarded_by_camera"]),
-            "observations_by_camera": dict(self._metrics["observations_by_camera"]),
-            "status_counts": dict(self._metrics["status_counts"]),
-            "final_class_counts": dict(self._metrics["final_class_counts"]),
-            "final_class_reason_counts": dict(self._metrics["final_class_reason_counts"]),
-            "average_observations_per_completed_track": average_observations,
-        }
+        with self._lock:
+            for track in self._tracks.values():
+                status_counts[track.status] = status_counts.get(track.status, 0) + 1
+            self._metrics["status_counts"] = status_counts
+            self._metrics["active_tracks_at_shutdown"] = len(
+                [track for track in self._tracks.values() if track.status in {TRACK_STATUS_TENTATIVE, TRACK_STATUS_ACTIVE, TRACK_STATUS_LOST}]
+            )
+            self._metrics["next_logical_track_number_by_camera"] = dict(self._next_logical_track_number_by_camera)
+            self._metrics["active_native_to_logical_count"] = len(self._native_to_active_logical)
+            return {
+                **self._metrics,
+                "tracks_created_by_camera": dict(self._metrics["tracks_created_by_camera"]),
+                "tracks_completed_by_camera": dict(self._metrics["tracks_completed_by_camera"]),
+                "tracks_discarded_by_camera": dict(self._metrics["tracks_discarded_by_camera"]),
+                "observations_by_camera": dict(self._metrics["observations_by_camera"]),
+                "status_counts": dict(self._metrics["status_counts"]),
+                "final_class_counts": dict(self._metrics["final_class_counts"]),
+                "final_class_reason_counts": dict(self._metrics["final_class_reason_counts"]),
+                "next_logical_track_number_by_camera": dict(self._metrics["next_logical_track_number_by_camera"]),
+                "average_observations_per_completed_track": average_observations,
+            }
 
     def update_frame(
         self,
@@ -140,46 +161,56 @@ class TrackManager:
         frame_number: int,
         tracked_detections: list[TrackedDetection],
     ) -> list[LocalTrack]:
-        self._validate_frame_order(camera_id, frame_number)
-        present_track_keys: set[tuple[str, str, int]] = set()
-        completed_now: list[LocalTrack] = []
-        for detection in tracked_detections:
-            self._validate_tracked_detection(camera_id, frame_number, detection)
-            key = (camera_id, str(detection.tracker_namespace), int(detection.tracker_id))
-            present_track_keys.add(key)
-            track = self._tracks.get(key)
-            if track is None:
-                track = self._create_track_from_detection(detection)
-                self._tracks[key] = track
-            else:
-                if track.status == TRACK_STATUS_LOST:
-                    self._metrics["lost_then_reactivated_count"] += 1
-                    self.logger.debug(
-                        "track reactivated camera=%s frame=%s local_track_id=%s native_tracker_id=%s",
-                        camera_id,
-                        frame_number,
-                        track.local_track_id,
-                        detection.tracker_id,
-                    )
-                self._append_observation(track, detection)
-        completed_now.extend(self._mark_missing_tracks(camera_id, frame_number, present_track_keys))
-        return [self._track_snapshot(track) for track in completed_now]
+        with self._lock:
+            self._validate_frame_order(camera_id, frame_number)
+            present_track_keys: set[tuple[str, str, int]] = set()
+            completed_now: list[LocalTrack] = []
+            for raw_detection in tracked_detections:
+                detection = self._with_logical_track_id(camera_id, frame_number, raw_detection)
+                self._validate_tracked_detection(camera_id, frame_number, detection)
+                key = self._native_key(detection)
+                present_track_keys.add(key)
+                track = self._tracks.get(key)
+                if track is None:
+                    track = self._create_track_from_detection(detection)
+                    self._tracks[key] = track
+                else:
+                    if detection.local_track_id != track.local_track_id:
+                        raise ConfigurationError(
+                            "Native tracker mapping changed for active track "
+                            f"camera={camera_id} namespace={detection.tracker_namespace} native_tracker_id={detection.tracker_id}: "
+                            f"active={track.local_track_id} detection={detection.local_track_id}"
+                        )
+                    if track.status == TRACK_STATUS_LOST:
+                        self._metrics["lost_then_reactivated_count"] += 1
+                        self.logger.debug(
+                            "track reactivated camera=%s frame=%s local_track_id=%s native_tracker_id=%s",
+                            camera_id,
+                            frame_number,
+                            track.local_track_id,
+                            detection.tracker_id,
+                        )
+                    self._append_observation(track, detection)
+            completed_now.extend(self._mark_missing_tracks(camera_id, frame_number, present_track_keys))
+            return [self._track_snapshot(track) for track in completed_now]
 
     def flush_camera(self, camera_id: str, completion_reason: str = COMPLETION_REASON_END_OF_STREAM) -> list[LocalTrack]:
-        finalized: list[LocalTrack] = []
-        for key, track in list(self._tracks.items()):
-            if track.camera_id != camera_id:
-                continue
-            finalized.append(self._finalize_track(key, completion_reason))
-        self.logger.info("camera flushed camera_id=%s finalized_tracks=%s", camera_id, len(finalized))
-        return [self._track_snapshot(track) for track in finalized]
+        with self._lock:
+            finalized: list[LocalTrack] = []
+            for key, track in list(self._tracks.items()):
+                if track.camera_id != camera_id:
+                    continue
+                finalized.append(self._finalize_track(key, completion_reason))
+            self.logger.info("camera flushed camera_id=%s finalized_tracks=%s", camera_id, len(finalized))
+            return [self._track_snapshot(track) for track in finalized]
 
     def flush_all(self) -> list[LocalTrack]:
-        finalized: list[LocalTrack] = []
-        for camera_id in sorted({track.camera_id for track in self._tracks.values()}):
-            finalized.extend(self.flush_camera(camera_id))
-        self.logger.info("all tracks flushed finalized_tracks=%s", len(finalized))
-        return finalized
+        with self._lock:
+            finalized: list[LocalTrack] = []
+            for camera_id in sorted({track.camera_id for track in self._tracks.values()}):
+                finalized.extend(self.flush_camera(camera_id))
+            self.logger.info("all tracks flushed finalized_tracks=%s", len(finalized))
+            return finalized
 
     def _validate_frame_order(self, camera_id: str, frame_number: int) -> None:
         previous = self._last_frame_by_camera.get(camera_id)
@@ -207,12 +238,76 @@ class TrackManager:
             raise ConfigurationError(f"TrackedDetection tracker_id must be a non-negative integer. Got: {detection.tracker_id}")
         if not str(detection.tracker_namespace).strip():
             raise ConfigurationError("TrackedDetection tracker_namespace must not be empty.")
+        if not str(detection.local_track_id or "").strip():
+            raise ConfigurationError("TrackedDetection local_track_id must not be empty after logical ID assignment.")
         x1, y1, x2, y2 = detection.bbox_xyxy
         if not (x2 > x1 and y2 > y1):
             raise ConfigurationError(f"TrackedDetection bbox is invalid for {camera_id}: {detection.bbox_xyxy}")
 
+    def _native_key(self, detection: TrackedDetection) -> tuple[str, str, int]:
+        return (detection.camera_id, str(detection.tracker_namespace), int(detection.tracker_id))
+
+    def _with_logical_track_id(self, camera_id: str, frame_number: int, detection: TrackedDetection) -> TrackedDetection:
+        self._validate_tracked_detection_shape(camera_id, frame_number, detection)
+        key = self._native_key(detection)
+        local_track_id = self._native_to_active_logical.get(key)
+        if local_track_id is None:
+            local_track_id = self._allocate_logical_track_id(detection.camera_id, detection.tracker_namespace)
+            self._native_to_active_logical[key] = local_track_id
+            self.logger.debug(
+                "native tracker mapped camera=%s namespace=%s native_tracker_id=%s local_track_id=%s",
+                detection.camera_id,
+                detection.tracker_namespace,
+                detection.tracker_id,
+                local_track_id,
+            )
+        elif detection.local_track_id is not None and detection.local_track_id != local_track_id:
+            raise ConfigurationError(
+                "TrackedDetection local_track_id conflicts with active native mapping "
+                f"camera={camera_id} namespace={detection.tracker_namespace} native_tracker_id={detection.tracker_id}: "
+                f"active={local_track_id} detection={detection.local_track_id}"
+            )
+        if detection.local_track_id == local_track_id:
+            return detection
+        return TrackedDetection(
+            camera_id=detection.camera_id,
+            tracker_namespace=detection.tracker_namespace,
+            frame_number=detection.frame_number,
+            timestamp_seconds=detection.timestamp_seconds,
+            tracker_id=detection.tracker_id,
+            bbox_xyxy=detection.bbox_xyxy,
+            confidence=detection.confidence,
+            raw_class_id=detection.raw_class_id,
+            raw_class_name=detection.raw_class_name,
+            local_track_id=local_track_id,
+        )
+
+    def _validate_tracked_detection_shape(self, camera_id: str, frame_number: int, detection: TrackedDetection) -> None:
+        if detection.camera_id != camera_id:
+            raise ConfigurationError(
+                f"TrackedDetection camera mismatch. update_frame camera={camera_id}; detection camera={detection.camera_id}"
+            )
+        if detection.frame_number != frame_number:
+            raise ConfigurationError(
+                f"TrackedDetection frame mismatch. update_frame frame={frame_number}; detection frame={detection.frame_number}"
+            )
+        if int(detection.tracker_id) < 0:
+            raise ConfigurationError(f"TrackedDetection tracker_id must be a non-negative integer. Got: {detection.tracker_id}")
+        if not str(detection.tracker_namespace).strip():
+            raise ConfigurationError("TrackedDetection tracker_namespace must not be empty.")
+        x1, y1, x2, y2 = detection.bbox_xyxy
+        if not (x2 > x1 and y2 > y1):
+            raise ConfigurationError(f"TrackedDetection bbox is invalid for {camera_id}: {detection.bbox_xyxy}")
+
+    def _allocate_logical_track_id(self, camera_id: str, tracker_namespace: str) -> str:
+        next_number = int(self._next_logical_track_number_by_camera.get(camera_id, 1))
+        self._next_logical_track_number_by_camera[camera_id] = next_number + 1
+        return self._build_local_track_id(camera_id, tracker_namespace, next_number)
+
     def _create_track_from_detection(self, detection: TrackedDetection) -> LocalTrack:
-        local_track_id = self._build_local_track_id(detection.camera_id, detection.tracker_namespace, int(detection.tracker_id))
+        local_track_id = str(detection.local_track_id or "").strip()
+        if not local_track_id:
+            raise ConfigurationError("Cannot create a LocalTrack without an assigned logical track ID.")
         observation = self._build_observation(local_track_id, detection)
         class_name = str(detection.raw_class_name).strip()
         track = LocalTrack(
@@ -327,9 +422,18 @@ class TrackManager:
 
     def _finalize_track(self, key: tuple[str, int], completion_reason: str) -> LocalTrack:
         track = self._tracks.pop(key)
+        self._native_to_active_logical.pop(key, None)
         final_class, final_reason = self._calculate_final_class(track)
         track.final_class = final_class
         track.final_class_reason = final_reason
+        finalized_identity = (track.camera_id, track.local_track_id)
+        if finalized_identity in self._finalized_logical_identities:
+            raise ConfigurationError(
+                "Duplicate finalized logical track identity detected at source: "
+                f"camera_id={track.camera_id} local_track_id={track.local_track_id} "
+                f"native_tracker_id={track.native_tracker_id}"
+            )
+        self._finalized_logical_identities.add(finalized_identity)
         if track.observation_count >= self.minimum_observations:
             track.status = TRACK_STATUS_COMPLETED
             track.completion_reason = completion_reason

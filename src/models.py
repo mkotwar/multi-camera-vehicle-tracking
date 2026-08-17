@@ -103,6 +103,7 @@ class TrackedDetection:
     confidence: float
     raw_class_id: int
     raw_class_name: str
+    local_track_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
