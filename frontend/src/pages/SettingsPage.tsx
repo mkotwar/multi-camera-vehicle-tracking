@@ -1,6 +1,6 @@
-import { MutableRefObject, PointerEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, MutableRefObject, PointerEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { cloneConfig, getConfig, listConfigs, roiPreviewDraftUrl, saveConfig, validateConfig } from "../api/configs";
+import { cloneConfig, getConfig, listConfigs, roiPreviewDraftUrl, saveConfig, uploadConfigVideoSource, validateConfig } from "../api/configs";
 import type { ConfigInventoryItem, ConfigListItem, ConfigValidationError, ConfigValidationResult, PipelineConfig } from "../types/config";
 
 type RoiRectangle = {
@@ -38,6 +38,9 @@ export function SettingsPage() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [uploadingSources, setUploadingSources] = useState<Record<string, boolean>>({});
+  const [sourceUploadErrors, setSourceUploadErrors] = useState<Record<string, string | null>>({});
+  const [draggingSourceCameraId, setDraggingSourceCameraId] = useState<string | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
 
@@ -128,6 +131,34 @@ export function SettingsPage() {
     });
     setDirty(true);
     setStatus(null);
+  }
+
+  function setSourceUploadError(cameraKey: string, nextError: string | null) {
+    setSourceUploadErrors((current) => ({ ...current, [cameraKey]: nextError }));
+  }
+
+  async function handleVideoSourceUpload(cameraIndex: number, file: File) {
+    if (!selectedConfig) {
+      return;
+    }
+    const camera = cameras[cameraIndex];
+    const cameraKey = String(camera?.camera_id ?? cameraIndex);
+    if (!cameraKey) {
+      return;
+    }
+    setUploadingSources((current) => ({ ...current, [cameraKey]: true }));
+    setSourceUploadError(cameraKey, null);
+    try {
+      const result = await uploadConfigVideoSource(selectedConfig, cameraKey, file);
+      updateValue(["input", "cameras", cameraIndex, "source"], result.source_path);
+      updateValue(["input", "cameras", cameraIndex, "source_type"], "video");
+      setStatus(`Uploaded ${result.filename} for ${result.camera_id}.`);
+    } catch (exc) {
+      setSourceUploadError(cameraKey, formatUploadError(exc));
+    } finally {
+      setUploadingSources((current) => ({ ...current, [cameraKey]: false }));
+      setDraggingSourceCameraId((current) => (current === cameraKey ? null : current));
+    }
   }
 
   function updateRoi(cameraIndex: number, next: RoiRectangle) {
@@ -422,7 +453,23 @@ export function SettingsPage() {
                     }}
                   />
                   <SelectControl label="Source type" value={String(camera.source_type ?? "video")} options={["video", "rtsp", "webcam"]} onChange={(value) => updateValue(["input", "cameras", index, "source_type"], value)} />
-                  <TextControl label="Source" value={String(camera.source ?? "")} onChange={(value) => updateValue(["input", "cameras", index, "source"], value)} />
+                  {String(camera.source_type ?? "video") === "video" ? (
+                    <VideoSourceControl
+                      cameraId={String(camera.camera_id ?? `CAM_${index + 1}`)}
+                      value={String(camera.source ?? "")}
+                      uploading={Boolean(uploadingSources[String(camera.camera_id ?? index)])}
+                      uploadError={sourceUploadErrors[String(camera.camera_id ?? index)] ?? null}
+                      dragging={draggingSourceCameraId === String(camera.camera_id ?? index)}
+                      onChange={(value) => {
+                        setSourceUploadError(String(camera.camera_id ?? index), null);
+                        updateValue(["input", "cameras", index, "source"], value);
+                      }}
+                      onFileSelected={(file) => void handleVideoSourceUpload(index, file)}
+                      onDragStateChange={(active) => setDraggingSourceCameraId(active ? String(camera.camera_id ?? index) : null)}
+                    />
+                  ) : (
+                    <TextControl label="Source" value={String(camera.source ?? "")} onChange={(value) => updateValue(["input", "cameras", index, "source"], value)} />
+                  )}
                   <ToggleControl label="Enabled" checked={Boolean(camera.enabled)} onChange={(value) => updateValue(["input", "cameras", index, "enabled"], value)} />
                 </div>
                 <CameraRoiControls
@@ -664,6 +711,88 @@ function TextControl({ label, value, onChange }: { label: string; value: string;
   );
 }
 
+function VideoSourceControl({
+  cameraId,
+  value,
+  uploading,
+  uploadError,
+  dragging,
+  onChange,
+  onFileSelected,
+  onDragStateChange,
+}: {
+  cameraId: string;
+  value: string;
+  uploading: boolean;
+  uploadError: string | null;
+  dragging: boolean;
+  onChange: (value: string) => void;
+  onFileSelected: (file: File) => void;
+  onDragStateChange: (active: boolean) => void;
+}) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  function handleFiles(fileList: FileList | null) {
+    const file = fileList?.[0];
+    if (file) {
+      onFileSelected(file);
+    }
+  }
+
+  function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    handleFiles(event.target.files);
+    event.target.value = "";
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    onDragStateChange(false);
+    handleFiles(event.dataTransfer.files);
+  }
+
+  return (
+    <div className="field-control video-source-control">
+      <span>Video source</span>
+      <div
+        className={`video-source-dropzone ${dragging ? "dragging" : ""}`}
+        aria-label={`Drop video for ${cameraId}`}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          onDragStateChange(true);
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          onDragStateChange(true);
+        }}
+        onDragLeave={(event) => {
+          event.preventDefault();
+          onDragStateChange(false);
+        }}
+        onDrop={handleDrop}
+      >
+        <div>
+          <strong>Browse or drop a video file</strong>
+          <p>{uploading ? "Uploading selected video..." : "Supported: MP4, AVI, MOV, MKV, M4V, WEBM"}</p>
+        </div>
+        <button className="secondary-button" type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+          Browse Video
+        </button>
+        <input
+          ref={fileInputRef}
+          className="sr-only"
+          aria-label={`Upload video for ${cameraId}`}
+          type="file"
+          accept="video/*,.mp4,.avi,.mov,.mkv,.m4v,.webm"
+          onChange={handleFileInputChange}
+        />
+      </div>
+      <input value={value} onChange={(event) => onChange(event.target.value)} placeholder="Stored video path or existing absolute path" />
+      <p className="field-hint">Existing paths still work. Uploading stores the file locally and updates the same YAML source field.</p>
+      {uploadError ? <div className="field-error">{uploadError}</div> : null}
+    </div>
+  );
+}
+
 function NumberControl({ label, value, step, min, max, onChange }: { label: string; value: number; step: number; min?: number; max?: number; onChange: (value: number) => void }) {
   return (
     <label className="field-control">
@@ -879,6 +1008,14 @@ function errorMessage(exc: unknown): string {
     return exc.message;
   }
   return "Request failed.";
+}
+
+function formatUploadError(exc: unknown): string {
+  const detail = errorMessage(exc);
+  if (isRecord(exc) && typeof exc.status === "number") {
+    return `Video upload failed. The server rejected the upload request (HTTP ${exc.status}). ${detail}`;
+  }
+  return `Video upload failed. ${detail}`;
 }
 
 async function previewErrorMessage(response: Response): Promise<string> {

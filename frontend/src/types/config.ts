@@ -45,3 +45,10 @@ export type ConfigSaveResult = ConfigValidationResult & {
   config_name: string;
   yaml_text: string;
 };
+
+export type ConfigVideoSourceUploadResult = {
+  camera_id: string;
+  filename: string;
+  source_path: string;
+  stored_path: string;
+};

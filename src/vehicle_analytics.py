@@ -27,6 +27,11 @@ class VehicleRecord:
     status: str
     member_track_ids: tuple[str, ...] = ()
     plate_text: str | None = None
+    plate_detected: bool | None = None
+    plate_detection_confidence: float | None = None
+    plate_text_confidence: float | None = None
+    plate_quality_status: str | None = None
+    plate_ocr_reason: str | None = None
     run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,6 +74,11 @@ def vehicle_records_from_tracks(tracks: list[dict[str, Any]]) -> list[VehicleRec
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
                 plate_text=_extract_track_plate_text(track),
+                plate_detected=_coerce_bool(_extract_track_enrichment_value(track, "plate_detected")),
+                plate_detection_confidence=_coerce_float(_extract_track_enrichment_value(track, "plate_detection_confidence")),
+                plate_text_confidence=_coerce_float(_extract_track_enrichment_value(track, "plate_text_confidence")),
+                plate_quality_status=_coerce_str_or_none(_extract_track_enrichment_value(track, "plate_quality_status")),
+                plate_ocr_reason=_coerce_str_or_none(_extract_track_enrichment_value(track, "plate_ocr_reason")),
                 run_id=run_id,
             )
         )
@@ -103,6 +113,11 @@ def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
                 plate_text=str(track.get("plate_text") or "").strip().upper() or None,
+                plate_detected=_coerce_bool(track.get("plate_detected")),
+                plate_detection_confidence=_coerce_float(track.get("plate_detection_confidence")),
+                plate_text_confidence=_coerce_float(track.get("plate_text_confidence")),
+                plate_quality_status=_coerce_str_or_none(track.get("plate_quality_status")),
+                plate_ocr_reason=_coerce_str_or_none(track.get("plate_ocr_reason")),
                 run_id=run_id,
             )
         )
@@ -135,6 +150,27 @@ def vehicle_records_from_physical_vehicles(vehicles: list[dict[str, Any]]) -> li
                 status=str(vehicle.get("identity_status") or "PHYSICAL_VEHICLE"),
                 member_track_ids=member_track_ids,
                 plate_text=str(vehicle.get("consensus_plate_text") or "") or None,
+                plate_detected=_coerce_bool(
+                    vehicle.get("plate_detected")
+                    or (vehicle.get("plate") or {}).get("detected")
+                    or bool(vehicle.get("consensus_plate_text"))
+                ),
+                plate_detection_confidence=_coerce_float(
+                    vehicle.get("plate_detection_confidence")
+                    or (vehicle.get("plate") or {}).get("detection_confidence")
+                ),
+                plate_text_confidence=_coerce_float(
+                    vehicle.get("plate_text_confidence")
+                    or (vehicle.get("plate") or {}).get("text_confidence")
+                ),
+                plate_quality_status=_coerce_str_or_none(
+                    vehicle.get("plate_quality_status")
+                    or (vehicle.get("plate") or {}).get("quality")
+                ),
+                plate_ocr_reason=_coerce_str_or_none(
+                    vehicle.get("plate_ocr_reason")
+                    or (vehicle.get("plate") or {}).get("status")
+                ),
                 run_id=run_id,
             )
         )
@@ -339,6 +375,13 @@ def _extract_track_plate_text(track: dict[str, Any]) -> str | None:
     return text or None
 
 
+def _extract_track_enrichment_value(track: dict[str, Any], key: str) -> Any:
+    enrichment = track.get("vehicle_enrichment")
+    if isinstance(enrichment, dict) and key in enrichment:
+        return enrichment.get(key)
+    return track.get(key)
+
+
 def _normalize_vehicle_class(value: Any) -> str:
     normalized = str(value or UNKNOWN_CLASS).strip().upper()
     return normalized if normalized in SUPPORTED_VEHICLE_CLASSES else UNKNOWN_CLASS
@@ -396,3 +439,21 @@ def _coerce_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    return bool(value)
+
+
+def _coerce_str_or_none(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None

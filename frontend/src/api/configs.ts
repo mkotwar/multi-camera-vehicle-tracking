@@ -1,5 +1,5 @@
-import { apiGet, apiPost, apiPut, apiUrl } from "./client";
-import type { ConfigDetail, ConfigListItem, ConfigSaveResult, ConfigValidationResult, PipelineConfig } from "../types/config";
+import { apiGet, apiPost, apiPut, apiUrl, ApiError } from "./client";
+import type { ConfigDetail, ConfigListItem, ConfigSaveResult, ConfigValidationResult, ConfigVideoSourceUploadResult, PipelineConfig } from "../types/config";
 
 export async function listConfigs(): Promise<ConfigListItem[]> {
   const payload = await apiGet<{ configs: ConfigListItem[] }>("/api/configs");
@@ -28,4 +28,24 @@ export function roiPreviewUrl(configName: string, cameraId: string): string {
 
 export function roiPreviewDraftUrl(configName: string): string {
   return apiUrl(`/api/configs/${encodeURIComponent(configName)}/roi-preview`);
+}
+
+export async function uploadConfigVideoSource(configName: string, cameraId: string, file: File): Promise<ConfigVideoSourceUploadResult> {
+  const payload = new FormData();
+  payload.append("camera_id", cameraId);
+  payload.append("file", file);
+  const response = await fetch(apiUrl(`/api/configs/${encodeURIComponent(configName)}/camera-source`), {
+    method: "POST",
+    body: payload,
+  });
+  if (!response.ok) {
+    let detail: unknown = null;
+    try {
+      detail = await response.json();
+    } catch {
+      detail = await response.text();
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return (await response.json()) as ConfigVideoSourceUploadResult;
 }

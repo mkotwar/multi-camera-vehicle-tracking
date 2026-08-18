@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppLayout } from "../components/layout/AppLayout";
 import { VideoChatPage } from "./VideoChatPage";
 
 const { fetchRuns, sendVideoChatMessage, fetchTrack, fetchTrackEvidence } = vi.hoisted(() => ({
@@ -41,11 +42,20 @@ function LocationProbe() {
   return <span data-testid="location">{location.pathname}</span>;
 }
 
+function openRunSelector() {
+  const trigger = screen.getByRole("button", { name: "Select runs" });
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    fireEvent.click(trigger);
+  }
+}
+
 function getRunCheckbox(runId: string) {
+  openRunSelector();
   return screen.getByRole("checkbox", { name: new RegExp(`^${runId}\\b`) }) as HTMLInputElement;
 }
 
 function expectSelectedRuns(runIds: string[]) {
+  openRunSelector();
   for (const checkbox of screen.getAllByRole("checkbox")) {
     const input = checkbox as HTMLInputElement;
     const label = input.nextElementSibling?.textContent ?? "";
@@ -162,7 +172,7 @@ describe("VideoChatPage", () => {
     );
 
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
-    expect(screen.getByText("Ask questions about this video")).toBeInTheDocument();
+    expect(screen.getByText("Ask questions about this run")).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: "Show white cars" })[0]);
 
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledWith(expect.objectContaining({ message: "Show white cars" })));
@@ -242,7 +252,7 @@ describe("VideoChatPage", () => {
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show me the white cars" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect((await screen.findAllByText("TRACK_13")).length).toBeGreaterThan(0);
+    expect(await screen.findByText("Track: TRACK_13")).toBeInTheDocument();
     expect(screen.getAllByText("CAR").length).toBeGreaterThan(0);
     expect(screen.getAllByText("WHITE").length).toBeGreaterThan(0);
     expect(screen.getByText("Plate: MP09AB1234")).toBeInTheDocument();
@@ -369,8 +379,8 @@ describe("VideoChatPage", () => {
     expect(await screen.findByText("CAM_001:TRACK_13")).toBeInTheDocument();
     expect(screen.getByText("Show vehicles")).toBeInTheDocument();
     expect(screen.getAllByText("2 vehicles were observed.").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("TRACK_5").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("TRACK_13").length).toBeGreaterThan(0);
+    expect(screen.getByText("Track: TRACK_5")).toBeInTheDocument();
+    expect(screen.getByText("Track: TRACK_13")).toBeInTheDocument();
   });
 
   it("renders selected track evidence categories", async () => {
@@ -471,6 +481,51 @@ describe("VideoChatPage", () => {
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenLastCalledWith(expect.objectContaining({ message: "Show them" })));
   });
 
+  it("keeps simple plate count responses compact without irrelevant zero breakdowns", async () => {
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "20260812_113742",
+      session_id: "session",
+      answer: "There are 11 cars with detected plates.",
+      parser_used: "rule",
+      parsed_query: {
+        intent: "COUNT",
+        subject: "vehicles",
+        include_classes: ["CAR"],
+        exclude_classes: [],
+        include_colours: [],
+        exclude_colours: [],
+        plate_presence: "detected",
+        show_evidence: false,
+      },
+      analytics_result: {
+        total: 11,
+        by_class: { CAR: 11, BUS: 0, MOTORCYCLE: 0, "3WHEELER": 0 },
+      },
+      matching_vehicle_ids: ["CAM_001:TRACK_13"],
+      evidence: [],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "how many cars with number plate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect((await screen.findAllByText("There are 11 cars with detected plates.")).length).toBeGreaterThan(0);
+    const primaryMetric = screen.getByLabelText("Primary result metric");
+    expect(within(primaryMetric).getByText("11")).toBeInTheDocument();
+    expect(within(primaryMetric).getByText("vehicles")).toBeInTheDocument();
+    expect(within(primaryMetric).getByText("CAR")).toBeInTheDocument();
+    expect(screen.getByText("Plates: Detected")).toBeInTheDocument();
+    expect(screen.queryByText("3WHEELER 0")).not.toBeInTheDocument();
+    expect(screen.queryByText("Motorcycle")).not.toBeInTheDocument();
+  });
+
   it("does not offer evidence actions for general chat responses", async () => {
     sendVideoChatMessage.mockResolvedValue({
       run_id: "20260812_113742",
@@ -529,9 +584,9 @@ describe("VideoChatPage", () => {
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Give me a traffic summary" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("Total vehicles")).toBeInTheDocument();
-    expect(screen.getByText("MOTORCYCLE")).toBeInTheDocument();
-    expect(screen.getByText("CAR")).toBeInTheDocument();
+    expect(await screen.findByText("Completed vehicles")).toBeInTheDocument();
+    expect(screen.getByText("MOTORCYCLE 18")).toBeInTheDocument();
+    expect(screen.getByText("CAR 17")).toBeInTheDocument();
   });
 
   it("renders comparison metrics and keeps developer details collapsed", async () => {
@@ -557,7 +612,7 @@ describe("VideoChatPage", () => {
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Were bikes more common than cars?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("Difference")).toBeInTheDocument();
+    expect((await screen.findAllByText("Motorcycles were slightly more common.")).length).toBeGreaterThan(0);
     const details = screen.getByText("Developer Details").closest("details");
     expect(details).not.toHaveAttribute("open");
   });
@@ -649,7 +704,7 @@ describe("VideoChatPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "New Chat" }));
     expect(screen.getByLabelText("Video analytics chat history").querySelectorAll(".chat-message-row")).toHaveLength(0);
-    expect(screen.getByText("Ask questions about this video")).toBeInTheDocument();
+    expect(screen.getByText("Ask questions about this run")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show them" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
@@ -668,7 +723,7 @@ describe("VideoChatPage", () => {
     );
 
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
-    expect(screen.getByText("Ask questions about this video")).toBeInTheDocument();
+    expect(screen.getByText("Ask questions about this run")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "How many cars were there?" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledTimes(1));
@@ -867,7 +922,7 @@ describe("VideoChatPage", () => {
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show vehicles" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    await screen.findByText("TRACK_5");
+    await screen.findByText("Track: TRACK_5");
     const beforeSelection = window.localStorage.getItem("video-chat.sessions-by-run.v1");
 
     fireEvent.click(screen.getByRole("button", { name: "View Track" }));
@@ -917,7 +972,7 @@ describe("VideoChatPage", () => {
     await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show white cars" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    expect(await screen.findByText("TRACK_5")).toBeInTheDocument();
+    expect(await screen.findByText("Track: TRACK_5")).toBeInTheDocument();
 
     unmount();
     render(
@@ -927,7 +982,7 @@ describe("VideoChatPage", () => {
     );
 
     expect(screen.getAllByText("1 white car was observed.").length).toBeGreaterThan(0);
-    expect(screen.getByText("TRACK_5")).toBeInTheDocument();
+    expect(screen.getByText("Track: TRACK_5")).toBeInTheDocument();
     expect(screen.getAllByText("WHITE").length).toBeGreaterThan(0);
     expect(screen.getByText("All 1 matching vehicles shown.")).toBeInTheDocument();
   });
@@ -975,8 +1030,9 @@ describe("VideoChatPage", () => {
     fireEvent.click(getRunCheckbox("RUN_B"));
     fireEvent.click(getRunCheckbox("RUN_C"));
     expectSelectedRuns(["RUN_A", "RUN_B", "RUN_C"]);
-    expect(screen.getByText("3 runs selected")).toBeInTheDocument();
+    expect(screen.getAllByText("3 runs selected").length).toBeGreaterThan(0);
 
+    openRunSelector();
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     expectSelectedRuns([]);
     expect(screen.getAllByText("No runs selected").length).toBeGreaterThan(0);
@@ -987,15 +1043,225 @@ describe("VideoChatPage", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Select at least one run to start the chat.");
   });
 
-  it("renders camera and run group breakdown rows", async () => {
+  it("selects one, two, and three runs with visible scope details", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+      { run_id: "RUN_C", status: "COMPLETED", track_count: 5, camera_count: 3, duration_seconds: 6 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    expect(screen.getByText("Selected runs: 1")).toBeInTheDocument();
+    expect(screen.getByText("Cameras in scope: 1")).toBeInTheDocument();
+
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    expectSelectedRuns(["RUN_A", "RUN_B"]);
+    expect(screen.getByText("Selected runs: 2")).toBeInTheDocument();
+    expect(screen.getByText("Cameras in scope: 3")).toBeInTheDocument();
+
+    fireEvent.click(getRunCheckbox("RUN_C"));
+    expectSelectedRuns(["RUN_A", "RUN_B", "RUN_C"]);
+    expect(screen.getByText("Selected runs: 3")).toBeInTheDocument();
+    expect(screen.getByText("Cameras in scope: 6")).toBeInTheDocument();
+  });
+
+  it("deselects one run without collapsing the rest of the selection", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+      { run_id: "RUN_C", status: "COMPLETED", track_count: 5, camera_count: 3, duration_seconds: 6 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    fireEvent.click(getRunCheckbox("RUN_C"));
+    expectSelectedRuns(["RUN_A", "RUN_B", "RUN_C"]);
+
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    expectSelectedRuns(["RUN_A", "RUN_C"]);
+    expect(screen.getByText("Selected runs: 2")).toBeInTheDocument();
+    expect(screen.getByText("Cameras in scope: 4")).toBeInTheDocument();
+  });
+
+  it("selects all available runs from the toolbar", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+      { run_id: "RUN_C", status: "COMPLETED", track_count: 5, camera_count: 3, duration_seconds: 6 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    openRunSelector();
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expectSelectedRuns(["RUN_A", "RUN_B", "RUN_C"]);
+    expect(screen.getAllByText("3 runs selected").length).toBeGreaterThan(0);
+  });
+
+  it("keeps multi-run selection after sending a message and after show more", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+    ]);
+    sendVideoChatMessage
+      .mockResolvedValueOnce({
+        run_id: "RUN_A",
+        run_ids: ["RUN_A", "RUN_B"],
+        session_id: "session-multi",
+        answer: "Showing grouped evidence.",
+        parser_used: "rule",
+        parsed_query: { intent: "LIST", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: true },
+        analytics_result: { total: 2 },
+        matching_vehicle_ids: ["RUN_A:CAM_001:TRACK_1", "RUN_B:CAM_002:TRACK_2"],
+        evidence_page: {
+          matching_total: 2,
+          evidence_returned_count: 1,
+          evidence_offset: 0,
+          evidence_page_size: 1,
+          evidence_remaining_count: 1,
+          shown_count: 1,
+          next_offset: 1,
+        },
+        evidence: [
+          {
+            vehicle_id: "RUN_A:CAM_001:TRACK_1",
+            run_id: "RUN_A",
+            camera_id: "CAM_001",
+            track_id: "TRACK_1",
+            vehicle_class: "CAR",
+            colour: "WHITE",
+            image_url: "/run-a.jpg",
+            track_detail_url: "/tracks/CAM_001/TRACK_1?run_id=RUN_A",
+          },
+        ],
+        context_used: false,
+      })
+      .mockResolvedValueOnce({
+        run_id: "RUN_A",
+        run_ids: ["RUN_A", "RUN_B"],
+        session_id: "session-multi",
+        answer: "Showing grouped evidence.",
+        parser_used: "rule",
+        parsed_query: { intent: "LIST", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: true, evidence_navigation: "next" },
+        analytics_result: { total: 2 },
+        matching_vehicle_ids: ["RUN_A:CAM_001:TRACK_1", "RUN_B:CAM_002:TRACK_2"],
+        evidence_page: {
+          matching_total: 2,
+          evidence_returned_count: 1,
+          evidence_offset: 1,
+          evidence_page_size: 1,
+          evidence_remaining_count: 0,
+          shown_count: 2,
+          next_offset: 2,
+        },
+        evidence: [
+          {
+            vehicle_id: "RUN_B:CAM_002:TRACK_2",
+            run_id: "RUN_B",
+            camera_id: "CAM_002",
+            track_id: "TRACK_2",
+            vehicle_class: "BUS",
+            colour: "BLUE",
+            image_url: "/run-b.jpg",
+            track_detail_url: "/tracks/CAM_002/TRACK_2?run_id=RUN_B",
+          },
+        ],
+        context_used: true,
+      });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    fireEvent.click(getRunCheckbox("RUN_B"));
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "show vehicles by selected runs" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sendVideoChatMessage).toHaveBeenCalledTimes(1));
+    const firstSessionId = sendVideoChatMessage.mock.calls[0][0].session_id;
+
+    expect(await screen.findByText("RUN_A:CAM_001:TRACK_1")).toBeInTheDocument();
+    expectSelectedRuns(["RUN_A", "RUN_B"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(await screen.findByText("RUN_B:CAM_002:TRACK_2")).toBeInTheDocument();
+    expectSelectedRuns(["RUN_A", "RUN_B"]);
+    expect(sendVideoChatMessage.mock.calls[1][0]).toMatchObject({
+      message: "Show more",
+      run_id: "RUN_A",
+      run_ids: ["RUN_A", "RUN_B"],
+      session_id: firstSessionId,
+    });
+  });
+
+  it("persists a cleared run selection in storage", async () => {
+    fetchRuns.mockResolvedValue([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 2, duration_seconds: 4 },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expectSelectedRuns(["RUN_A"]));
+    openRunSelector();
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expectSelectedRuns([]);
+    expect(JSON.parse(window.localStorage.getItem("video-chat.active-run-ids.v1") || "null")).toEqual([]);
+    expect(screen.getAllByText("No runs selected").length).toBeGreaterThan(0);
+    expect(window.localStorage.getItem("video-chat.active-run-id.v1")).toBeNull();
+  });
+
+  it("renders structured run and camera summary cards instead of a flattened text dump", async () => {
     sendVideoChatMessage.mockResolvedValueOnce({
       run_id: "RUN_A",
       run_ids: ["RUN_A", "RUN_B"],
       session_id: "session-grouped",
-      answer: "Grouped results ready.",
+      answer: "Traffic summary by run and camera: RUN_A / CAM_001: 2 vehicles; RUN_B / CAM_003: 1 vehicles.",
       parser_used: "rule",
-      parsed_query: { intent: "GROUP", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: false, group_by: "run_camera" },
-      analytics_result: { total: 3, by_run_camera: { "RUN_A / CAM_001": 2, "RUN_B / CAM_003": 1 } },
+      parsed_query: { intent: "SUMMARY", include_classes: [], exclude_classes: [], include_colours: [], exclude_colours: [], show_evidence: false, group_by: "run_camera" },
+      analytics_result: {
+        total_unique_vehicles: 3,
+        group_by: "run_camera",
+        groups: {
+          "RUN_A / CAM_001": {
+            total_unique_vehicles: 2,
+            vehicle_classes: { CAR: 2 },
+            colours: { WHITE: 1, BLUE: 1 },
+            first_seen_seconds: 2,
+            last_seen_seconds: 8,
+          },
+          "RUN_B / CAM_003": {
+            total_unique_vehicles: 1,
+            vehicle_classes: { BUS: 1 },
+            colours: { BLACK: 1 },
+            first_seen_seconds: 10,
+            last_seen_seconds: 12,
+          },
+        },
+      },
       matching_vehicle_ids: [],
       evidence: [],
       context_used: false,
@@ -1011,7 +1277,27 @@ describe("VideoChatPage", () => {
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "count vehicles by run and camera" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByText("RUN A / CAM 001")).toBeInTheDocument();
-    expect(screen.getByText("RUN B / CAM 003")).toBeInTheDocument();
+    expect(await screen.findByText("Traffic summary by run and camera.")).toBeInTheDocument();
+    expect(screen.getByText("RUN_A")).toBeInTheDocument();
+    expect(screen.getByText("CAM_001")).toBeInTheDocument();
+    expect(screen.getByText("CAR 2")).toBeInTheDocument();
+    expect(screen.getByText("WHITE 1")).toBeInTheDocument();
+    expect(screen.getByText("RUN_B")).toBeInTheDocument();
+    expect(screen.getByText("CAM_003")).toBeInTheDocument();
+  });
+
+  it("renders the VinfoAI brand in the shared header", () => {
+    render(
+      <MemoryRouter>
+        <AppLayout>
+          <div>Body</div>
+        </AppLayout>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("link", { name: "VinfoAI home" })).toBeInTheDocument();
+    const logo = screen.getByRole("img", { name: "VinfoAI logo" });
+    expect(logo).toBeInTheDocument();
+    expect(logo).toHaveAttribute("src", expect.stringContaining("vinfo-logo.jpeg"));
   });
 });

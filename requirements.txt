@@ -5,6 +5,7 @@ pytest
 ultralytics
 supervision
 fastapi
+python-multipart
 uvicorn
 transformers==4.49.0
 peft==0.19.1

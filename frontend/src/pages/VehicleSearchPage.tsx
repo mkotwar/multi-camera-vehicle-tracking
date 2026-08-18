@@ -487,18 +487,18 @@ export function VehicleSearchPage() {
                 </thead>
                 <tbody>
                   {pagedRows.map((row) => (
-                    <tr key={`${row.run_id ?? "runtime"}-${row.local_track_id}`}>
+                    <tr key={`${row.run_id ?? "runtime"}-${row.local_track_id}`} className="vehicle-table-row">
                       <td>{row.best_crop_url ? <img src={row.best_crop_url} alt={`${row.local_track_id} crop`} className="table-thumb" /> : <div className="thumb-placeholder small">No crop</div>}</td>
-                      <td>{row.run_id ?? "runtime"}</td>
-                      <td>{row.camera_id}</td>
+                      <td><span className="table-badge table-badge--camera">{row.run_id ?? "runtime"}</span></td>
+                      <td><span className="table-badge table-badge--camera">{row.camera_id}</span></td>
                       <td><Link to={`/tracks/${row.camera_id}/${row.track_id}?run_id=${encodeURIComponent(row.run_id ?? "latest")}`}>{row.track_id}</Link></td>
                       <td><span className={`plate-badge ${row.plate_text ? "readable" : "empty"}`}>{formatPlate(row)}</span></td>
-                      <td>{(row.vehicle_class ?? "UNKNOWN").toUpperCase()}</td>
-                      <td><span className="colour-badge">{row.colour ?? row.colour_status ?? "Unavailable"}</span></td>
+                      <td><span className={`table-badge table-badge--class ${classBadgeClass(row.vehicle_class)}`}>{(row.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></td>
+                      <td><span className={`table-badge table-badge--colour ${colourBadgeClass(row.colour ?? row.colour_status)}`}>{row.colour ?? row.colour_status ?? "Unavailable"}</span></td>
                       <td>{formatVideoTime(row.first_seen_seconds ?? row.first_seen)}</td>
                       <td>{formatVideoTime(row.last_seen_seconds ?? row.last_seen)}</td>
                       <td>{formatVideoTime(row.duration_seconds)}</td>
-                      <td>{row.status ?? "-"}</td>
+                      <td><span className={`table-badge table-badge--status ${statusBadgeClass(row.status)}`}>{row.status ?? "-"}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -594,22 +594,22 @@ function PhysicalVehiclesView({
               const memberTracks = vehicle.member_track_ids ?? [];
               const cameras = vehicle.camera_ids?.length ? vehicle.camera_ids : [vehicle.primary_camera_id ?? "-"];
               return (
-                <tr key={`${vehicle.run_id ?? "latest"}-${vehicle.vehicle_id}`}>
+                <tr key={`${vehicle.run_id ?? "latest"}-${vehicle.vehicle_id}`} className="vehicle-table-row">
                   <td>{vehicle.best_crop_url ? <img src={vehicle.best_crop_url} alt={`${vehicle.vehicle_id} crop`} className="table-thumb" /> : <div className="thumb-placeholder small">No crop</div>}</td>
-                  <td><span className="status">{vehicle.vehicle_id}</span></td>
+                  <td><span className="table-badge table-badge--vehicle-id">{vehicle.vehicle_id}</span></td>
                   <td>
                     <div className="search-id-list">
-                      {memberTracks.map((trackId) => <code key={trackId}>{shortTrackId(trackId)}</code>)}
+                      {memberTracks.map((trackId) => <span key={trackId} className="table-badge table-badge--track">{shortTrackId(trackId)}</span>)}
                     </div>
                   </td>
-                  <td>{cameras.join(", ")}</td>
-                  <td>{String(vehicle.vehicle_class ?? "UNKNOWN").toUpperCase()}</td>
-                  <td><span className="colour-badge">{vehicle.vehicle_colour ?? "Unavailable"}</span></td>
-                  <td>{vehicle.consensus_plate_text ?? "No readable plate"}</td>
+                  <td><span className="table-badge table-badge--camera">{cameras.join(", ")}</span></td>
+                  <td><span className={`table-badge table-badge--class ${classBadgeClass(vehicle.vehicle_class)}`}>{String(vehicle.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></td>
+                  <td><span className={`table-badge table-badge--colour ${colourBadgeClass(vehicle.vehicle_colour)}`}>{vehicle.vehicle_colour ?? "Unavailable"}</span></td>
+                  <td><span className={`plate-badge ${vehicle.consensus_plate_text ? "readable" : "empty"}`}>{vehicle.consensus_plate_text ?? "No readable plate"}</span></td>
                   <td>{formatVideoTime(vehicle.first_seen_seconds)}</td>
                   <td>{formatVideoTime(vehicle.last_seen_seconds)}</td>
-                  <td>{formatScore(vehicle.identity_confidence)}</td>
-                  <td>{vehicle.identity_status ?? vehicle.identity_method ?? "-"}</td>
+                  <td><span className="table-badge table-badge--confidence">{formatScore(vehicle.identity_confidence)}</span></td>
+                  <td><span className={`table-badge table-badge--status ${statusBadgeClass(vehicle.identity_status ?? vehicle.identity_method)}`}>{vehicle.identity_status ?? vehicle.identity_method ?? "-"}</span></td>
                 </tr>
               );
             })}
@@ -1002,21 +1002,21 @@ function ReconciledVehiclesView({
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.vehicle_id}>
-                    <td><span className="status">{row.vehicle_id}</span></td>
+                  <tr key={row.vehicle_id} className="vehicle-table-row">
+                    <td><span className="table-badge table-badge--vehicle-id">{row.vehicle_id}</span></td>
                     <td>
                       <div className="search-id-list">
-                        {row.fragments.map((fragment) => <code key={fragment.local_track_id}>{shortTrackId(fragment.local_track_id)}</code>)}
+                        {row.fragments.map((fragment) => <span key={fragment.local_track_id} className="table-badge table-badge--track">{shortTrackId(fragment.local_track_id)}</span>)}
                       </div>
                       <span className="muted">{row.fragments.map((fragment) => shortTrackId(fragment.local_track_id)).join(" -> ")}</span>
                     </td>
-                    <td>{row.vehicle_class}</td>
-                    <td><span className="colour-badge">{row.colour}</span></td>
+                    <td><span className={`table-badge table-badge--class ${classBadgeClass(row.vehicle_class)}`}>{row.vehicle_class}</span></td>
+                    <td><span className={`table-badge table-badge--colour ${colourBadgeClass(row.colour)}`}>{row.colour}</span></td>
                     <td>{row.recovered ? "YES" : "NO"}</td>
                     <td>{row.recovered ? `${formatNumber(row.gap_frames)} frames / ${formatSeconds(row.gap_seconds)}` : "-"}</td>
-                    <td>{row.recovered ? formatScore(row.score) : "-"}</td>
-                    <td>{row.recovered ? formatScore(row.second_best_score) : "-"}</td>
-                    <td>{row.result}</td>
+                    <td><span className="table-badge table-badge--confidence">{row.recovered ? formatScore(row.score) : "-"}</span></td>
+                    <td><span className="table-badge table-badge--confidence">{row.recovered ? formatScore(row.second_best_score) : "-"}</span></td>
+                    <td><span className={`table-badge table-badge--status ${statusBadgeClass(row.result)}`}>{row.result}</span></td>
                     <td>{row.recovered ? <Link to={`/runs/${encodeURIComponent(reconciliation.run_id)}/reconciliation`}>View Evidence</Link> : "-"}</td>
                   </tr>
                 ))}
@@ -1105,6 +1105,33 @@ function MetricCard({ label, value }: { label: string; value: unknown }) {
       <strong className="summary-value">{formatNumber(value)}</strong>
     </div>
   );
+}
+
+function colourBadgeClass(value: string | null | undefined) {
+  const normalized = String(value ?? "unknown").trim().toLowerCase();
+  return `badge-tone--${normalized.replace(/[^a-z0-9]+/g, "-") || "unknown"}`;
+}
+
+function classBadgeClass(value: string | null | undefined) {
+  const normalized = String(value ?? "unknown").trim().toLowerCase();
+  return `badge-class--${normalized.replace(/[^a-z0-9]+/g, "-") || "unknown"}`;
+}
+
+function statusBadgeClass(value: string | null | undefined) {
+  const normalized = String(value ?? "unknown").trim().toLowerCase();
+  if (normalized.includes("merged")) return "badge-status--merged";
+  if (normalized.includes("accept")) return "badge-status--accepted";
+  if (normalized.includes("single")) return "badge-status--single";
+  if (normalized.includes("partial")) return "badge-status--partial";
+  if (normalized.includes("recovered")) return "badge-status--recovered";
+  if (normalized.includes("completed")) return "badge-status--completed";
+  if (normalized.includes("unmatched")) return "badge-status--unmatched";
+  if (normalized.includes("failed")) return "badge-status--failed";
+  if (normalized.includes("none")) return "badge-status--none";
+  if (normalized.includes("pending")) return "badge-status--pending";
+  if (normalized.includes("exact")) return "badge-status--exact";
+  if (normalized.includes("runtime")) return "badge-status--runtime";
+  return "badge-status--neutral";
 }
 
 function VehicleSearchResult({ result }: { result: VehicleSearchResponse }) {

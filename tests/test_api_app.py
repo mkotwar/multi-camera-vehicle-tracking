@@ -354,6 +354,30 @@ def test_api_app_filter_options_and_track_filters(tmp_path: Path) -> None:
     assert len(time_tracks) == 2
 
 
+def test_api_app_uploads_camera_video_sources(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "validation_rectangle_roi.yaml").write_text(
+        "input:\n  cameras:\n    - camera_id: CAM_001\n      source_type: video\n      source: existing.mp4\n      enabled: true\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(outputs_root=tmp_path / "runs", config_dir=config_dir))
+
+    response = client.post(
+        "/api/configs/validation_rectangle_roi.yaml/camera-source",
+        data={"camera_id": "CAM_001"},
+        files={"file": ("example-video.mp4", b"video-bytes", "video/mp4")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["camera_id"] == "CAM_001"
+    assert payload["filename"].startswith("CAM_001_example-video")
+    assert payload["stored_path"].startswith("data/uploads/config_videos/")
+    assert Path(payload["source_path"]).exists()
+    assert Path(payload["source_path"]).read_bytes() == b"video-bytes"
+
+
 def test_api_app_physical_vehicle_counts_and_video_chat_evidence(tmp_path: Path) -> None:
     run_id = _build_physical_vehicle_run(tmp_path)
     client = TestClient(create_app(outputs_root=tmp_path))
@@ -1286,3 +1310,70 @@ def test_api_plate_assisted_identity_endpoint_available_missing_and_raw_tracks_u
     assert missing_response.status_code == 200
     assert missing_response.json()["available"] is False
     assert missing_response.json()["message"] == "Plate-assisted identity experiment has not been run for this run."
+
+
+def test_api_video_chat_run_scope_and_plate_queries(tmp_path: Path) -> None:
+    def build_run(run_id: str, camera_ids: list[str], *, plate_detected: bool | None = None, vehicle_class: str = "car") -> None:
+        run_dir = tmp_path / run_id
+        _write_json(run_dir / "summary.json", {"run_id": run_id, "status": "COMPLETED", "camera_count": len(camera_ids), "processed_frames": 10})
+        _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": len(camera_ids)})
+        tracks = []
+        enrichments = []
+        for index, camera_id in enumerate(camera_ids, start=1):
+            local_track_id = f"{camera_id}:TRACK_{index}"
+            tracks.append(
+                {
+                    "run_id": run_id,
+                    "local_track_id": local_track_id,
+                    "camera_id": camera_id,
+                    "status": "COMPLETED",
+                    "first_timestamp_seconds": float(index),
+                    "last_timestamp_seconds": float(index + 1),
+                    "observation_count": 4,
+                    "final_class": vehicle_class,
+                    "vehicle_enrichment": {
+                        "vehicle_colour": {"label": "WHITE", "status": "completed"},
+                        "plate_detected": plate_detected,
+                    },
+                }
+            )
+            enrichments.append(
+                {
+                    "local_track_id": local_track_id,
+                    "camera_id": camera_id,
+                    "vehicle_class": vehicle_class.upper(),
+                    "vehicle_colour": {"label": "WHITE", "status": "completed"},
+                    "plate_detected": plate_detected,
+                    "status": "completed",
+                }
+            )
+        _write_json(run_dir / "tracks.json", tracks)
+        _write_json(run_dir / "vehicle_enrichment.json", enrichments)
+
+    build_run("RUN_A", ["CAM_001"], plate_detected=True)
+    build_run("RUN_B", ["CAM_001", "CAM_002"], plate_detected=False)
+    build_run("RUN_C", ["CAM_003", "CAM_004", "CAM_005"], plate_detected=None, vehicle_class="bus")
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    runs_count = client.post(
+        "/api/video-chat",
+        json={"message": "how many runs are there in this search", "run_ids": ["RUN_A", "RUN_B", "RUN_C"], "session_id": "run-scope"},
+    )
+    assert runs_count.status_code == 200
+    assert runs_count.json()["parsed_query"]["subject"] == "runs"
+    assert runs_count.json()["analytics_result"]["total"] == 3
+
+    multiple_cameras = client.post(
+        "/api/video-chat",
+        json={"message": "which run have multiple cameras", "run_ids": ["RUN_A", "RUN_B", "RUN_C"], "session_id": "run-scope"},
+    )
+    assert multiple_cameras.status_code == 200
+    assert multiple_cameras.json()["analytics_result"]["run_ids"] == ["RUN_B", "RUN_C"]
+
+    plates = client.post(
+        "/api/video-chat",
+        json={"message": "how many cars with number plate", "run_ids": ["RUN_A", "RUN_B"], "session_id": "run-scope"},
+    )
+    assert plates.status_code == 200
+    assert plates.json()["parsed_query"]["plate_presence"] == "detected"
+    assert plates.json()["analytics_result"]["total"] == 1

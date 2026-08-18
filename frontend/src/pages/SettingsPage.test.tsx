@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   saveConfig: vi.fn(),
   cloneConfig: vi.fn(),
   roiPreviewDraftUrl: vi.fn(),
+  uploadConfigVideoSource: vi.fn(),
 }));
 
 vi.mock("../api/configs", () => mocks);
@@ -77,6 +78,12 @@ describe("SettingsPage", () => {
     mocks.validateConfig.mockResolvedValue({ valid: true, errors: [], warnings: [] });
     mocks.saveConfig.mockResolvedValue({ valid: true, errors: [], warnings: [], saved_path: "config/validation_rectangle_roi.yaml", config_name: "validation_rectangle_roi.yaml", yaml_text: "saved: true\n" });
     mocks.roiPreviewDraftUrl.mockReturnValue("/api/configs/validation_rectangle_roi.yaml/roi-preview");
+    mocks.uploadConfigVideoSource.mockResolvedValue({
+      camera_id: "CAM_001",
+      filename: "CAM_001_uploaded.mp4",
+      source_path: "D:/project/multi-camera-vehicle-tracking/data/uploads/config_videos/CAM_001_uploaded.mp4",
+      stored_path: "data/uploads/config_videos/CAM_001_uploaded.mp4",
+    });
   });
 
   it("loads config values into structured controls and saves numeric edits", async () => {
@@ -304,7 +311,7 @@ describe("SettingsPage", () => {
 
     await screen.findByDisplayValue("CAM_001");
     fireEvent.click(screen.getByRole("button", { name: "Add Camera" }));
-    fireEvent.change(screen.getAllByLabelText("Source")[2], { target: { value: "D:/cam3.mp4" } });
+    fireEvent.change(screen.getAllByPlaceholderText("Stored video path or existing absolute path")[2], { target: { value: "D:/cam3.mp4" } });
     fireEvent.click(screen.getAllByRole("button", { name: "Load frame" })[2]);
 
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
@@ -329,5 +336,42 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     const [_url, options] = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(JSON.parse(options.body).camera.source).toBe("D:/new-source.mp4");
+  });
+
+  it("uploads a selected video and updates the camera source field", async () => {
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    const file = new File(["video"], "new-camera.mp4", { type: "video/mp4" });
+    fireEvent.change(await screen.findByLabelText("Upload video for CAM_001"), {
+      target: { files: [file] },
+    });
+
+    await waitFor(() => expect(mocks.uploadConfigVideoSource).toHaveBeenCalledWith("validation_rectangle_roi.yaml", "CAM_001", file));
+    expect(await screen.findByDisplayValue("D:/project/multi-camera-vehicle-tracking/data/uploads/config_videos/CAM_001_uploaded.mp4")).toBeInTheDocument();
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+  });
+
+  it("accepts drag and drop uploads for camera videos", async () => {
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    const file = new File(["video"], "drop-source.mp4", { type: "video/mp4" });
+    const dropzone = await screen.findByLabelText("Drop video for CAM_001");
+    fireEvent.dragEnter(dropzone, { dataTransfer: { files: [file] } });
+    fireEvent.drop(dropzone, { dataTransfer: { files: [file] } });
+
+    await waitFor(() => expect(mocks.uploadConfigVideoSource).toHaveBeenCalledWith("validation_rectangle_roi.yaml", "CAM_001", file));
+  });
+
+  it("keeps the previous source and shows a friendly error when upload fails", async () => {
+    mocks.uploadConfigVideoSource.mockRejectedValueOnce({ status: 405, detail: { detail: "Method Not Allowed" } });
+    render(<MemoryRouter><SettingsPage /></MemoryRouter>);
+
+    const file = new File(["video"], "bad-camera.mp4", { type: "video/mp4" });
+    fireEvent.change(await screen.findByLabelText("Upload video for CAM_001"), {
+      target: { files: [file] },
+    });
+
+    expect(await screen.findByDisplayValue("D:/video.mp4")).toBeInTheDocument();
+    expect(screen.getByText("Video upload failed. The server rejected the upload request (HTTP 405). Method Not Allowed")).toBeInTheDocument();
   });
 });

@@ -16,6 +16,8 @@ DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3:1.7b"
 DEFAULT_OLLAMA_KEEP_ALIVE = "10m"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 45.0
+DEFAULT_OLLAMA_TEMPERATURE = 0.0
+DEFAULT_OLLAMA_NUM_PREDICT = 128
 
 
 class OllamaQwenChatLLMProvider:
@@ -26,13 +28,19 @@ class OllamaQwenChatLLMProvider:
         model: str = DEFAULT_OLLAMA_MODEL,
         keep_alive: str = DEFAULT_OLLAMA_KEEP_ALIVE,
         timeout_seconds: float = DEFAULT_OLLAMA_TIMEOUT_SECONDS,
+        temperature: float = DEFAULT_OLLAMA_TEMPERATURE,
+        num_predict: int = DEFAULT_OLLAMA_NUM_PREDICT,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.keep_alive = keep_alive
         self.timeout_seconds = float(timeout_seconds)
+        self.temperature = float(temperature)
+        self.num_predict = int(num_predict)
+        self.last_metadata: dict[str, Any] = {}
 
     def parse(self, message: str, context: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         payload = {
             "model": self.model,
             "messages": [
@@ -42,7 +50,10 @@ class OllamaQwenChatLLMProvider:
             "stream": False,
             "think": False,
             "format": chat_vehicle_query_json_schema(),
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.num_predict,
+            },
             "keep_alive": self.keep_alive,
         }
         request = Request(
@@ -51,7 +62,6 @@ class OllamaQwenChatLLMProvider:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        started = time.perf_counter()
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = json.loads(response.read().decode("utf-8"))
@@ -68,6 +78,26 @@ class OllamaQwenChatLLMProvider:
             raise RuntimeError("Ollama message.content was not valid JSON") from exc
         if not isinstance(parsed, dict):
             raise RuntimeError("Ollama structured output was not a JSON object")
+        self.last_metadata = {
+            "parser": "qwen",
+            "provider": "ollama",
+            "model": self.model,
+            "base_url": self.base_url,
+            "keep_alive": self.keep_alive,
+            "timeout_seconds": self.timeout_seconds,
+            "temperature": self.temperature,
+            "num_predict": self.num_predict,
+            "think": False,
+            "structured_output": True,
+            "wall_time_ms": round((time.perf_counter() - started) * 1000, 3),
+            "total_duration_ms": _duration_ms(raw.get("total_duration")),
+            "load_duration_ms": _duration_ms(raw.get("load_duration")),
+            "prompt_eval_duration_ms": _duration_ms(raw.get("prompt_eval_duration")),
+            "eval_duration_ms": _duration_ms(raw.get("eval_duration")),
+            "prompt_eval_count": raw.get("prompt_eval_count"),
+            "eval_count": raw.get("eval_count"),
+            "done_reason": raw.get("done_reason"),
+        }
         return parsed
 
 
@@ -94,10 +124,12 @@ def build_chat_llm_provider_from_env() -> OllamaQwenChatLLMProvider | None:
     if provider not in {"ollama", "qwen", "qwen3"}:
         return None
     return OllamaQwenChatLLMProvider(
-        base_url=env.get("VIDEO_CHAT_OLLAMA_URL", DEFAULT_OLLAMA_URL).strip('"'),
-        model=env.get("VIDEO_CHAT_OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL).strip('"'),
-        keep_alive=env.get("VIDEO_CHAT_OLLAMA_KEEP_ALIVE", DEFAULT_OLLAMA_KEEP_ALIVE).strip('"'),
-        timeout_seconds=float(env.get("VIDEO_CHAT_OLLAMA_TIMEOUT_SECONDS", str(DEFAULT_OLLAMA_TIMEOUT_SECONDS)).strip('"')),
+        base_url=_env_first(env, ["VIDEO_CHAT_QWEN_URL", "VIDEO_CHAT_OLLAMA_URL"], DEFAULT_OLLAMA_URL),
+        model=_env_first(env, ["VIDEO_CHAT_QWEN_MODEL", "VIDEO_CHAT_OLLAMA_MODEL"], DEFAULT_OLLAMA_MODEL),
+        keep_alive=_env_first(env, ["VIDEO_CHAT_QWEN_KEEP_ALIVE", "VIDEO_CHAT_OLLAMA_KEEP_ALIVE"], DEFAULT_OLLAMA_KEEP_ALIVE),
+        timeout_seconds=float(_env_first(env, ["VIDEO_CHAT_QWEN_TIMEOUT_SECONDS", "VIDEO_CHAT_OLLAMA_TIMEOUT_SECONDS"], str(DEFAULT_OLLAMA_TIMEOUT_SECONDS))),
+        temperature=float(_env_first(env, ["VIDEO_CHAT_QWEN_TEMPERATURE", "VIDEO_CHAT_OLLAMA_TEMPERATURE"], str(DEFAULT_OLLAMA_TEMPERATURE))),
+        num_predict=int(_env_first(env, ["VIDEO_CHAT_QWEN_NUM_PREDICT", "VIDEO_CHAT_OLLAMA_NUM_PREDICT"], str(DEFAULT_OLLAMA_NUM_PREDICT))),
     )
 
 
@@ -107,10 +139,16 @@ def chat_vehicle_query_json_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": [
             "intent",
+            "subject",
+            "run_filter",
             "class_include",
             "class_exclude",
             "colour_include",
             "colour_exclude",
+            "plate_presence",
+            "plate_detected",
+            "plate_readable",
+            "plate_text",
             "start_time",
             "end_time",
             "group_by",
@@ -120,10 +158,16 @@ def chat_vehicle_query_json_schema() -> dict[str, Any]:
         ],
         "properties": {
             "intent": {"type": "string", "enum": ["GENERAL_CHAT", "COUNT", "LIST", "SUMMARY", "GROUP", "COMPARE", "FIND_INTERVALS", "UNIQUE_CLASSES", "UNIQUE_COLOURS"]},
+            "subject": {"type": "string", "enum": ["vehicles", "runs"]},
+            "run_filter": {"anyOf": [{"type": "string", "enum": ["multiple_cameras"]}, {"type": "null"}]},
             "class_include": {"type": "array", "items": {"type": "string", "enum": [*SUPPORTED_VEHICLE_CLASSES, "UNKNOWN"]}},
             "class_exclude": {"type": "array", "items": {"type": "string", "enum": [*SUPPORTED_VEHICLE_CLASSES, "UNKNOWN"]}},
             "colour_include": {"type": "array", "items": {"type": "string", "enum": list(SUPPORTED_VEHICLE_COLOUR_LABELS)}},
             "colour_exclude": {"type": "array", "items": {"type": "string", "enum": list(SUPPORTED_VEHICLE_COLOUR_LABELS)}},
+            "plate_presence": {"anyOf": [{"type": "string", "enum": ["detected", "readable"]}, {"type": "null"}]},
+            "plate_detected": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "plate_readable": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "plate_text": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "start_time": {"anyOf": [{"type": "number"}, {"type": "null"}]},
             "end_time": {"anyOf": [{"type": "number"}, {"type": "null"}]},
             "group_by": {"anyOf": [{"type": "string", "enum": ["vehicle_class", "colour", "camera", "run", "run_camera"]}, {"type": "null"}]},
@@ -136,6 +180,7 @@ def chat_vehicle_query_json_schema() -> dict[str, Any]:
 
 def _system_prompt() -> str:
     return """Convert the user's traffic-video question into the supplied JSON schema.
+Return exactly one compact JSON object on a single line.
 
 Never answer the question. Never provide counts. Never invent values.
 Only populate fields clearly required by the user. Leave unrelated fields empty or null.
@@ -148,6 +193,9 @@ Normalize synonyms:
 
 Rules:
 - greetings, thanks, who are you, what can you do -> GENERAL_CHAT with no filters and no context_reference
+- default subject is vehicles unless the user is explicitly asking about runs
+- run questions must use subject runs
+- use run_filter multiple_cameras only for questions about runs with multiple cameras
 - how many -> COUNT
 - show, show me, find, which ones, let me see -> LIST and show_evidence true
 - overview, summary -> SUMMARY
@@ -156,6 +204,11 @@ Rules:
 - camera-wise, by camera, per camera, camera breakdown, in each camera -> GROUP with group_by camera
 - run-wise, by run, per run, run breakdown, in each run -> GROUP with group_by run
 - by run and camera, per run and camera, compare cameras across runs -> GROUP with group_by run_camera
+- with detected number plates -> plate_presence detected, plate_detected true
+- with readable number plates -> plate_presence readable, plate_detected true, plate_readable true
+- without readable number plates -> plate_detected true if detection is implied, plate_readable false
+- without number plates / no number plates -> plate_detected false, plate_readable false
+- exact plate lookup -> set plate_text and also plate_detected true plus plate_readable true
 - colours of motorcycles/cars/three-wheelers/bikes -> GROUP with group_by colour and preserve the named class
 - vehicle classes/types were black/white/red/etc -> GROUP with group_by vehicle_class and preserve the named colour
 - what kinds/types -> GROUP with group_by vehicle_class
@@ -169,70 +222,34 @@ Rules:
 
 Examples:
 User: hello
-Output: {"intent":"GENERAL_CHAT","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
+Output: {"intent":"GENERAL_CHAT","subject":"vehicles","run_filter":null,"class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
 
 User: How many cars are there?
-Output: {"intent":"COUNT","class_include":["CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
+Output: {"intent":"COUNT","subject":"vehicles","run_filter":null,"class_include":["CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
 
-User: How many cars and bikes did we see?
-Output: {"intent":"COUNT","class_include":["CAR","MOTORCYCLE"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
+User: cars with detected number plates
+Output: {"intent":"LIST","subject":"vehicles","run_filter":null,"class_include":["CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":"detected","plate_detected":true,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
 
-User: Apart from bikes, what kinds of vehicles were there?
-Output: {"intent":"GROUP","class_include":[],"class_exclude":["MOTORCYCLE"],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"vehicle_class","operator":null,"show_evidence":false,"context_reference":null}
+User: cars without readable number plates
+Output: {"intent":"LIST","subject":"vehicles","run_filter":null,"class_include":["CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":true,"plate_readable":false,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
+
+User: show plate DL01AB1234
+Output: {"intent":"LIST","subject":"vehicles","run_filter":null,"class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":"readable","plate_detected":true,"plate_readable":true,"plate_text":"DL01AB1234","start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
+
+User: which runs have multiple cameras
+Output: {"intent":"LIST","subject":"runs","run_filter":"multiple_cameras","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
+
+User: how many runs are there in this search
+Output: {"intent":"COUNT","subject":"runs","run_filter":null,"class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
+
+User: give me the summary run and camera wise
+Output: {"intent":"SUMMARY","subject":"vehicles","run_filter":null,"class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":"run_camera","operator":null,"show_evidence":false,"context_reference":null}
 
 User: Show black vehicles except motorcycles.
-Output: {"intent":"LIST","class_include":[],"class_exclude":["MOTORCYCLE"],"colour_include":["BLACK"],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
+Output: {"intent":"LIST","subject":"vehicles","run_filter":null,"class_include":[],"class_exclude":["MOTORCYCLE"],"colour_include":["BLACK"],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
 
-User: I want to see the vehicles other than car and bike.
-Output: {"intent":"LIST","class_include":[],"class_exclude":["CAR","MOTORCYCLE"],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
-
-User: What vehicle colours are present except black?
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":["BLACK"],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}
-
-Previous context has black motorcycle results. User: Give all vehicles class wise.
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"vehicle_class","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Show colour-wise counts.
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Count vehicles camera wise.
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"camera","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Count vehicles by run.
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"run","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Count vehicles by run and camera.
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"run_camera","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Give me the colours of motorcycles.
-Output: {"intent":"GROUP","class_include":["MOTORCYCLE"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}
-
-User: What vehicle classes were black?
-Output: {"intent":"GROUP","class_include":[],"class_exclude":[],"colour_include":["BLACK"],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"vehicle_class","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Were two-wheelers more common than cars?
-Output: {"intent":"COMPARE","class_include":["MOTORCYCLE","CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
-
-User: At what time were bikes more than cars?
-Output: {"intent":"FIND_INTERVALS","class_include":["MOTORCYCLE","CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":">","show_evidence":false,"context_reference":null}
-
-User: Show me the green autos.
-Output: {"intent":"LIST","class_include":["3WHEELER"],"class_exclude":[],"colour_include":["GREEN"],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
-
-User: Show unknown vehicles.
-Output: {"intent":"LIST","class_include":["UNKNOWN"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":null}
-
-User: What colour were most of the cars?
-Output: {"intent":"GROUP","class_include":["CAR"],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":"colour","operator":null,"show_evidence":false,"context_reference":null}
-
-User: Give me a quick overview of this traffic video.
-Output: {"intent":"SUMMARY","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":null}
-
-Previous context has MOTORCYCLE results. User: Which of those were black?
-Output: {"intent":"LIST","class_include":[],"class_exclude":[],"colour_include":["BLACK"],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":"previous_result"}
-
-Previous context has black motorcycle results. User: Show them.
-Output: {"intent":"LIST","class_include":[],"class_exclude":[],"colour_include":[],"colour_exclude":[],"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":true,"context_reference":"previous_result"}
+User: Which of those were black?
+Output: {"intent":"LIST","subject":"vehicles","run_filter":null,"class_include":[],"class_exclude":[],"colour_include":["BLACK"],"colour_exclude":[],"plate_presence":null,"plate_detected":null,"plate_readable":null,"plate_text":null,"start_time":null,"end_time":null,"group_by":null,"operator":null,"show_evidence":false,"context_reference":"previous_result"}
 
 Return only JSON."""
 
@@ -254,3 +271,20 @@ def _video_chat_env() -> dict[str, str]:
         if key.startswith("VIDEO_CHAT_"):
             values[key] = value
     return values
+
+
+def _env_first(values: dict[str, str], keys: list[str], default: str) -> str:
+    for key in keys:
+        value = values.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip().strip('"')
+    return default
+
+
+def _duration_ms(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value) / 1_000_000, 3)
+    except (TypeError, ValueError):
+        return None

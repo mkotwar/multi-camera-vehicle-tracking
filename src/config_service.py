@@ -30,8 +30,10 @@ class ConfigServiceError(Exception):
 
 
 class ConfigService:
-    def __init__(self, config_dir: str | Path = "config") -> None:
+    def __init__(self, config_dir: str | Path = "config", *, project_root: str | Path | None = None) -> None:
         self.config_dir = Path(config_dir).expanduser().resolve()
+        self.project_root = Path(project_root).expanduser().resolve() if project_root is not None else self.config_dir.parent
+        self.uploads_dir = self.project_root / "data" / "uploads" / "config_videos"
 
     def list_configs(self) -> dict[str, Any]:
         self._ensure_config_dir()
@@ -154,11 +156,7 @@ class ConfigService:
         raw_source = clean_config_string(camera.get("source"))
         if not raw_source:
             raise ConfigServiceError(f"Video source is required for {camera_id}.", status_code=400)
-        source_path = Path(raw_source).expanduser()
-        if not source_path.is_absolute():
-            source_path = (path.parent / source_path).resolve()
-        else:
-            source_path = source_path.resolve()
+        source_path = self._resolve_video_source_path(path, raw_source)
         if not source_path.exists():
             raise ConfigServiceError(f"Video source does not exist for {camera_id}: {source_path}", status_code=404)
 
@@ -191,6 +189,33 @@ class ConfigService:
             return encoded.tobytes(), headers
         finally:
             capture.release()
+
+    def save_uploaded_video_source(self, config_name: str, camera_id: str, filename: str, content: bytes) -> dict[str, Any]:
+        self._resolve_config_path(config_name, must_exist=True)
+        normalized_camera_id = self._normalize_camera_id(camera_id)
+        source_name = Path(str(filename or "").strip()).name
+        if not source_name:
+            raise ConfigServiceError("Uploaded video file name is required.", status_code=400)
+        suffix = Path(source_name).suffix.lower()
+        if suffix not in {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm"}:
+            raise ConfigServiceError("Unsupported video file type. Use MP4, AVI, MOV, MKV, M4V, or WEBM.", status_code=400)
+        if not content:
+            raise ConfigServiceError("Uploaded video is empty.", status_code=400)
+
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(source_name).stem).strip("-._") or "video"
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        target = self.uploads_dir / f"{normalized_camera_id}_{safe_stem}{suffix}"
+        counter = 1
+        while target.exists():
+            target = self.uploads_dir / f"{normalized_camera_id}_{safe_stem}_{counter}{suffix}"
+            counter += 1
+        target.write_bytes(content)
+        return {
+            "camera_id": normalized_camera_id,
+            "filename": target.name,
+            "source_path": str(target.resolve()),
+            "stored_path": str(target.relative_to(self.project_root).as_posix()),
+        }
 
     def _ensure_config_dir(self) -> None:
         if not self.config_dir.exists() or not self.config_dir.is_dir():
@@ -238,6 +263,24 @@ class ConfigService:
             if isinstance(camera, dict) and str(camera.get("camera_id")) == camera_id:
                 return dict(camera)
         raise ConfigServiceError(f"Camera not found in config: {camera_id}", status_code=404)
+
+    def _resolve_video_source_path(self, config_path: Path, raw_source: str) -> Path:
+        source_path = Path(raw_source).expanduser()
+        if source_path.is_absolute():
+            return source_path.resolve()
+        config_relative = (config_path.parent / source_path).resolve()
+        if config_relative.exists():
+            return config_relative
+        project_relative = (self.project_root / source_path).resolve()
+        if project_relative.exists():
+            return project_relative
+        return config_relative
+
+    def _normalize_camera_id(self, camera_id: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(camera_id or "").strip()).strip("._-")
+        if not normalized:
+            raise ConfigServiceError("camera_id is required for uploaded video sources.", status_code=400)
+        return normalized
 
     def _validate_common_fields(self, config: dict[str, Any]) -> list[ConfigValidationError]:
         errors: list[ConfigValidationError] = []

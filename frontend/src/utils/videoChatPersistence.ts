@@ -6,7 +6,7 @@ const SESSIONS_BY_RUN_KEY = "video-chat.sessions-by-run.v1";
 
 export function scopeKeyForRunIds(runIds: string[]): string {
   const cleaned = runIds.map((item) => item.trim()).filter(Boolean);
-  return cleaned.length ? cleaned.join("|") : "latest";
+  return cleaned.length ? cleaned.join("|") : "__none__";
 }
 
 export function createVideoChatSession(runId: string, runIds?: string[]): PersistedVideoChatSession {
@@ -31,7 +31,7 @@ export function loadActiveVideoChatRunIds(): string[] | null {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return null;
     const runIds = parsed.map((item) => String(item).trim()).filter(Boolean);
-    return runIds.length ? runIds : null;
+    return runIds;
   } catch {
     return null;
   }
@@ -55,9 +55,12 @@ export function saveActiveVideoChatRunIds(runIds: string[]): void {
   if (!canUseLocalStorage()) return;
   try {
     const cleaned = runIds.map((item) => item.trim()).filter(Boolean);
-    const primary = cleaned[0] ?? "latest";
-    window.localStorage.setItem(ACTIVE_RUN_KEY, primary);
-    window.localStorage.setItem(ACTIVE_RUNS_KEY, JSON.stringify(cleaned.length ? cleaned : [primary]));
+    if (cleaned.length > 0) {
+      window.localStorage.setItem(ACTIVE_RUN_KEY, cleaned[0]);
+    } else {
+      window.localStorage.removeItem(ACTIVE_RUN_KEY);
+    }
+    window.localStorage.setItem(ACTIVE_RUNS_KEY, JSON.stringify(cleaned));
   } catch {
     // Persistence must never make the chat unusable.
   }
@@ -94,8 +97,8 @@ export function replaceVideoChatSessionForRun(runId: string): PersistedVideoChat
 }
 
 export function replaceVideoChatSessionForRunIds(runIds: string[]): PersistedVideoChatSession {
-  const cleaned = runIds.length ? runIds : ["latest"];
-  const nextSession = createVideoChatSession(cleaned[0], cleaned);
+  const cleaned = runIds.map((item) => item.trim()).filter(Boolean);
+  const nextSession = createVideoChatSession(cleaned[0] ?? "latest", cleaned);
   saveVideoChatSessionForRun(nextSession);
   return nextSession;
 }
@@ -105,8 +108,8 @@ export function getOrCreateVideoChatSessionForRun(runId: string): PersistedVideo
 }
 
 export function getOrCreateVideoChatSessionForRunIds(runIds: string[]): PersistedVideoChatSession {
-  const cleaned = runIds.length ? runIds : ["latest"];
-  return loadVideoChatSessionForRunIds(cleaned) ?? createVideoChatSession(cleaned[0], cleaned);
+  const cleaned = runIds.map((item) => item.trim()).filter(Boolean);
+  return loadVideoChatSessionForRunIds(cleaned) ?? createVideoChatSession(cleaned[0] ?? "latest", cleaned);
 }
 
 function canUseLocalStorage() {

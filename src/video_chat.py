@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import re
+import time
 from typing import Any, Protocol
 
 from .run_repository import RunRepository
@@ -106,6 +107,8 @@ class ChatLLMProvider(Protocol):
 @dataclass(frozen=True, slots=True)
 class ChatVehicleQuery:
     intent: str
+    subject: str = "vehicles"
+    run_filter: str | None = None
     selected_run_ids: list[str] = field(default_factory=list)
     include_camera_ids: list[str] = field(default_factory=list)
     exclude_camera_ids: list[str] = field(default_factory=list)
@@ -113,6 +116,10 @@ class ChatVehicleQuery:
     exclude_classes: list[str] = field(default_factory=list)
     include_colours: list[str] = field(default_factory=list)
     exclude_colours: list[str] = field(default_factory=list)
+    plate_presence: str | None = None
+    plate_detected: bool | None = None
+    plate_readable: bool | None = None
+    plate_text: str | None = None
     start_time: float | None = None
     end_time: float | None = None
     camera_id: str | None = None
@@ -127,12 +134,37 @@ class ChatVehicleQuery:
     def __post_init__(self) -> None:
         if self.intent not in SUPPORTED_CHAT_INTENTS:
             raise VehicleQueryParseError(f"Unsupported chat intent: {self.intent}")
+        if self.subject not in {"vehicles", "runs"}:
+            raise VehicleQueryParseError(f"Unsupported query subject: {self.subject}")
+        if self.run_filter not in {None, "multiple_cameras"}:
+            raise VehicleQueryParseError(f"Unsupported run filter: {self.run_filter}")
         for label in self.include_classes + self.exclude_classes:
             if label not in (*SUPPORTED_VEHICLE_CLASSES, "UNKNOWN"):
                 raise VehicleQueryParseError(f"Unsupported vehicle class from parser: {label}")
         for label in self.include_colours + self.exclude_colours:
             if label not in SUPPORTED_VEHICLE_COLOUR_LABELS:
                 raise VehicleQueryParseError(f"Unsupported colour from parser: {label}")
+        if self.plate_presence not in {None, "detected", "readable"}:
+            raise VehicleQueryParseError(f"Unsupported plate_presence: {self.plate_presence}")
+        normalized_plate_text = _clean_plate_text(self.plate_text)
+        object.__setattr__(self, "plate_text", normalized_plate_text)
+        if self.plate_presence == "readable":
+            object.__setattr__(self, "plate_detected", True if self.plate_detected is None else self.plate_detected)
+            object.__setattr__(self, "plate_readable", True if self.plate_readable is None else self.plate_readable)
+        elif self.plate_presence == "detected":
+            object.__setattr__(self, "plate_detected", True if self.plate_detected is None else self.plate_detected)
+        if normalized_plate_text is not None:
+            object.__setattr__(self, "plate_detected", True if self.plate_detected is None else self.plate_detected)
+            object.__setattr__(self, "plate_readable", True if self.plate_readable is None else self.plate_readable)
+        if self.plate_readable is True and self.plate_detected is False:
+            raise VehicleQueryParseError("plate_readable=true requires plate_detected to be true or unset.")
+        if self.plate_text and self.plate_readable is False:
+            raise VehicleQueryParseError("plate_text cannot be set when plate_readable=false.")
+        if self.plate_presence is None:
+            if self.plate_readable is True:
+                object.__setattr__(self, "plate_presence", "readable")
+            elif self.plate_detected is True:
+                object.__setattr__(self, "plate_presence", "detected")
         if self.group_by not in {None, "class", "colour", "camera", "run", "run_camera"}:
             raise VehicleQueryParseError(f"Unsupported group_by: {self.group_by}")
         if self.evidence_navigation not in {None, "next", "restart"}:
@@ -185,7 +217,11 @@ def handle_video_chat(
         repository=repository,
         context=context,
     )
-    analytics_result = execute_chat_vehicle_query(records, parsed, context=context) if parsed.intent in ANALYTICS_INTENTS else {}
+    execution_context = {
+        **context,
+        "run_scope": _build_run_scope(selected_run_ids, repository),
+    }
+    analytics_result = execute_chat_vehicle_query(records, parsed, context=execution_context) if parsed.intent in ANALYTICS_INTENTS else {}
     matching_vehicle_ids = list(analytics_result.get("vehicle_ids", []) or [])
     previous_ids = list(context.get("previous_vehicle_ids", []) or [])
     is_evidence_navigation = parsed.evidence_navigation is not None
@@ -216,10 +252,16 @@ def handle_video_chat(
     next_context = dict(context) if parsed.intent == "GENERAL_CHAT" else {
         "previous_query": parsed.to_dict(),
         "previous_filters": {
+            "subject": parsed.subject,
+            "run_filter": parsed.run_filter,
             "include_classes": parsed.include_classes,
             "exclude_classes": parsed.exclude_classes,
             "include_colours": parsed.include_colours,
             "exclude_colours": parsed.exclude_colours,
+            "plate_presence": parsed.plate_presence,
+            "plate_detected": parsed.plate_detected,
+            "plate_readable": parsed.plate_readable,
+            "plate_text": parsed.plate_text,
             "start_time": parsed.start_time,
             "end_time": parsed.end_time,
             "camera_id": parsed.camera_id,
@@ -280,6 +322,7 @@ def parse_chat_vehicle_query_detailed(
     context: dict[str, Any] | None = None,
     llm_provider: ChatLLMProvider | None = None,
 ) -> tuple[ChatVehicleQuery, str, dict[str, Any]]:
+    parser_started = time.perf_counter()
     text = _normalize(str(message or ""))
     if not text:
         raise VehicleQueryParseError("Query is empty.")
@@ -293,9 +336,20 @@ def parse_chat_vehicle_query_detailed(
         "normalized_plan": None,
         "semantic_validation_result": "not_run",
         "semantic_repair_applied": False,
+        "semantic_repair_notes": [],
         "final_query_plan": None,
         "message_type": _classify_message_type(text, context or {}),
         "filters_before_context": None,
+        "parser_primary": "rule_based",
+        "parser_fallback": None,
+        "fallback_reason": None,
+        "parser_model": getattr(llm_provider, "model", None) if llm_provider is not None else None,
+        "total_parser_ms": None,
+        "qwen_request_ms": None,
+        "normalize_ms": None,
+        "repair_ms": None,
+        "validation_ms": None,
+        "ollama_metadata": None,
     }
     explicit_mentions = _extract_explicit_filter_mentions(text)
     diagnostics.update(
@@ -311,40 +365,80 @@ def parse_chat_vehicle_query_detailed(
         diagnostics["llm_attempted"] = False
         diagnostics["filters_before_context"] = _query_filters(general_chat)
         diagnostics["final_query_plan"] = general_chat.to_dict()
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - parser_started) * 1000, 3)
         return general_chat, "rule_based", diagnostics
     navigation = _parse_evidence_navigation_query(text, context or {})
     if navigation is not None:
         diagnostics["filters_before_context"] = _query_filters(navigation)
         diagnostics["final_query_plan"] = navigation.to_dict()
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - parser_started) * 1000, 3)
         return navigation, "rule_based", diagnostics
+    rule_candidate = _deterministic_rule_candidate(text, context or {})
     if llm_provider is not None:
+        diagnostics["parser_primary"] = "qwen"
         try:
+            request_started = time.perf_counter()
             payload = llm_provider.parse(message, _llm_context(context or {}))
+            diagnostics["qwen_request_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+            diagnostics["ollama_metadata"] = dict(getattr(llm_provider, "last_metadata", {}) or {})
             diagnostics["llm_raw_structured_output"] = dict(payload) if isinstance(payload, dict) else payload
             diagnostics["qwen_raw_plan"] = diagnostics["llm_raw_structured_output"]
+            normalize_started = time.perf_counter()
             normalized = normalize_llm_vehicle_query(payload)
-            repaired, repair_applied, validation_result = _repair_llm_plan_with_explicit_mentions(normalized, explicit_mentions)
+            diagnostics["normalize_ms"] = round((time.perf_counter() - normalize_started) * 1000, 3)
+            repair_started = time.perf_counter()
+            repaired, repair_applied, repair_notes, validation_result = _repair_llm_plan_with_explicit_mentions(
+                normalized,
+                explicit_mentions,
+                text=text,
+                rule_candidate=rule_candidate,
+            )
+            diagnostics["repair_ms"] = round((time.perf_counter() - repair_started) * 1000, 3)
             diagnostics["normalized_llm_output"] = normalized
             diagnostics["normalized_plan"] = repaired
             diagnostics["semantic_validation_result"] = validation_result
             diagnostics["semantic_repair_applied"] = repair_applied
+            diagnostics["semantic_repair_notes"] = repair_notes
             diagnostics["filters_before_context"] = _payload_filters(repaired)
+            validation_started = time.perf_counter()
+            fallback_reason, rejection_reason = _validate_qwen_plan(
+                raw_payload=normalized,
+                repaired_payload=repaired,
+                text=text,
+                rule_candidate=rule_candidate,
+            )
+            diagnostics["validation_ms"] = round((time.perf_counter() - validation_started) * 1000, 3)
+            if fallback_reason is not None:
+                diagnostics["fallback_reason"] = fallback_reason
+                diagnostics["llm_rejection_reason"] = rejection_reason
+                diagnostics["parser_fallback"] = "rule_based_fallback"
+                raise VehicleQueryParseError(rejection_reason)
             parsed = chat_query_from_llm_vehicle_query(repaired, text=text, context=context or {}, explicit_mentions=explicit_mentions)
             diagnostics["final_query_plan"] = parsed.to_dict()
             diagnostics["llm_accepted"] = True
-            return parsed, "qwen", diagnostics
+            diagnostics["total_parser_ms"] = round((time.perf_counter() - parser_started) * 1000, 3)
+            return parsed, "qwen_repaired" if repair_applied else "qwen", diagnostics
         except Exception as exc:
-            diagnostics["llm_rejection_reason"] = _diagnostic_reason(exc)
+            diagnostics["qwen_request_ms"] = diagnostics["qwen_request_ms"] or round((time.perf_counter() - request_started) * 1000, 3)
+            diagnostics["ollama_metadata"] = diagnostics["ollama_metadata"] or dict(getattr(llm_provider, "last_metadata", {}) or {})
+            if diagnostics["fallback_reason"] is None:
+                diagnostics["fallback_reason"] = _classify_qwen_failure(exc)
+            diagnostics["llm_rejection_reason"] = diagnostics["llm_rejection_reason"] or _diagnostic_reason(exc)
+            diagnostics["parser_fallback"] = "rule_based_fallback"
     try:
         parsed = _parse_rule_chat_query(text, context or {})
         diagnostics["filters_before_context"] = _query_filters(parsed)
         diagnostics["final_query_plan"] = parsed.to_dict()
-        return parsed, "rule_based", diagnostics
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - parser_started) * 1000, 3)
+        parser_used = "rule_based_fallback" if llm_provider is not None and diagnostics["parser_primary"] == "qwen" else "rule_based"
+        return parsed, parser_used, diagnostics
     except VehicleQueryParseError:
         raise
 
 
 def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicleQuery, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    if parsed.subject == "runs":
+        return _execute_run_query(parsed, context=context)
     base_ids = None
     if parsed.context_reference == "previous_results":
         base_ids = set(str(item) for item in list((context or {}).get("previous_vehicle_ids", []) or []))
@@ -359,8 +453,16 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
         include_camera_ids=parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else []),
         exclude_camera_ids=parsed.exclude_camera_ids,
         selected_run_ids=parsed.selected_run_ids,
+        plate_presence=parsed.plate_presence,
+        plate_detected=parsed.plate_detected,
+        plate_readable=parsed.plate_readable,
+        plate_text=parsed.plate_text,
         base_ids=base_ids,
     )
+    if parsed.intent == "SUMMARY" and parsed.group_by in {"camera", "run", "run_camera"}:
+        payload = _grouped_summary_payload(matched, group_by=parsed.group_by)
+        payload["vehicle_ids"] = [_vehicle_result_id(record, parsed) for record in matched]
+        return payload
     if parsed.intent == "SUMMARY":
         payload = _summary_payload(matched)
         payload["vehicle_ids"] = [_vehicle_result_id(record, parsed) for record in matched]
@@ -384,6 +486,10 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
             include_camera_ids=parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else []),
             exclude_camera_ids=parsed.exclude_camera_ids,
             selected_run_ids=parsed.selected_run_ids,
+            plate_presence=parsed.plate_presence,
+            plate_detected=parsed.plate_detected,
+            plate_readable=parsed.plate_readable,
+            plate_text=parsed.plate_text,
             base_ids=base_ids,
         )
         left_records = _filter_records(comparison_base, include_classes=[left] if left else [])
@@ -408,6 +514,10 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
             include_camera_ids=parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else []),
             exclude_camera_ids=parsed.exclude_camera_ids,
             selected_run_ids=parsed.selected_run_ids,
+            plate_presence=parsed.plate_presence,
+            plate_detected=parsed.plate_detected,
+            plate_readable=parsed.plate_readable,
+            plate_text=parsed.plate_text,
             base_ids=base_ids,
         )
         return find_vehicle_class_comparison_intervals(
@@ -684,6 +794,8 @@ def _evidence_matches_query(item: dict[str, Any], parsed: ChatVehicleQuery) -> b
         return False
     if colour in set(parsed.exclude_colours):
         return False
+    if not _matches_plate_filters_dict(item, parsed):
+        return False
     return True
 
 
@@ -696,7 +808,35 @@ def format_chat_answer(
 ) -> str:
     if parsed.intent == "GENERAL_CHAT":
         return "Hello. I can answer questions about this processed traffic video, such as vehicle counts, classes, colours, time ranges, comparisons, and evidence."
+    if parsed.subject == "runs":
+        if parsed.intent == "SUMMARY":
+            return (
+                f"Run scope summary: {int(analytics_result.get('total_runs', 0) or 0)} runs "
+                f"across {int(analytics_result.get('total_cameras', 0) or 0)} cameras."
+            )
+        if parsed.intent == "COUNT":
+            noun = "runs with multiple cameras" if parsed.run_filter == "multiple_cameras" else "runs"
+            verb = "is" if int(analytics_result.get("total", 0) or 0) == 1 else "are"
+            return f"There {verb} {int(analytics_result.get('total', 0) or 0)} {noun} in the current selection."
+        runs = list(analytics_result.get("runs", []) or [])
+        if not runs:
+            noun = "with multiple cameras" if parsed.run_filter == "multiple_cameras" else "in scope"
+            return f"No runs {noun} were found."
+        details = ", ".join(
+            f"{item.get('run_id')} ({int(item.get('camera_count') or 0)} cameras)"
+            for item in runs
+        )
+        prefix = "Runs with multiple cameras" if parsed.run_filter == "multiple_cameras" else "Runs in scope"
+        return f"{prefix}: {details}."
     if parsed.intent == "SUMMARY":
+        if parsed.group_by in {"camera", "run", "run_camera"}:
+            groups = dict(analytics_result.get("groups", {}) or {})
+            pieces = [
+                f"{key}: {int(dict(value).get('total_unique_vehicles', 0) or 0)} vehicles"
+                for key, value in groups.items()
+            ]
+            label = {"camera": "camera", "run": "run", "run_camera": "run and camera"}[parsed.group_by]
+            return f"Traffic summary by {label}: " + ("; ".join(pieces) if pieces else "none") + "."
         classes = _nonzero_counts(analytics_result.get("vehicle_classes", {}))
         colours = _nonzero_counts(analytics_result.get("colours", {}))
         return (
@@ -858,10 +998,19 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     previous_filters = dict(context.get("previous_filters", {}) or {}) if context_reference else {}
     explicit_mentions = _extract_explicit_filter_mentions(text)
     show_evidence = bool(re.search(r"\b(show|show me|find|which ones|let me see|want to see|see|evidence|display|show them)\b", text))
+    plate_presence, plate_detected, plate_readable, plate_text = _parse_plate_filters(text)
     include_classes = explicit_mentions.positive_classes or list(previous_filters.get("include_classes", []) or [])
     include_colours = explicit_mentions.positive_colours or list(previous_filters.get("include_colours", []) or [])
     exclude_classes = _dedupe(list(previous_filters.get("exclude_classes", []) or []) + explicit_mentions.negative_classes)
     exclude_colours = _dedupe(list(previous_filters.get("exclude_colours", []) or []) + explicit_mentions.negative_colours)
+    if plate_presence is None and context_reference:
+        plate_presence = previous_filters.get("plate_presence")
+    if plate_detected is None and context_reference:
+        plate_detected = previous_filters.get("plate_detected")
+    if plate_readable is None and context_reference:
+        plate_readable = previous_filters.get("plate_readable")
+    if plate_text is None and context_reference:
+        plate_text = previous_filters.get("plate_text")
     start_time, end_time = parse_time_range(text)
     if context_reference and start_time is None and end_time is None:
         start_time = previous_filters.get("start_time")
@@ -880,6 +1029,10 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             exclude_classes=exclude_classes,
             include_colours=include_colours,
             exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -888,17 +1041,34 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             show_evidence=show_evidence,
             context_reference=context_reference,
         )
+    run_metadata_query = _parse_run_metadata_query(text)
+    if run_metadata_query is not None:
+        return run_metadata_query
     if (include_classes or exclude_classes) and _is_colour_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
     if (include_colours or exclude_colours) and _is_class_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
     if _is_class_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if _is_colour_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     group_by_scope = _parse_scope_group_by(text)
     if group_by_scope is not None:
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by=group_by_scope)
+        return ChatVehicleQuery(
+            intent="SUMMARY" if _is_summary_query(text) else "GROUP",
+            include_classes=include_classes,
+            exclude_classes=exclude_classes,
+            include_colours=include_colours,
+            exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
+            include_camera_ids=include_camera_ids,
+            exclude_camera_ids=exclude_camera_ids,
+            group_by=group_by_scope,
+            context_reference=context_reference,
+        )
     if context_reference == "previous_results" and previous_group_by is not None and _is_follow_up_refinement(text) and not show_evidence:
         return ChatVehicleQuery(
             intent="GROUP",
@@ -906,15 +1076,19 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             exclude_classes=exclude_classes,
             include_colours=include_colours,
             exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
             include_camera_ids=include_camera_ids,
             exclude_camera_ids=exclude_camera_ids,
             group_by=previous_group_by,
             context_reference=context_reference,
         )
     if "most" in text and re.search(r"\b(vehicle\s+)?(class|type|category)\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, group_by="class", sort_by="count_desc", limit=1)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, group_by="class", sort_by="count_desc", limit=1)
     if _is_summary_query(text):
-        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     interval_query = _parse_interval_comparison_query(text)
     if interval_query is not None:
         return interval_query
@@ -924,17 +1098,17 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             raise VehicleQueryParseError("Compare queries need two vehicle classes.")
         return ChatVehicleQuery(intent="COMPARE", comparison={"left": classes[0], "right": classes[1]})
     if re.search(r"\b(types?|classes?|kinds?)\s+of\s+vehicles?\s+(?:are\s+)?present\b", text):
-        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if _is_colour_group_query(text) or ("most" in text and re.search(r"\bcolou?r\b", text)):
         if include_classes:
-            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
-        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
+        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if re.search(r"\b(group|breakdown)\s+by\s+class\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if re.search(r"\b(group|breakdown)\s+by\s+colou?r\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     if include_classes and re.fullmatch(r"(unknown|unclassified)\s+vehicles?", text):
-        return ChatVehicleQuery(intent="LIST", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, show_evidence=True)
+        return ChatVehicleQuery(intent="LIST", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True)
     if show_evidence or re.search(r"\b(which vehicles|appeared|list|display|want to see)\b", text):
         return ChatVehicleQuery(
             intent="LIST",
@@ -942,6 +1116,10 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             exclude_classes=exclude_classes,
             include_colours=include_colours,
             exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -959,6 +1137,10 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             exclude_classes=exclude_classes,
             include_colours=include_colours,
             exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -966,13 +1148,17 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             exclude_camera_ids=exclude_camera_ids,
             context_reference=context_reference,
         )
-    if include_classes or exclude_classes or include_colours or exclude_colours:
+    if include_classes or exclude_classes or include_colours or exclude_colours or plate_presence is not None or plate_detected is not None or plate_readable is not None or plate_text is not None:
         return ChatVehicleQuery(
             intent="LIST",
             include_classes=include_classes,
             exclude_classes=exclude_classes,
             include_colours=include_colours,
             exclude_colours=exclude_colours,
+            plate_presence=plate_presence,
+            plate_detected=plate_detected,
+            plate_readable=plate_readable,
+            plate_text=plate_text,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -1043,6 +1229,7 @@ def _explicit_filters_detected(parsed: ChatVehicleQuery) -> dict[str, bool]:
     return {
         "classes": bool(parsed.include_classes or parsed.exclude_classes),
         "colours": bool(parsed.include_colours or parsed.exclude_colours),
+        "plate": parsed.plate_presence is not None or parsed.plate_detected is not None or parsed.plate_readable is not None or parsed.plate_text is not None,
         "time": parsed.start_time is not None or parsed.end_time is not None,
         "camera": parsed.camera_id is not None or bool(parsed.include_camera_ids or parsed.exclude_camera_ids),
         "run": bool(parsed.selected_run_ids),
@@ -1057,16 +1244,20 @@ def _parse_evidence_navigation_query(text: str, context: dict[str, Any]) -> Chat
     exclude_classes = list(previous_filters.get("exclude_classes", []) or [])
     colours = list(previous_filters.get("include_colours", []) or [])
     exclude_colours = list(previous_filters.get("exclude_colours", []) or [])
+    plate_presence = previous_filters.get("plate_presence")
+    plate_detected = previous_filters.get("plate_detected")
+    plate_readable = previous_filters.get("plate_readable")
+    plate_text = previous_filters.get("plate_text")
     include_camera_ids = list(previous_filters.get("include_camera_ids", []) or [])
     selected_run_ids = list(previous_filters.get("selected_run_ids", []) or [])
     if re.fullmatch(r"(show|display|list)\s+(from\s+the\s+beginning|again|all)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, show_evidence=True, context_reference="previous_results", evidence_navigation="restart")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="restart")
     if re.fullmatch(r"(show\s+)?(more|next|next\s+\d+|remaining|the\s+rest|rest|the\s+other\s+\d+|other\s+\d+)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     if re.fullmatch(r"(show|display|list)\s+(them|those|these|ones|evidence)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     if re.fullmatch(r"show\s+me\s+(the\s+)?(other\s+\d+|remaining|rest|evidence|them|those)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     return None
 
 
@@ -1095,6 +1286,45 @@ def _parse_interval_comparison_query(text: str) -> ChatVehicleQuery | None:
     )
 
 
+def _parse_plate_presence(text: str) -> str | None:
+    return _parse_plate_filters(text)[0]
+
+
+def _parse_plate_filters(text: str) -> tuple[str | None, bool | None, bool | None, str | None]:
+    plate_text = _parse_plate_text_query(text)
+    if plate_text is not None:
+        return "readable", True, True, plate_text
+    if re.search(r"\b(detected|has|having|with)\s+.*\b(not\s+readable|unreadable|not\s+clear|not\s+visible)\b", text) or re.search(r"\b(not\s+readable|unreadable|not\s+clear|not\s+visible)\b.*\b(number\s+plates?|plates?)\b", text):
+        return None, True, False, None
+    if re.search(r"\b(without|no)\s+readable\s+(number\s+plates?|plates?|registration)\b", text):
+        return None, None, False, None
+    if re.search(r"\b(without|no)\s+(detected\s+)?(number\s+plates?|plates?|registration)\b", text):
+        return None, False, False, None
+    if re.search(r"\b(readable|clear|visible)\s+(number\s+plates?|plates?|registration)\b", text) or re.search(r"\bregistration\s+number\b", text):
+        return "readable", True, True, None
+    if re.search(r"\b(with|has|having)\s+(a\s+)?(detected\s+)?(number\s+plates?|plates?)\b", text) or re.search(r"\b(detected|visible)\s+(number\s+plates?|plates?)\b", text) or re.search(r"\b(number\s+plates?|plates?)\s+(detected|present)\b", text):
+        return "detected", True, None, None
+    return None, None, None, None
+
+
+def _parse_plate_text_query(text: str) -> str | None:
+    match = re.search(r"\b(?:plate|number\s+plate|registration)\s+([A-Z0-9-]{4,})\b", text.upper())
+    if not match:
+        return None
+    token = _clean_plate_text(match.group(1))
+    if token in {"WITH", "WITHOUT"}:
+        return None
+    return token
+
+
+def _parse_run_metadata_query(text: str) -> ChatVehicleQuery | None:
+    if re.search(r"\bhow\s+many\s+runs?\b", text):
+        return ChatVehicleQuery(intent="COUNT", subject="runs")
+    if re.search(r"\b(which|what)\s+runs?\b.*\bmultiple\s+cameras\b|\bruns?\s+have\s+multiple\s+cameras\b", text):
+        return ChatVehicleQuery(intent="LIST", subject="runs", run_filter="multiple_cameras")
+    return None
+
+
 def normalize_llm_vehicle_query(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise VehicleQueryParseError("LLM returned an invalid schema.")
@@ -1103,10 +1333,16 @@ def normalize_llm_vehicle_query(payload: dict[str, Any]) -> dict[str, Any]:
         raise VehicleQueryParseError("missing_required:intent")
     normalized = {
         "intent": intent,
+        "subject": _normalize_llm_subject(payload.get("subject")),
+        "run_filter": _normalize_llm_run_filter(payload.get("run_filter")),
         "classes": _normalize_llm_class_list(payload.get("class_include", payload.get("classes", payload.get("include_classes", [])))),
         "exclude_classes": _normalize_llm_class_list(payload.get("class_exclude", payload.get("exclude_classes", []))),
         "colours": _normalize_llm_colour_list(payload.get("colour_include", payload.get("color_include", payload.get("colours", payload.get("include_colours", []))))),
         "exclude_colours": _normalize_llm_colour_list(payload.get("colour_exclude", payload.get("color_exclude", payload.get("exclude_colours", [])))),
+        "plate_presence": payload.get("plate_presence"),
+        "plate_detected": _optional_bool(payload.get("plate_detected")),
+        "plate_readable": _optional_bool(payload.get("plate_readable")),
+        "plate_text": _clean_plate_text(payload.get("plate_text")),
         "start_time": _optional_float(payload.get("start_time")),
         "end_time": _optional_float(payload.get("end_time")),
         "group_by": _normalize_llm_group_by(payload.get("group_by")),
@@ -1117,52 +1353,113 @@ def normalize_llm_vehicle_query(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _repair_llm_plan_with_explicit_mentions(payload: dict[str, Any], mentions: ExplicitFilterMentions) -> tuple[dict[str, Any], bool, str]:
+def _repair_llm_plan_with_explicit_mentions(
+    payload: dict[str, Any],
+    mentions: ExplicitFilterMentions,
+    *,
+    text: str,
+    rule_candidate: ChatVehicleQuery | None,
+) -> tuple[dict[str, Any], bool, list[str], str]:
     repaired = {**payload}
     class_include = list(repaired.get("classes", []) or [])
     class_exclude = list(repaired.get("exclude_classes", []) or [])
     colour_include = list(repaired.get("colours", []) or [])
     colour_exclude = list(repaired.get("exclude_colours", []) or [])
     repair_applied = False
+    repair_notes: list[str] = []
 
     for label in mentions.negative_classes:
         if label in class_include:
             class_include = [item for item in class_include if item != label]
             repair_applied = True
+            repair_notes.append(f"removed include_class={label} due to explicit exclusion")
         if label not in class_exclude:
             class_exclude.append(label)
             repair_applied = True
+            repair_notes.append(f"added exclude_class={label}")
     for label in mentions.negative_colours:
         if label in colour_include:
             colour_include = [item for item in colour_include if item != label]
             repair_applied = True
+            repair_notes.append(f"removed include_colour={label} due to explicit exclusion")
         if label not in colour_exclude:
             colour_exclude.append(label)
             repair_applied = True
+            repair_notes.append(f"added exclude_colour={label}")
     for label in mentions.positive_classes:
         if label not in class_include and label not in class_exclude:
             class_include.append(label)
             repair_applied = True
+            repair_notes.append(f"added include_class={label}")
     for label in mentions.positive_colours:
         if label not in colour_include and label not in colour_exclude:
             colour_include.append(label)
             repair_applied = True
+            repair_notes.append(f"added include_colour={label}")
 
     intent = str(repaired.get("intent") or "").upper()
     if intent == "UNIQUE_COLOURS" and (class_include or class_exclude):
         repaired["intent"] = "GROUP"
         repaired["group_by"] = "colour"
         repair_applied = True
+        repair_notes.append("normalized UNIQUE_COLOURS to GROUP by colour")
     if intent == "UNIQUE_CLASSES" and (colour_include or colour_exclude):
         repaired["intent"] = "GROUP"
         repaired["group_by"] = "vehicle_class"
         repair_applied = True
+        repair_notes.append("normalized UNIQUE_CLASSES to GROUP by vehicle_class")
+
+    expected_plate_presence, expected_plate_detected, expected_plate_readable, expected_plate_text = _parse_plate_filters(text)
+    if expected_plate_presence is not None and repaired.get("plate_presence") != expected_plate_presence:
+        repaired["plate_presence"] = expected_plate_presence
+        repair_applied = True
+        repair_notes.append(f"set plate_presence={expected_plate_presence}")
+    if expected_plate_detected is not None and repaired.get("plate_detected") != expected_plate_detected:
+        repaired["plate_detected"] = expected_plate_detected
+        repair_applied = True
+        repair_notes.append(f"set plate_detected={expected_plate_detected}")
+    if expected_plate_readable is not None and repaired.get("plate_readable") != expected_plate_readable:
+        repaired["plate_readable"] = expected_plate_readable
+        repair_applied = True
+        repair_notes.append(f"set plate_readable={expected_plate_readable}")
+    if expected_plate_text is not None and repaired.get("plate_text") != expected_plate_text:
+        repaired["plate_text"] = expected_plate_text
+        repair_applied = True
+        repair_notes.append(f"set plate_text={expected_plate_text}")
+
+    if rule_candidate is not None:
+        if rule_candidate.subject == "runs" and repaired.get("subject") != "runs":
+            repaired["subject"] = "runs"
+            repair_applied = True
+            repair_notes.append("set subject=runs from deterministic validator")
+        if rule_candidate.run_filter is not None and repaired.get("run_filter") != rule_candidate.run_filter:
+            repaired["run_filter"] = rule_candidate.run_filter
+            repair_applied = True
+            repair_notes.append(f"set run_filter={rule_candidate.run_filter}")
+        if (
+            rule_candidate.intent in {"COUNT", "GROUP", "SUMMARY", "UNIQUE_CLASSES", "UNIQUE_COLOURS"}
+            and str(repaired.get("intent") or "").upper() == "LIST"
+            and rule_candidate.show_evidence is False
+            and repaired.get("show_evidence") is True
+        ):
+            repaired["intent"] = rule_candidate.intent
+            repaired["show_evidence"] = False
+            repair_applied = True
+            repair_notes.append(f"set intent={rule_candidate.intent} from deterministic validator")
+        if rule_candidate.group_by is not None and repaired.get("group_by") is None and str(repaired.get("intent") or "").upper() in {"SUMMARY", "GROUP"}:
+            repaired["group_by"] = "vehicle_class" if rule_candidate.group_by == "class" else rule_candidate.group_by
+            repair_applied = True
+            repair_notes.append(f"set group_by={rule_candidate.group_by}")
+        if rule_candidate.intent == "SUMMARY" and str(repaired.get("intent") or "").upper() == "GROUP":
+            repaired["intent"] = "SUMMARY"
+            repair_applied = True
+            repair_notes.append("set intent=SUMMARY from deterministic validator")
 
     repaired["classes"] = _dedupe(class_include)
     repaired["exclude_classes"] = _dedupe(class_exclude)
     repaired["colours"] = _dedupe(colour_include)
     repaired["exclude_colours"] = _dedupe(colour_exclude)
-    return repaired, repair_applied, "repaired" if repair_applied else "accepted"
+    return repaired, repair_applied, repair_notes, "repaired" if repair_applied else "accepted"
 
 
 def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, context: dict[str, Any], explicit_mentions: ExplicitFilterMentions | None = None) -> ChatVehicleQuery:
@@ -1193,10 +1490,16 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
     limit = 1 if sort_by else None
     return ChatVehicleQuery(
         intent=str(payload["intent"]).upper(),
+        subject=str(payload.get("subject") or "vehicles"),
+        run_filter=payload.get("run_filter"),
         include_classes=classes,
         exclude_classes=list(payload.get("exclude_classes", []) or []),
         include_colours=colours,
         exclude_colours=list(payload.get("exclude_colours", []) or []),
+        plate_presence=payload.get("plate_presence"),
+        plate_detected=payload.get("plate_detected"),
+        plate_readable=payload.get("plate_readable"),
+        plate_text=payload.get("plate_text"),
         start_time=payload.get("start_time"),
         end_time=payload.get("end_time"),
         camera_id=None,
@@ -1222,6 +1525,10 @@ def _filter_records(
     include_camera_ids: list[str] | None = None,
     exclude_camera_ids: list[str] | None = None,
     selected_run_ids: list[str] | None = None,
+    plate_presence: str | None = None,
+    plate_detected: bool | None = None,
+    plate_readable: bool | None = None,
+    plate_text: str | None = None,
     base_ids: set[str] | None = None,
 ) -> list[VehicleRecord]:
     include_classes_set = {item.upper() for item in include_classes or []}
@@ -1242,6 +1549,7 @@ def _filter_records(
         and record.colour not in exclude_colours_set
         and (not include_camera_set or record.camera_id in include_camera_set)
         and record.camera_id not in exclude_camera_set
+        and _matches_plate_filters(record, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text)
         and not (start_time is not None and record.last_seen_seconds is not None and record.last_seen_seconds < start_time)
         and not (end_time is not None and record.first_seen_seconds is not None and record.first_seen_seconds > end_time)
     ]
@@ -1257,6 +1565,21 @@ def _summary_payload(records: list[VehicleRecord]) -> dict[str, Any]:
         "first_seen_seconds": min(first_values) if first_values else None,
         "last_seen_seconds": max(last_values) if last_values else None,
         "vehicle_ids": [record.vehicle_id for record in records],
+    }
+
+
+def _grouped_summary_payload(records: list[VehicleRecord], *, group_by: str) -> dict[str, Any]:
+    grouped: dict[str, list[VehicleRecord]] = {}
+    for record in records:
+        key = _group_key_for_record(record, group_by=group_by)
+        grouped.setdefault(key, []).append(record)
+    return {
+        "total_unique_vehicles": len(records),
+        "group_by": group_by,
+        "groups": {
+            key: _summary_payload(items)
+            for key, items in sorted(grouped.items())
+        },
     }
 
 
@@ -1304,8 +1627,115 @@ def _count_by_run_camera(records: list[VehicleRecord]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _group_key_for_record(record: VehicleRecord, *, group_by: str) -> str:
+    if group_by == "camera":
+        return record.camera_id or "UNKNOWN"
+    if group_by == "run":
+        return str(getattr(record, "run_id", None) or "UNKNOWN")
+    return f"{str(getattr(record, 'run_id', None) or 'UNKNOWN')} / {record.camera_id or 'UNKNOWN'}"
+
+
+def _matches_plate_filters(
+    record: VehicleRecord,
+    *,
+    plate_presence: str | None,
+    plate_detected: bool | None,
+    plate_readable: bool | None,
+    plate_text: str | None,
+) -> bool:
+    normalized_plate_text = _clean_plate_text(getattr(record, "plate_text", None))
+    detected = bool(getattr(record, "plate_detected", None)) or normalized_plate_text is not None
+    readable = normalized_plate_text is not None
+    expected_detected = plate_detected
+    expected_readable = plate_readable
+    if plate_presence == "readable":
+        expected_detected = True if expected_detected is None else expected_detected
+        expected_readable = True if expected_readable is None else expected_readable
+    elif plate_presence == "detected":
+        expected_detected = True if expected_detected is None else expected_detected
+    if expected_detected is True and not detected:
+        return False
+    if expected_detected is False and detected:
+        return False
+    if expected_readable is True and not readable:
+        return False
+    if expected_readable is False and readable:
+        return False
+    if plate_text is not None and normalized_plate_text != _clean_plate_text(plate_text):
+        return False
+    return True
+
+
+def _matches_plate_filters_dict(item: dict[str, Any], parsed: ChatVehicleQuery) -> bool:
+    normalized_plate_text = _clean_plate_text(item.get("plate_text"))
+    detected = bool(item.get("plate_detected")) or normalized_plate_text is not None
+    readable = normalized_plate_text is not None
+    if parsed.plate_detected is True and not detected:
+        return False
+    if parsed.plate_detected is False and detected:
+        return False
+    if parsed.plate_readable is True and not readable:
+        return False
+    if parsed.plate_readable is False and readable:
+        return False
+    if parsed.plate_text is not None and normalized_plate_text != _clean_plate_text(parsed.plate_text):
+        return False
+    return True
+
+
+def _build_run_scope(selected_run_ids: list[str], repository: RunRepository) -> list[dict[str, Any]]:
+    scope: list[dict[str, Any]] = []
+    get_run = getattr(repository, "get_run", None)
+    list_cameras = getattr(repository, "list_cameras", None)
+    for run_id in selected_run_ids:
+        summary = get_run(run_id) if callable(get_run) else {}
+        summary = summary or {}
+        summary_payload = dict(summary.get("summary", {}) or {}) if isinstance(summary, dict) else {}
+        metadata_payload = dict(summary.get("metadata", {}) or {}) if isinstance(summary, dict) else {}
+        cameras = []
+        if callable(list_cameras):
+            cameras = [item for item in list_cameras(run_id=run_id) if item.get("camera_id")]
+        camera_ids = sorted({str(item.get("camera_id")) for item in cameras if item.get("camera_id")})
+        camera_count = summary.get("camera_count") or summary_payload.get("configured_camera_count") or metadata_payload.get("camera_count")
+        if camera_count is None:
+            camera_count = len(camera_ids)
+        scope.append(
+            {
+                **summary,
+                "run_id": run_id,
+                "status": summary.get("status") or summary_payload.get("status") or metadata_payload.get("status"),
+                "camera_ids": camera_ids,
+                "camera_count": int(camera_count or 0),
+            }
+        )
+    return scope
+
+
+def _execute_run_query(parsed: ChatVehicleQuery, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    run_scope = [dict(item) for item in list((context or {}).get("run_scope", []) or [])]
+    if parsed.run_filter == "multiple_cameras":
+        run_scope = [item for item in run_scope if int(item.get("camera_count") or 0) > 1]
+    run_ids = [str(item.get("run_id") or "") for item in run_scope if item.get("run_id")]
+    if parsed.intent == "SUMMARY":
+        return {
+            "total_runs": len(run_scope),
+            "total_cameras": sum(int(item.get("camera_count") or 0) for item in run_scope),
+            "runs": run_scope,
+            "run_ids": run_ids,
+            "vehicle_ids": [],
+        }
+    return {
+        "total": len(run_scope),
+        "runs": run_scope,
+        "run_ids": run_ids,
+        "vehicle_ids": [],
+    }
+
+
 def _query_filters(parsed: ChatVehicleQuery) -> dict[str, Any]:
     return {
+        "subject": parsed.subject,
+        "run_filter": parsed.run_filter,
         "selected_run_ids": list(parsed.selected_run_ids),
         "include_camera_ids": list(parsed.include_camera_ids),
         "exclude_camera_ids": list(parsed.exclude_camera_ids),
@@ -1313,6 +1743,10 @@ def _query_filters(parsed: ChatVehicleQuery) -> dict[str, Any]:
         "exclude_classes": list(parsed.exclude_classes),
         "include_colours": list(parsed.include_colours),
         "exclude_colours": list(parsed.exclude_colours),
+        "plate_presence": parsed.plate_presence,
+        "plate_detected": parsed.plate_detected,
+        "plate_readable": parsed.plate_readable,
+        "plate_text": parsed.plate_text,
         "start_time": parsed.start_time,
         "end_time": parsed.end_time,
         "camera_id": parsed.camera_id,
@@ -1322,6 +1756,8 @@ def _query_filters(parsed: ChatVehicleQuery) -> dict[str, Any]:
 
 def _payload_filters(payload: dict[str, Any]) -> dict[str, Any]:
     return {
+        "subject": payload.get("subject", "vehicles"),
+        "run_filter": payload.get("run_filter"),
         "selected_run_ids": list(payload.get("selected_run_ids", []) or []),
         "include_camera_ids": list(payload.get("include_camera_ids", []) or []),
         "exclude_camera_ids": list(payload.get("exclude_camera_ids", []) or []),
@@ -1329,6 +1765,10 @@ def _payload_filters(payload: dict[str, Any]) -> dict[str, Any]:
         "exclude_classes": list(payload.get("exclude_classes", []) or []),
         "include_colours": list(payload.get("colours", []) or []),
         "exclude_colours": list(payload.get("exclude_colours", []) or []),
+        "plate_presence": payload.get("plate_presence"),
+        "plate_detected": payload.get("plate_detected"),
+        "plate_readable": payload.get("plate_readable"),
+        "plate_text": payload.get("plate_text"),
         "start_time": payload.get("start_time"),
         "end_time": payload.get("end_time"),
         "camera_id": None,
@@ -1355,8 +1795,23 @@ def _reject_suspicious_llm_payload(payload: dict[str, Any], text: str, context: 
             raise VehicleQueryParseError("incorrect_group_by:expected_colour")
     expected_scope_group_by = _parse_scope_group_by(text)
     if expected_scope_group_by is not None:
-        if intent != "GROUP" or _normalize_group_by(payload.get("group_by")) != expected_scope_group_by:
+        allowed_intents = {"GROUP"}
+        if _is_summary_query(text):
+            allowed_intents.add("SUMMARY")
+        if intent not in allowed_intents or _normalize_group_by(payload.get("group_by")) != expected_scope_group_by:
             raise VehicleQueryParseError(f"incorrect_group_by:expected_{expected_scope_group_by}")
+    expected_run_query = _parse_run_metadata_query(text)
+    if expected_run_query is not None and payload.get("subject") != "runs":
+        raise VehicleQueryParseError("missing_subject:runs")
+    expected_plate_presence, expected_plate_detected, expected_plate_readable, expected_plate_text = _parse_plate_filters(text)
+    if expected_plate_presence is not None and payload.get("plate_presence") != expected_plate_presence:
+        raise VehicleQueryParseError("missing_plate_presence")
+    if expected_plate_detected is not None and payload.get("plate_detected") != expected_plate_detected:
+        raise VehicleQueryParseError("missing_plate_detected")
+    if expected_plate_readable is not None and payload.get("plate_readable") != expected_plate_readable:
+        raise VehicleQueryParseError("missing_plate_readable")
+    if expected_plate_text is not None and payload.get("plate_text") != expected_plate_text:
+        raise VehicleQueryParseError("missing_plate_text")
     if payload.get("context_reference") is not None and not _context_reference(text):
         raise VehicleQueryParseError("invented_context_reference")
     if (payload.get("start_time") == 0 or payload.get("end_time") == 0) and not re.search(r"\b(0|zero|first|between|after|before|from|to|\d)\b", text):
@@ -1381,22 +1836,34 @@ def _reject_suspicious_llm_payload(payload: dict[str, Any], text: str, context: 
             raise VehicleQueryParseError("missing_exclusion")
     include_classes = _upper_list(payload.get("classes"))
     exclude_classes = _upper_list(payload.get("exclude_classes"))
+    expected_classes = set(mentioned_classes)
+    if expected_run_query is not None:
+        expected_classes = set()
     if re.search(r"\bvehicles?\b", text) and not mentioned_classes and include_classes:
         raise VehicleQueryParseError("invented_class_for_generic_vehicle_query")
+    if expected_classes and not set(include_classes).issubset(expected_classes):
+        extras = sorted(set(include_classes) - expected_classes)
+        if extras:
+            raise VehicleQueryParseError(f"invented_class:{extras[0]}")
+    if explicit_mentions.negative_classes and not set(exclude_classes).issuperset(set(explicit_mentions.negative_classes)):
+        raise VehicleQueryParseError(f"missed_class:{explicit_mentions.negative_classes[0]}")
     for label in explicit_mentions.positive_classes:
         if label not in include_classes:
             raise VehicleQueryParseError(f"missed_class:{label}")
-    for label in explicit_mentions.negative_classes:
-        if label not in exclude_classes:
-            raise VehicleQueryParseError(f"missed_class:{label}")
     include_colours = _upper_list(payload.get("colours"))
     exclude_colours = _upper_list(payload.get("exclude_colours"))
+    expected_colours = set(mentioned_colours)
+    if expected_colours and not set(include_colours).issubset(expected_colours):
+        extras = sorted(set(include_colours) - expected_colours)
+        if extras:
+            raise VehicleQueryParseError(f"invented_colour:{extras[0]}")
+    if explicit_mentions.negative_colours and not set(exclude_colours).issuperset(set(explicit_mentions.negative_colours)):
+        raise VehicleQueryParseError(f"missed_colour:{explicit_mentions.negative_colours[0]}")
     for label in explicit_mentions.positive_colours:
         if label not in include_colours:
             raise VehicleQueryParseError(f"missed_colour:{label}")
-    for label in explicit_mentions.negative_colours:
-        if label not in exclude_colours:
-            raise VehicleQueryParseError(f"missed_colour:{label}")
+    if expected_plate_text is not None and payload.get("show_evidence") is not True:
+        raise VehicleQueryParseError("incorrect_show_evidence:plate_lookup")
 
 
 def _top_count(counts: dict[str, int]) -> dict[str, Any] | None:
@@ -1441,6 +1908,8 @@ def _normalize_llm_group_by(value: Any) -> str | None:
         return "camera"
     if normalized in {"run", "run_id"}:
         return "run"
+    if normalized in {"run_camera", "run_and_camera", "camera_run"}:
+        return "run_camera"
     raise VehicleQueryParseError(f"invalid_group_by:{value}")
 
 
@@ -1462,6 +1931,32 @@ def _normalize_operator(value: Any) -> str | None:
     if operator not in {">", "<", "="}:
         raise VehicleQueryParseError(f"invalid_operator:{value}")
     return operator
+
+
+def _normalize_llm_subject(value: Any) -> str:
+    if value is None:
+        return "vehicles"
+    normalized = str(value).strip().lower()
+    if normalized not in {"vehicles", "runs"}:
+        raise VehicleQueryParseError(f"invalid_subject:{value}")
+    return normalized
+
+
+def _normalize_llm_run_filter(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in {"multiple_cameras"}:
+        raise VehicleQueryParseError(f"invalid_run_filter:{value}")
+    return normalized
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise VehicleQueryParseError(f"invalid_boolean:{value}")
 
 
 def _comparison_from_llm(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -1495,6 +1990,76 @@ def _llm_context(context: dict[str, Any]) -> dict[str, Any]:
         "previous_filters": context.get("previous_filters"),
         "previous_vehicle_ids": list(context.get("previous_vehicle_ids", []) or [])[:20],
     }
+
+
+def _deterministic_rule_candidate(text: str, context: dict[str, Any]) -> ChatVehicleQuery | None:
+    try:
+        return _parse_rule_chat_query(text, context)
+    except VehicleQueryParseError:
+        return None
+
+
+def _classify_qwen_failure(exc: Exception) -> str:
+    message = str(exc or "")
+    lowered = message.lower()
+    if isinstance(exc, TimeoutError) or "timed out" in lowered or "timeout" in lowered:
+        return "qwen_timeout"
+    if "connection refused" in lowered or "provider=ollama" in lowered or "urlerror" in lowered or "unavailable" in lowered:
+        return "qwen_unavailable"
+    if "not valid json" in lowered or "json" in lowered and "invalid" in lowered:
+        return "qwen_invalid_json"
+    if isinstance(exc, VehicleQueryParseError):
+        if lowered.startswith("unsupported_") or lowered.startswith("invalid_") or lowered.startswith("missing_required"):
+            return "qwen_schema_validation_failed"
+        return "qwen_semantic_validation_failed"
+    return "qwen_unavailable"
+
+
+def _validate_qwen_plan(
+    *,
+    raw_payload: dict[str, Any],
+    repaired_payload: dict[str, Any],
+    text: str,
+    rule_candidate: ChatVehicleQuery | None,
+) -> tuple[str | None, str | None]:
+    raw_intent = str(raw_payload.get("intent") or "").upper()
+    if rule_candidate is not None and rule_candidate.intent != "GENERAL_CHAT" and raw_intent == "GENERAL_CHAT":
+        return "qwen_semantic_validation_failed", "incorrect_intent:general_chat_for_analytics"
+    if rule_candidate is not None:
+        if rule_candidate.subject == "runs" and repaired_payload.get("subject") != "runs":
+            return "qwen_semantic_validation_failed", "missing_subject:runs"
+        if rule_candidate.run_filter != repaired_payload.get("run_filter"):
+            if rule_candidate.run_filter is not None:
+                return "qwen_semantic_validation_failed", f"missing_run_filter:{rule_candidate.run_filter}"
+        if rule_candidate.group_by is not None and str(repaired_payload.get("intent") or "").upper() in {"GROUP", "SUMMARY"}:
+            normalized_group_by = _normalize_group_by(repaired_payload.get("group_by"))
+            if normalized_group_by != rule_candidate.group_by:
+                return "qwen_semantic_validation_failed", f"incorrect_group_by:expected_{rule_candidate.group_by}"
+        expected_classes = set(rule_candidate.include_classes)
+        actual_classes = set(_upper_list(repaired_payload.get("classes")))
+        if expected_classes and not actual_classes.issuperset(expected_classes):
+            return "qwen_semantic_validation_failed", f"missed_class:{sorted(expected_classes - actual_classes)[0]}"
+        if actual_classes - expected_classes and expected_classes:
+            return "qwen_semantic_validation_failed", f"invented_class:{sorted(actual_classes - expected_classes)[0]}"
+        expected_excluded = set(rule_candidate.exclude_classes)
+        actual_excluded = set(_upper_list(repaired_payload.get("exclude_classes")))
+        if expected_excluded and not actual_excluded.issuperset(expected_excluded):
+            return "qwen_semantic_validation_failed", f"missed_class:{sorted(expected_excluded - actual_excluded)[0]}"
+        expected_colours = set(rule_candidate.include_colours)
+        actual_colours = set(_upper_list(repaired_payload.get("colours")))
+        if expected_colours and not actual_colours.issuperset(expected_colours):
+            return "qwen_semantic_validation_failed", f"missed_colour:{sorted(expected_colours - actual_colours)[0]}"
+        if actual_colours - expected_colours and expected_colours:
+            return "qwen_semantic_validation_failed", f"invented_colour:{sorted(actual_colours - expected_colours)[0]}"
+        if rule_candidate.plate_detected != repaired_payload.get("plate_detected") and rule_candidate.plate_detected is not None:
+            return "qwen_semantic_validation_failed", "plate_detected_mismatch"
+        if rule_candidate.plate_readable != repaired_payload.get("plate_readable") and rule_candidate.plate_readable is not None:
+            return "qwen_semantic_validation_failed", "plate_readable_mismatch"
+        if rule_candidate.plate_text and repaired_payload.get("plate_text") != rule_candidate.plate_text:
+            return "qwen_semantic_validation_failed", "plate_text_mismatch"
+    if raw_intent == "GENERAL_CHAT" and _classify_message_type(text, {}) == "NEW_ANALYTICS_QUERY":
+        return "qwen_semantic_validation_failed", "incorrect_intent:general_chat_for_analytics"
+    return None, None
 
 
 def _diagnostic_reason(exc: Exception) -> str:
@@ -1600,6 +2165,18 @@ def _query_description(parsed: ChatVehicleQuery, total: int) -> str:
         parts.append(" or ".join(nouns))
     else:
         parts.append("vehicles")
+    if parsed.plate_text:
+        parts.append(f"with plate {parsed.plate_text}")
+    elif parsed.plate_detected is True and parsed.plate_readable is False:
+        parts.append("with detected but unreadable number plates")
+    elif parsed.plate_readable is False:
+        parts.append("without readable number plates")
+    elif parsed.plate_detected is False:
+        parts.append("without number plates")
+    elif parsed.plate_presence == "readable":
+        parts.append("with readable number plates")
+    elif parsed.plate_presence == "detected":
+        parts.append("with number plates")
     description = " ".join(parts)
     exclusions: list[str] = []
     if parsed.exclude_classes:
@@ -1715,7 +2292,7 @@ def _all_cameras_requested(text: str) -> bool:
 
 
 def _parse_scope_group_by(text: str) -> str | None:
-    if re.search(r"\b(?:by|per|compare)\s+run\s+and\s+camera\b|\b(?:by|per|compare)\s+camera\s+and\s+run\b", text):
+    if re.search(r"\b(?:by|per|compare)\s+run\s+and\s+camera\b|\b(?:by|per|compare)\s+camera\s+and\s+run\b|\brun\s+and\s+camera\s*(?:-| )wise\b", text):
         return "run_camera"
     by_camera = bool(
         re.search(
@@ -1780,6 +2357,8 @@ def _apply_run_and_camera_scope(
         intent = "GROUP"
     return ChatVehicleQuery(
         intent=intent,
+        subject=parsed.subject,
+        run_filter=parsed.run_filter,
         selected_run_ids=scoped_run_ids,
         include_camera_ids=include_camera_ids,
         exclude_camera_ids=exclude_camera_ids,
@@ -1787,6 +2366,7 @@ def _apply_run_and_camera_scope(
         exclude_classes=list(parsed.exclude_classes),
         include_colours=list(parsed.include_colours),
         exclude_colours=list(parsed.exclude_colours),
+        plate_presence=parsed.plate_presence,
         start_time=parsed.start_time,
         end_time=parsed.end_time,
         camera_id=include_camera_ids[0] if len(include_camera_ids) == 1 else parsed.camera_id,

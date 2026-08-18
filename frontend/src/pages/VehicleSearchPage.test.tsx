@@ -512,6 +512,11 @@ describe("VehicleSearchPage", () => {
     expect(screen.getByText("VEHICLE_004")).toBeInTheDocument();
     expect(screen.getAllByText("HR38AD4296").length).toBeGreaterThan(0);
     expect(screen.getAllByText("TRACK_4").length).toBeGreaterThan(0);
+    expect(screen.getByText("VEHICLE_004")).toHaveClass("table-badge", "table-badge--vehicle-id");
+    expect(screen.getByText("TRACK_4")).toHaveClass("table-badge", "table-badge--track");
+    expect(document.querySelector(".table-badge--class.badge-class--car")).not.toBeNull();
+    expect(document.querySelector(".table-badge--colour.badge-tone--white")).not.toBeNull();
+    expect(document.querySelector(".table-badge--status.badge-status--merged")).not.toBeNull();
     expect(fetchTrackReconciliation).not.toHaveBeenCalled();
     expect(fetchPlateAssistedVehicles).not.toHaveBeenCalled();
   });
@@ -535,7 +540,9 @@ describe("VehicleSearchPage", () => {
     expect(screen.getByText("YES")).toBeInTheDocument();
     expect(screen.getAllByText("0.748").length).toBeGreaterThan(0);
     expect(screen.getByText("View Evidence")).toBeInTheDocument();
-    expect(screen.getByText("ACCEPTED")).toBeInTheDocument();
+    expect(document.querySelector(".table-badge--vehicle-id")).not.toBeNull();
+    expect(document.querySelector(".table-badge--track")).not.toBeNull();
+    expect(document.querySelector(".table-badge--status")).not.toBeNull();
   });
 
   it("shows a clean missing reconciliation message without breaking raw tracks", async () => {
@@ -564,6 +571,7 @@ describe("VehicleSearchPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Raw Tracks" }));
     expect(screen.getByText("TRACK_1")).toBeInTheDocument();
     expect(screen.getByText("DL8CAF5030")).toBeInTheDocument();
+    expect(document.querySelector(".table-badge--status.badge-status--completed")).not.toBeNull();
   });
 
   it("loads plate-assisted identity as a separate experimental view", async () => {

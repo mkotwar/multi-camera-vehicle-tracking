@@ -7,6 +7,11 @@ from dataclasses import asdict
 
 from pydantic import BaseModel, Field
 
+try:
+    from starlette.requests import Request
+except ModuleNotFoundError:  # pragma: no cover
+    Request = Any  # type: ignore[assignment]
+
 from .config_service import ConfigService, ConfigServiceError
 from .env_loader import load_env_file, set_env_file_value
 from .pipeline_run_manager import (
@@ -75,7 +80,7 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
         resolved_env_path = project_root / resolved_env_path
 
     repository = get_run_repository(outputs_root=outputs_root)
-    config_service = ConfigService(config_dir=resolved_config_dir)
+    config_service = ConfigService(config_dir=resolved_config_dir, project_root=project_root)
     pipeline_run_manager = PipelineRunManager(
         project_root=project_root,
         config_service=config_service,
@@ -511,6 +516,19 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
     @app.post("/api/configs/{config_name}/clone")
     def clone_config(config_name: str, request: ConfigCloneRequest) -> dict[str, Any]:
         return config_service.clone_config(config_name, request.new_name, config=request.config)
+
+    @app.post("/api/configs/{config_name}/camera-source")
+    async def upload_config_camera_source(config_name: str, request: Request) -> dict[str, Any]:
+        form = await request.form()
+        camera_id = str(form.get("camera_id") or "").strip()
+        if not camera_id:
+            raise HTTPException(status_code=422, detail="camera_id is required")
+        uploaded = form.get("file")
+        if uploaded is None or not hasattr(uploaded, "read"):
+            raise HTTPException(status_code=422, detail="file is required")
+        payload = await uploaded.read()
+        filename = str(getattr(uploaded, "filename", "") or "")
+        return config_service.save_uploaded_video_source(config_name, camera_id, filename, payload)
 
     @app.get("/api/configs/{config_name}/roi-preview")
     def get_config_roi_preview(config_name: str, camera_id: str, frame_number: int | None = Query(default=None)) -> Any:

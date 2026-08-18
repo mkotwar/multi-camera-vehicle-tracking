@@ -4,8 +4,9 @@ import { fetchRuns } from "../api/runs";
 import { sendVideoChatMessage } from "../api/videoChat";
 import { TrackDetailPanel, type TrackSelection } from "../components/track/TrackDetailPanel";
 import type { RunSummary } from "../types/run";
-import type { ChatMessage, EvidencePage, VideoChatResponse, VehicleEvidence } from "../types/videoChat";
+import type { ChatMessage, ChatVehicleQuery, EvidencePage, VideoChatResponse, VehicleEvidence } from "../types/videoChat";
 import {
+  createVideoChatSession,
   getOrCreateVideoChatSessionForRunIds,
   loadActiveVideoChatRunIds,
   loadActiveVideoChatRunId,
@@ -24,17 +25,41 @@ const PROMPT_SUGGESTIONS = [
 
 export function VideoChatPage() {
   const initialRunIds = loadActiveVideoChatRunIds() ?? [loadActiveVideoChatRunId() ?? "latest"];
-  const [chatSession, setChatSession] = useState(() => getOrCreateVideoChatSessionForRunIds(initialRunIds));
+  const [chatSession, setChatSession] = useState(() => (initialRunIds.length ? getOrCreateVideoChatSessionForRunIds(initialRunIds) : createVideoChatSession("latest", [])));
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [runIds, setRunIds] = useState<string[]>(chatSession.run_ids?.length ? chatSession.run_ids : [chatSession.run_id]);
+  const [runIds, setRunIds] = useState<string[]>(sessionRunIds(chatSession));
   const [messages, setMessages] = useState<ChatMessage[]>(chatSession.messages);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isRunMenuOpen, setIsRunMenuOpen] = useState(false);
+  const [runQuery, setRunQuery] = useState("");
   const [userIsReading, setUserIsReading] = useState(false);
   const [selectedTrack, setSelectedTrack] = useState<TrackSelection | null>(null);
   const chatHistoryRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const runMenuRef = useRef<HTMLDivElement | null>(null);
+  const runIdsRef = useRef(runIds);
+  const chatSessionRef = useRef(chatSession);
+
+  useEffect(() => {
+    runIdsRef.current = runIds;
+  }, [runIds]);
+
+  useEffect(() => {
+    chatSessionRef.current = chatSession;
+  }, [chatSession]);
+
+  useEffect(() => {
+    if (!isRunMenuOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!runMenuRef.current?.contains(event.target as Node)) {
+        setIsRunMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", handlePointerDown);
+    return () => window.removeEventListener("mousedown", handlePointerDown);
+  }, [isRunMenuOpen]);
 
   useEffect(() => {
     void fetchRuns()
@@ -56,6 +81,12 @@ export function VideoChatPage() {
   const selectedRuns = useMemo(() => runIds.map((runId) => runs.find((item) => item.run_id === runId)).filter(Boolean) as RunSummary[], [runIds, runs]);
   const selectedRun = selectedRuns.length === 1 ? selectedRuns[0] : undefined;
   const latestAssistantMessage = useMemo(() => [...messages].reverse().find((message) => message.role === "assistant"), [messages]);
+  const camerasInScope = selectedRuns.reduce((total, run) => total + Number(run.camera_count ?? 0), 0);
+  const filteredRuns = useMemo(() => {
+    const query = runQuery.trim().toLowerCase();
+    if (!query) return runs;
+    return runs.filter((run) => `${run.run_id} ${run.status ?? ""}`.toLowerCase().includes(query));
+  }, [runQuery, runs]);
 
   const handleScroll = () => {
     const element = chatHistoryRef.current;
@@ -72,14 +103,15 @@ export function VideoChatPage() {
       setError("Select at least one run to start the chat.");
       return;
     }
-    const sessionId = chatSession.session_id;
+    const currentRunIds = runIdsRef.current;
+    const sessionId = chatSessionRef.current.session_id;
     const userMessage: ChatMessage = { id: makeMessageId("user"), role: "user", text, timestamp: new Date().toISOString() };
     persistMessages((current) => [...current, userMessage]);
     setInput("");
     setError(null);
     setIsSending(true);
     try {
-      const response = await sendVideoChatMessage({ message: text, run_id: runIds[0], run_ids: runIds, session_id: sessionId });
+      const response = await sendVideoChatMessage({ message: text, run_id: currentRunIds[0], run_ids: currentRunIds, session_id: sessionId });
       persistMessages((current) => [...current, responseToMessage(response)]);
     } catch (chatError) {
       setError(describeChatError(chatError));
@@ -100,7 +132,7 @@ export function VideoChatPage() {
     setSelectedTrack(track);
   };
 
-  const startNewChat = (nextRunIds = runIds.length ? runIds : ["latest"]) => {
+  const startNewChat = (nextRunIds = runIdsRef.current) => {
     const nextSession = replaceVideoChatSessionForRunIds(nextRunIds);
     setChatSession(nextSession);
     setRunIds(nextRunIds);
@@ -108,29 +140,30 @@ export function VideoChatPage() {
     setSelectedTrack(null);
     setInput("");
     setError(null);
+    setIsRunMenuOpen(false);
+    setRunQuery("");
     setUserIsReading(false);
   };
 
   const changeRuns = (nextRunIds: string[]) => {
-    if (nextRunIds.length === 0) {
-      setRunIds([]);
-      setMessages([]);
-      setSelectedTrack(null);
-      setError(null);
-      setUserIsReading(false);
+    const normalized = normalizeRunIds(nextRunIds, runs);
+    if (normalized.length === 0) {
+      clearRunSelection();
       return;
     }
-    loadRunSession(nextRunIds);
+    loadRunSession(normalized);
   };
 
   function loadRunSession(nextRunIds: string[]) {
-    const cleaned = nextRunIds.length ? nextRunIds : ["latest"];
+    const cleaned = normalizeRunIds(nextRunIds, runs);
     const nextSession = getOrCreateVideoChatSessionForRunIds(cleaned);
     setChatSession(nextSession);
-    setRunIds(cleaned);
+    setRunIds(sessionRunIds(nextSession));
     setMessages(nextSession.messages);
     setSelectedTrack(null);
     setError(null);
+    setIsRunMenuOpen(false);
+    setRunQuery("");
     setUserIsReading(false);
     saveActiveVideoChatRunIds(cleaned);
     if (nextSession.messages.length === 0) {
@@ -138,10 +171,26 @@ export function VideoChatPage() {
     }
   }
 
+  function clearRunSelection() {
+    const nextSession = createVideoChatSession("latest", []);
+    setChatSession(nextSession);
+    setRunIds([]);
+    setMessages([]);
+    setSelectedTrack(null);
+    setInput("");
+    setError(null);
+    setIsRunMenuOpen(false);
+    setRunQuery("");
+    setUserIsReading(false);
+    saveActiveVideoChatRunIds([]);
+  }
+
   function persistMessages(updater: (current: ChatMessage[]) => ChatMessage[]) {
     setMessages((current) => {
       const nextMessages = updater(current);
-      const nextSession = { ...chatSession, run_id: runIds[0], run_ids: runIds, messages: nextMessages };
+      const currentRunIds = runIdsRef.current;
+      const currentSession = chatSessionRef.current;
+      const nextSession = { ...currentSession, run_id: currentRunIds[0] ?? currentSession.run_id, run_ids: currentRunIds, messages: nextMessages };
       setChatSession(nextSession);
       saveVideoChatSessionForRun(nextSession);
       return nextMessages;
@@ -150,7 +199,7 @@ export function VideoChatPage() {
 
   const runBadges = [
     { label: "Runs", value: selectedRuns.length > 1 ? `${selectedRuns.length} selected` : selectedRun?.run_id ?? runIds[0] ?? "None selected" },
-    { label: "Cameras", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.camera_count ?? 0), 0) : "Any" },
+    { label: "Cameras", value: selectedRuns.length ? camerasInScope : "None selected" },
     { label: "Duration", value: selectedRun?.duration_seconds != null ? formatVideoTime(selectedRun.duration_seconds) : selectedRuns.length > 1 ? "Multiple runs" : "Saved run" },
     { label: "Vehicles", value: selectedRuns.length ? selectedRuns.reduce((total, run) => total + Number(run.physical_vehicle_count ?? run.track_count ?? 0), 0) : "Unavailable" },
   ];
@@ -179,45 +228,78 @@ export function VideoChatPage() {
       <section className="video-chat-workspace">
         <section className="chat-panel" aria-label="Video analytics assistant">
           <div className="chat-panel-toolbar">
-            <div className="run-selector-shell" aria-label="Video chat run">
-              <span>Runs / videos</span>
-              <div className="run-selector-actions">
-                <button type="button" className="secondary-button compact-action" onClick={() => changeRuns(runs.map((run) => run.run_id))} disabled={runs.length === 0}>
-                  Select all
-                </button>
-                <button type="button" className="secondary-button compact-action" onClick={() => changeRuns([])} disabled={runIds.length === 0}>
-                  Clear
-                </button>
+            <div ref={runMenuRef} className="run-selector-shell" aria-label="Video chat run">
+              <div className="run-selector-heading">
+                <span>Runs / videos</span>
+                <small className="run-selector-summary">
+                  {runIds.length === 0 ? "No runs selected" : `${runIds.length} run${runIds.length === 1 ? "" : "s"} selected`}
+                </small>
               </div>
-              <div className="run-selector-list" role="group" aria-label="Video chat run">
-                {runs.length === 0 ? (
-                  <label className="run-selector-option">
-                    <input type="checkbox" checked readOnly />
-                    <span>Latest</span>
+              <button
+                type="button"
+                className={`run-selector-trigger ${isRunMenuOpen ? "open" : ""}`}
+                aria-label="Select runs"
+                aria-expanded={isRunMenuOpen}
+                aria-haspopup="dialog"
+                aria-controls="video-chat-run-menu"
+                onClick={() => setIsRunMenuOpen((current) => !current)}
+              >
+                <strong>{runIds.length === 0 ? "Choose runs" : runIds.length === 1 ? runIds[0] : `${runIds.length} runs selected`}</strong>
+                <span>{runIds.length === 0 ? "Search and select one or more processed runs" : `${camerasInScope} cameras in scope`}</span>
+              </button>
+              <div className="run-selector-scope" aria-live="polite">
+                <strong>Selected runs: {runIds.length}</strong>
+                <span>Cameras in scope: {runIds.length === 0 ? 0 : camerasInScope}</span>
+              </div>
+              {isRunMenuOpen ? (
+                <div id="video-chat-run-menu" className="run-selector-popover" role="dialog" aria-label="Run selection menu">
+                  <label className="run-selector-search">
+                    <span>Search runs</span>
+                    <input
+                      value={runQuery}
+                      onChange={(event) => setRunQuery(event.target.value)}
+                      placeholder="Search by run ID or status"
+                      aria-label="Search runs"
+                    />
                   </label>
-                ) : (
-                  runs.map((run) => {
-                    const checked = runIds.includes(run.run_id);
-                    return (
-                      <label key={run.run_id} className="run-selector-option">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => {
-                            const nextRunIds = checked ? runIds.filter((runId) => runId !== run.run_id) : [...runIds, run.run_id];
-                            changeRuns(nextRunIds);
-                          }}
-                        />
-                        <span>{run.run_id}</span>
-                        <small>{run.status ?? "Saved run"}</small>
+                  <div className="run-selector-actions">
+                    <button type="button" className="secondary-button compact-action" onClick={() => changeRuns(runs.map((run) => run.run_id))} disabled={runs.length === 0}>
+                      Select all
+                    </button>
+                    <button type="button" className="secondary-button compact-action" onClick={() => changeRuns([])} disabled={runIds.length === 0}>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="run-selector-list" role="group" aria-label="Video chat run">
+                    {runs.length === 0 ? (
+                      <label className="run-selector-option">
+                        <input type="checkbox" checked readOnly />
+                        <span>Latest</span>
                       </label>
-                    );
-                  })
-                )}
-              </div>
-              <small className="run-selector-summary">
-                {runIds.length === 0 ? "No runs selected" : `${runIds.length} run${runIds.length === 1 ? "" : "s"} selected`}
-              </small>
+                    ) : filteredRuns.length === 0 ? (
+                      <div className="run-selector-empty">No runs match that search.</div>
+                    ) : (
+                      filteredRuns.map((run) => {
+                        const checked = runIds.includes(run.run_id);
+                        return (
+                          <label key={run.run_id} className="run-selector-option">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => {
+                                const nextRunIds = checked ? runIds.filter((runId) => runId !== run.run_id) : [...runIds, run.run_id];
+                                changeRuns(nextRunIds);
+                              }}
+                            />
+                            <span>{run.run_id}</span>
+                            <small>{run.status ?? "Saved run"}</small>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              ) : null}
             </div>
             <span className="status status-completed">{runIds.length === 0 ? "Choose runs" : selectedRuns.length > 1 ? "All selected runs" : selectedRun?.status ?? "Latest"}</span>
             <button type="button" className="secondary-button compact-action" onClick={() => startNewChat()}>
@@ -226,7 +308,7 @@ export function VideoChatPage() {
           </div>
 
           <div ref={chatHistoryRef} className="chat-history" aria-label="Video analytics chat history" onScroll={handleScroll}>
-            {messages.length === 0 ? <ChatEmptyState onPrompt={submitMessage} /> : null}
+            {messages.length === 0 ? <ChatEmptyState onPrompt={submitMessage} selectedRunCount={runIds.length} /> : null}
             {messages.map((message) => (
               <ChatMessageCard
                 key={message.id}
@@ -280,6 +362,17 @@ function responseToMessage(response: VideoChatResponse): ChatMessage {
       llm_rejection_reason: response.llm_rejection_reason,
       llm_raw_structured_output: response.llm_raw_structured_output,
       normalized_llm_output: response.normalized_llm_output,
+      normalized_plan: response.normalized_plan,
+      semantic_repair_applied: response.semantic_repair_applied,
+      semantic_repair_notes: response.semantic_repair_notes,
+      fallback_reason: response.fallback_reason,
+      parser_model: response.parser_model,
+      total_parser_ms: response.total_parser_ms,
+      qwen_request_ms: response.qwen_request_ms,
+      normalize_ms: response.normalize_ms,
+      repair_ms: response.repair_ms,
+      validation_ms: response.validation_ms,
+      ollama_metadata: response.ollama_metadata,
       message_type: response.message_type,
       context_was_available: response.context_was_available,
       context_reference: response.context_reference,
@@ -303,13 +396,13 @@ function makeMessageId(role: ChatMessage["role"]) {
   return `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function ChatEmptyState({ onPrompt }: { onPrompt: (event?: FormEvent, override?: string) => void }) {
+function ChatEmptyState({ onPrompt, selectedRunCount }: { onPrompt: (event?: FormEvent, override?: string) => void; selectedRunCount: number }) {
   return (
     <section className="chat-empty-state">
       <div className="assistant-avatar" aria-hidden="true"><span>AI</span></div>
       <div>
-        <h2>Ask questions about this video</h2>
-        <p>You can count vehicles, inspect colours, compare classes, and open evidence from matching tracks.</p>
+        <h2>{selectedRunCount > 1 ? "Ask questions across these runs" : "Ask questions about this run"}</h2>
+        <p>You can count vehicles, compare cameras or runs, filter by plates, and open evidence from matching tracks.</p>
         <div className="suggestion-grid">
           {PROMPT_SUGGESTIONS.map((prompt) => (
             <button key={prompt} type="button" onClick={() => onPrompt(undefined, prompt)}>
@@ -369,15 +462,36 @@ function ChatMessageCard({
 }
 
 function ResultPresentation({ message }: { message: ChatMessage }) {
-  const intent = message.debug?.parsed_query.intent?.toUpperCase();
+  const parsed = message.debug?.parsed_query;
   const analytics = message.debug?.analytics_result ?? {};
-  const metrics = getResultMetrics(intent, analytics);
+  const lead = getResultLead(message);
+  const metrics = getResultMetrics(parsed, analytics);
+  const primaryMetric = getPrimaryMetric(parsed, analytics);
   const intervals = getIntervalResults(analytics);
-  const groups = getGroupRows(analytics);
+  const groups = getGroupRows(parsed, analytics);
+  const groupedSummary = getGroupedSummary(parsed, analytics);
+  const filterChips = getFilterChips(parsed);
+  const listValues = getValueList(parsed, analytics);
 
   return (
     <div className="result-block">
-      <p>{message.text}</p>
+      {primaryMetric ? (
+        <section className="result-primary-metric" aria-label="Primary result metric">
+          {primaryMetric.title ? <span className="result-primary-eyebrow">{primaryMetric.title}</span> : null}
+          <strong>{primaryMetric.value}</strong>
+          <span>{primaryMetric.label}</span>
+          {lead ? <p>{lead}</p> : null}
+        </section>
+      ) : (
+        <p>{lead}</p>
+      )}
+      {filterChips.length ? (
+        <div className="result-chip-row" aria-label="Applied filters">
+          {filterChips.map((chip) => (
+            <span key={chip}>{chip}</span>
+          ))}
+        </div>
+      ) : null}
       {metrics.length ? (
         <div className="result-metric-grid" aria-label="Result metrics">
           {metrics.map((metric) => (
@@ -388,6 +502,37 @@ function ResultPresentation({ message }: { message: ChatMessage }) {
           ))}
         </div>
       ) : null}
+      {groupedSummary.length ? (
+        <div className="grouped-summary-grid" aria-label="Structured summary">
+          {groupedSummary.map((group) => (
+            <section key={group.key} className="grouped-summary-card">
+              <div className="grouped-summary-header">
+                <strong>{group.title}</strong>
+                {group.subtitle ? <span>{group.subtitle}</span> : null}
+              </div>
+              <div className="grouped-summary-stats">
+                <div>
+                  <span>Vehicles</span>
+                  <strong>{group.total}</strong>
+                </div>
+                {group.window ? (
+                  <div>
+                    <span>Seen</span>
+                    <strong>{group.window}</strong>
+                  </div>
+                ) : null}
+              </div>
+              {group.highlights.length ? (
+                <div className="result-chip-row" aria-label={`Highlights for ${group.title}`}>
+                  {group.highlights.map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          ))}
+        </div>
+      ) : null}
       {groups.length ? (
         <div className="result-list" aria-label="Result breakdown">
           {groups.map((row) => (
@@ -395,6 +540,13 @@ function ResultPresentation({ message }: { message: ChatMessage }) {
               <span>{row.label}</span>
               <strong>{row.value}</strong>
             </div>
+          ))}
+        </div>
+      ) : null}
+      {listValues.length ? (
+        <div className="result-chip-row" aria-label="Result values">
+          {listValues.map((value) => (
+            <span key={value}>{value}</span>
           ))}
         </div>
       ) : null}
@@ -486,7 +638,6 @@ function EvidenceGrid({
                 <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
               </div>
               <span className="evidence-seen">Track: {displayTrack}</span>
-              <span className="evidence-seen">{displayTrack}</span>
               <span className={`evidence-plate ${item.plate_text ? "readable" : ""}`}>Plate: {plateText}</span>
               <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
               {onSelectTrack ? (
@@ -552,7 +703,7 @@ function ChatComposer({
         <input
           value={input}
           onChange={(event) => onInput(event.target.value)}
-          placeholder="Ask about vehicles, colours, time ranges, or evidence..."
+          placeholder="Ask about selected runs, cameras, plates, time ranges, or evidence..."
           aria-label="Video chat message"
         />
         <button type="submit" disabled={isSending || !input.trim()}>
@@ -597,7 +748,7 @@ function VideoContextPanel({
       ) : (
         <>
           <section>
-            <h2>Current Video</h2>
+            <h2>Current Scope</h2>
             <dl className="context-list">
               <div><dt>Run</dt><dd>{selectedRunIds.length > 1 ? `${selectedRunIds.length} selected` : selectedRun?.run_id ?? runId}</dd></div>
               <div><dt>Scope</dt><dd>{selectedRunIds.length === 0 ? "No runs selected" : selectedRunIds.length > 1 ? "All selected runs" : selectedRun?.run_id ?? runId}</dd></div>
@@ -655,28 +806,177 @@ function formatMessageTime(timestamp: string) {
   return value.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function getResultMetrics(intent: string | undefined, analytics: Record<string, unknown>) {
-  if (!intent || !["COUNT", "COMPARE", "GROUP", "SUMMARY"].includes(intent)) return [];
-  const labels = [
-    ["total", "Total"],
-    ["count", "Matches"],
-    ["matching_count", "Matches"],
-    ["total_unique_vehicles", "Total vehicles"],
-    ["difference", "Difference"],
-  ] as const;
-  return labels
-    .map(([key, label]) => ({ label, value: analytics[key] }))
-    .filter((metric) => typeof metric.value === "number" || typeof metric.value === "string")
-    .map((metric) => ({ label: metric.label, value: String(metric.value) }));
+function getResultLead(message: ChatMessage) {
+  const parsed = message.debug?.parsed_query;
+  const analytics = message.debug?.analytics_result ?? {};
+  const intent = parsed?.intent?.toUpperCase();
+  if (intent === "SUMMARY" && parsed?.group_by) {
+    return `Traffic summary by ${formatGroupBy(parsed.group_by)}.`;
+  }
+  if (intent === "GROUP" && parsed?.group_by) {
+    const total = readNumericResult(analytics.total ?? analytics.matching_count ?? analytics.count);
+    return total == null ? message.text : `I found ${total} matching vehicles.`;
+  }
+  return message.text;
 }
 
-function getGroupRows(analytics: Record<string, unknown>) {
-  const source = analytics.by_run_camera ?? analytics.by_run ?? analytics.by_camera ?? analytics.by_type ?? analytics.by_class ?? analytics.by_colour ?? analytics.counts;
-  if (!source || typeof source !== "object" || Array.isArray(source)) return [];
-  return Object.entries(source as Record<string, unknown>)
-    .filter(([, value]) => typeof value === "number" || typeof value === "string")
+function getResultMetrics(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const intent = parsed?.intent?.toUpperCase();
+  const subject = parsed?.subject;
+  const groupBy = parsed?.group_by;
+  if (!intent) return [];
+  if (intent === "COUNT") {
+    const total = readNumericResult(analytics.total ?? analytics.count ?? analytics.matching_count);
+    if (total == null) return [];
+    return [{ label: subject === "runs" ? "Runs" : "Matching vehicles", value: String(total) }];
+  }
+  if (intent === "SUMMARY" && !groupBy) {
+    const total = readNumericResult(analytics.total_unique_vehicles);
+    return total == null ? [] : [{ label: "Completed vehicles", value: String(total) }];
+  }
+  if (intent === "GROUP") {
+    const total = readNumericResult(analytics.total);
+    return total == null ? [] : [{ label: "Matching vehicles", value: String(total) }];
+  }
+  if (intent === "COMPARE") {
+    const metrics = [
+      analytics.left && analytics.left_total != null ? { label: String(analytics.left), value: String(analytics.left_total) } : null,
+      analytics.right && analytics.right_total != null ? { label: String(analytics.right), value: String(analytics.right_total) } : null,
+      analytics.answer ? { label: "Result", value: String(analytics.answer) } : null,
+    ];
+    return metrics.filter(Boolean) as Array<{ label: string; value: string }>;
+  }
+  return [];
+}
+
+function getPrimaryMetric(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const intent = parsed?.intent?.toUpperCase();
+  const total = readNumericResult(
+    analytics.total ??
+    analytics.count ??
+    analytics.matching_count ??
+    analytics.total_unique_vehicles,
+  );
+  if (intent === "COUNT" && total != null) {
+    return {
+      title: getPrimaryMetricTitle(parsed),
+      value: String(total),
+      label: total === 1 ? (parsed?.subject === "runs" ? "run" : "vehicle") : (parsed?.subject === "runs" ? "runs" : "vehicles"),
+    };
+  }
+  if (intent === "SUMMARY" && !parsed?.group_by && total != null) {
+    return {
+      title: getPrimaryMetricTitle(parsed),
+      value: String(total),
+      label: total === 1 ? "vehicle" : "vehicles",
+    };
+  }
+  return null;
+}
+
+function getPrimaryMetricTitle(parsed: ChatVehicleQuery | undefined) {
+  if (!parsed) return "Result";
+  if (parsed.subject === "runs") {
+    return parsed.run_filter === "multiple_cameras" ? "Runs with multiple cameras" : "Selected runs";
+  }
+  const includeClasses = parsed.include_classes.map((value) => formatLabel(value));
+  const includeColours = parsed.include_colours.map((value) => formatLabel(value));
+  const titleParts = [...includeColours, ...includeClasses];
+  if (titleParts.length) {
+    return titleParts.join(" ");
+  }
+  if (parsed.plate_text) {
+    return `Plate ${parsed.plate_text}`;
+  }
+  if (parsed.plate_readable === false) {
+    return "Unreadable plates";
+  }
+  if (parsed.plate_presence === "detected") {
+    return "Vehicles with number plates";
+  }
+  return "Result";
+}
+
+function getGroupRows(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const intent = parsed?.intent?.toUpperCase();
+  if (intent === "SUMMARY" && parsed?.group_by) return [];
+  const source = resolveGroupSource(parsed, analytics);
+  if (!source) return [];
+  return Object.entries(source)
+    .filter(([, value]) => readNumericResult(value) != null && Number(value) > 0)
     .slice(0, 12)
-    .map(([label, value]) => ({ label: formatLabel(label), value: String(value) }));
+    .map(([label, value]) => ({ label: formatGroupLabel(label, parsed?.group_by), value: String(value) }));
+}
+
+function getGroupedSummary(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const groupBy = parsed?.group_by;
+  if (parsed?.intent?.toUpperCase() !== "SUMMARY" || !groupBy) return [];
+  const groups = analytics.groups;
+  if (!groups || typeof groups !== "object" || Array.isArray(groups)) return [];
+  return Object.entries(groups as Record<string, unknown>)
+    .map(([key, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const group = value as Record<string, unknown>;
+      const classes = formatCountHighlights(group.vehicle_classes);
+      const colours = formatCountHighlights(group.colours);
+      const window = formatTimeWindow(group.first_seen_seconds, group.last_seen_seconds);
+      const [runTitle, cameraTitle] = key.split(" / ");
+      return {
+        key,
+        title: groupBy === "run_camera" ? (runTitle || key) : formatGroupLabel(key, groupBy),
+        subtitle: groupBy === "run_camera" && cameraTitle ? cameraTitle : undefined,
+        total: String(readNumericResult(group.total_unique_vehicles) ?? 0),
+        window,
+        highlights: [...classes, ...colours].slice(0, 6),
+      };
+    })
+    .filter(Boolean) as Array<{ key: string; title: string; subtitle?: string; total: string; window?: string; highlights: string[] }>;
+}
+
+function getFilterChips(parsed: ChatVehicleQuery | undefined) {
+  if (!parsed) return [];
+  const chips = [
+    ...parsed.include_classes.map((value) => formatLabel(value)),
+    ...parsed.include_colours.map((value) => formatLabel(value)),
+    parsed.plate_presence ? `Plates: ${formatLabel(parsed.plate_presence)}` : null,
+    parsed.camera_id ? `Camera: ${parsed.camera_id}` : null,
+    ...(parsed.include_camera_ids ?? []).map((value) => `Camera: ${value}`),
+    parsed.run_filter === "multiple_cameras" ? "Multiple cameras only" : null,
+  ];
+  return chips.filter(Boolean) as string[];
+}
+
+function getValueList(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const intent = parsed?.intent?.toUpperCase();
+  if (intent === "UNIQUE_CLASSES") {
+    return toStringList(analytics.vehicle_classes_present);
+  }
+  if (intent === "UNIQUE_COLOURS") {
+    return toStringList(analytics.colours_present);
+  }
+  if (intent === "SUMMARY" && !parsed?.group_by) {
+    return [
+      ...formatCountHighlights(analytics.vehicle_classes ?? analytics.by_type),
+      ...formatCountHighlights(analytics.colours ?? analytics.by_colour),
+    ].slice(0, 10);
+  }
+  return [];
+}
+
+function normalizeRunIds(runIds: string[], runs: RunSummary[]): string[] {
+  const selected = new Set(runIds.map((item) => item.trim()).filter(Boolean));
+  if (selected.size === 0) {
+    return [];
+  }
+  const availableRunIds = runs.map((run) => run.run_id).filter((runId) => selected.has(runId));
+  return availableRunIds.length > 0 ? availableRunIds : Array.from(selected);
+}
+
+function sessionRunIds(session: { run_id: string; run_ids?: string[] }): string[] {
+  if (session.run_ids !== undefined) {
+    return session.run_ids;
+  }
+  return session.run_id ? [session.run_id] : [];
 }
 
 function getIntervalResults(analytics: Record<string, unknown>) {
@@ -695,6 +995,62 @@ function getIntervalResults(analytics: Record<string, unknown>) {
       .join(" · ");
     return { label: start || end ? `${start}-${end}` : `Interval ${index + 1}`, detail };
   });
+}
+
+function resolveGroupSource(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  const intent = parsed?.intent?.toUpperCase();
+  const groupBy = parsed?.group_by;
+  if (intent !== "GROUP") return null;
+  const sourceKey = groupBy === "run_camera"
+    ? "by_run_camera"
+    : groupBy === "run"
+      ? "by_run"
+      : groupBy === "camera"
+        ? "by_camera"
+        : groupBy === "colour"
+          ? "by_colour"
+          : "by_class";
+  const source = analytics[sourceKey];
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  return source as Record<string, unknown>;
+}
+
+function formatGroupBy(value: string) {
+  return value === "run_camera" ? "run and camera" : formatLabel(value).toLowerCase();
+}
+
+function formatGroupLabel(value: string, groupBy?: string | null) {
+  if (groupBy === "run_camera") {
+    const [runId, cameraId] = value.split(" / ");
+    if (runId && cameraId) {
+      return `${runId} - ${cameraId}`;
+    }
+  }
+  return formatLabel(value);
+}
+
+function readNumericResult(value: unknown) {
+  return typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" && !Number.isNaN(Number(value)) ? Number(value) : null;
+}
+
+function formatCountHighlights(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value as Record<string, unknown>)
+    .filter(([, count]) => readNumericResult(count) != null && Number(count) > 0)
+    .sort(([, left], [, right]) => Number(right) - Number(left))
+    .slice(0, 3)
+    .map(([label, count]) => `${formatLabel(label)} ${count}`);
+}
+
+function formatTimeWindow(firstSeen: unknown, lastSeen: unknown) {
+  const start = typeof firstSeen === "number" ? formatVideoTime(firstSeen) : null;
+  const end = typeof lastSeen === "number" ? formatVideoTime(lastSeen) : null;
+  if (!start && !end) return undefined;
+  return `${start ?? "?"} - ${end ?? "?"}`;
+}
+
+function toStringList(value: unknown) {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
 }
 
 function formatLabel(value: string) {

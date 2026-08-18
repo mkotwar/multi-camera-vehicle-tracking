@@ -18,6 +18,8 @@ export type VehicleEvidence = {
 
 export type ChatVehicleQuery = {
   intent: string;
+  subject?: string;
+  run_filter?: string | null;
   selected_run_ids?: string[];
   include_camera_ids?: string[];
   exclude_camera_ids?: string[];
@@ -25,6 +27,9 @@ export type ChatVehicleQuery = {
   exclude_classes: string[];
   include_colours: string[];
   exclude_colours: string[];
+  plate_presence?: string | null;
+  plate_text?: string | null;
+  plate_readable?: boolean | null;
   start_time?: number | null;
   end_time?: number | null;
   camera_id?: string | null;
@@ -64,6 +69,17 @@ export type VideoChatResponse = {
   llm_rejection_reason?: string | null;
   llm_raw_structured_output?: Record<string, unknown> | null;
   normalized_llm_output?: Record<string, unknown> | null;
+  normalized_plan?: Record<string, unknown> | null;
+  semantic_repair_applied?: boolean;
+  semantic_repair_notes?: string[];
+  fallback_reason?: string | null;
+  parser_model?: string | null;
+  total_parser_ms?: number | null;
+  qwen_request_ms?: number | null;
+  normalize_ms?: number | null;
+  repair_ms?: number | null;
+  validation_ms?: number | null;
+  ollama_metadata?: Record<string, unknown> | null;
   message_type?: string;
   context_was_available?: boolean;
   context_reference?: string | null;
@@ -90,7 +106,7 @@ export type ChatMessage = {
   timestamp: string;
   evidence?: VehicleEvidence[];
   evidence_page?: EvidencePage;
-  debug?: Pick<VideoChatResponse, "original_query" | "parser_used" | "llm_attempted" | "llm_accepted" | "llm_rejection_reason" | "llm_raw_structured_output" | "normalized_llm_output" | "message_type" | "context_was_available" | "context_reference" | "filters_before_context" | "filters_after_context" | "explicit_filters_detected" | "filters_before_validation" | "filters_after_validation" | "group_by" | "matching_vehicle_ids_count" | "context_saved_vehicle_ids_count" | "parsed_query" | "analytics_result" | "matching_vehicle_ids" | "context_used">;
+  debug?: Pick<VideoChatResponse, "original_query" | "parser_used" | "llm_attempted" | "llm_accepted" | "llm_rejection_reason" | "llm_raw_structured_output" | "normalized_llm_output" | "normalized_plan" | "semantic_repair_applied" | "semantic_repair_notes" | "fallback_reason" | "parser_model" | "total_parser_ms" | "qwen_request_ms" | "normalize_ms" | "repair_ms" | "validation_ms" | "ollama_metadata" | "message_type" | "context_was_available" | "context_reference" | "filters_before_context" | "filters_after_context" | "explicit_filters_detected" | "filters_before_validation" | "filters_after_validation" | "group_by" | "matching_vehicle_ids_count" | "context_saved_vehicle_ids_count" | "parsed_query" | "analytics_result" | "matching_vehicle_ids" | "context_used">;
 };
 
 export type PersistedVideoChatSession = {

@@ -6,7 +6,7 @@ from urllib.error import URLError
 
 import pytest
 
-from src.ollama_qwen_provider import OllamaQwenChatLLMProvider
+from src.ollama_qwen_provider import DEFAULT_OLLAMA_NUM_PREDICT, DEFAULT_OLLAMA_TEMPERATURE, OllamaQwenChatLLMProvider, build_chat_llm_provider_from_env
 from src.run_repository import RunRepository
 from src.vehicle_analytics import VehicleRecord, load_vehicle_records_from_tracks_json
 from src.vehicle_nlp import VehicleQueryParseError
@@ -132,10 +132,40 @@ class _PhysicalEvidenceRepository:
 def _valid_payload(**overrides):
     payload = {
         "intent": "LIST",
+        "subject": "vehicles",
+        "run_filter": None,
+        "class_include": ["CAR"],
+        "class_exclude": [],
+        "colour_include": ["WHITE"],
+        "colour_exclude": [],
+        "plate_presence": None,
+        "plate_detected": None,
+        "plate_readable": None,
+        "plate_text": None,
+        "start_time": None,
+        "end_time": None,
+        "group_by": None,
+        "operator": None,
+        "show_evidence": True,
+        "context_reference": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _normalized_payload(**overrides):
+    payload = {
+        "intent": "LIST",
+        "subject": "vehicles",
+        "run_filter": None,
         "classes": ["CAR"],
         "exclude_classes": [],
         "colours": ["WHITE"],
         "exclude_colours": [],
+        "plate_presence": None,
+        "plate_detected": None,
+        "plate_readable": None,
+        "plate_text": None,
         "start_time": None,
         "end_time": None,
         "group_by": None,
@@ -251,7 +281,7 @@ def test_video_chat_qwen_provider_structured_payload_is_accepted() -> None:
     assert diagnostics["llm_attempted"] is True
     assert diagnostics["llm_accepted"] is True
     assert diagnostics["llm_raw_structured_output"] == _valid_payload()
-    assert diagnostics["normalized_llm_output"] == _valid_payload()
+    assert diagnostics["normalized_llm_output"] == _normalized_payload()
     assert parsed.intent == "LIST"
     assert parsed.include_classes == ["CAR"]
     assert parsed.include_colours == ["WHITE"]
@@ -260,11 +290,11 @@ def test_video_chat_qwen_provider_structured_payload_is_accepted() -> None:
 
 def test_video_chat_qwen_multi_class_synonyms_exclusion_group_summary_evidence_and_context() -> None:
     cases = [
-        (_valid_payload(intent="COUNT", classes=["CAR", "MOTORCYCLE"], show_evidence=False), ["CAR", "MOTORCYCLE"], []),
-        (_valid_payload(intent="GROUP", classes=[], exclude_classes=["MOTORCYCLE"], group_by="vehicle_class", show_evidence=False), [], ["MOTORCYCLE"]),
-        (_valid_payload(intent="SUMMARY", classes=[], colours=[], show_evidence=False), [], []),
-        (_valid_payload(intent="LIST", classes=["3WHEELER"], colours=["GREEN"], show_evidence=True), ["3WHEELER"], []),
-        (_valid_payload(intent="LIST", classes=[], colours=["WHITE"], context_reference="previous_result", show_evidence=True), [], []),
+        (_valid_payload(intent="COUNT", class_include=["CAR", "MOTORCYCLE"], colour_include=["WHITE"], show_evidence=False), ["CAR", "MOTORCYCLE"], []),
+        (_valid_payload(intent="GROUP", class_include=[], class_exclude=["MOTORCYCLE"], colour_include=["WHITE"], group_by="vehicle_class", show_evidence=False), [], ["MOTORCYCLE"]),
+        (_valid_payload(intent="SUMMARY", class_include=[], colour_include=[], show_evidence=False), [], []),
+        (_valid_payload(intent="LIST", class_include=["3WHEELER"], colour_include=["GREEN"], show_evidence=True), ["3WHEELER"], []),
+        (_valid_payload(intent="LIST", class_include=[], colour_include=["WHITE"], context_reference="previous_result", show_evidence=True), [], []),
     ]
     for payload, expected_classes, expected_exclusions in cases:
         context = {"previous_vehicle_ids": ["CAM_001:TRACK_1"]} if payload.get("context_reference") == "previous_result" else {}
@@ -276,7 +306,7 @@ def test_video_chat_qwen_multi_class_synonyms_exclusion_group_summary_evidence_a
 
 
 def test_video_chat_qwen_receives_small_structured_context() -> None:
-    provider = _FakeProvider(_valid_payload(intent="COUNT", classes=["MOTORCYCLE"], colours=["BLACK"], show_evidence=False, context_reference="previous_result"))
+    provider = _FakeProvider(_valid_payload(intent="COUNT", class_include=["MOTORCYCLE"], colour_include=["BLACK"], show_evidence=False, context_reference="previous_result"))
     parse_chat_vehicle_query(
         message="How many of those were black?",
         context={
@@ -299,22 +329,28 @@ def test_video_chat_qwen_invalid_schema_falls_back_to_rule_parser() -> None:
         llm_provider=_FakeProvider({"intent": "COUNT", "classes": ["SPACESHIP"]}),
     )
 
-    assert parser_used == "rule_based"
+    assert parser_used == "rule_based_fallback"
     assert parsed.include_classes == ["CAR"]
     assert diagnostics["llm_attempted"] is True
     assert diagnostics["llm_accepted"] is False
     assert diagnostics["llm_rejection_reason"] == "unsupported_class:SPACESHIP"
+    assert diagnostics["fallback_reason"] == "qwen_schema_validation_failed"
 
 
 def test_video_chat_qwen_unavailable_and_timeout_fall_back_to_rule_parser() -> None:
-    for error in [RuntimeError("Ollama unavailable"), TimeoutError("timed out")]:
-        parsed, parser_used = parse_chat_vehicle_query(
+    expected = {
+        "Ollama unavailable": "qwen_unavailable",
+        "timed out": "qwen_timeout",
+    }
+    for message, fallback_reason in expected.items():
+        parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
             message="How many motorcycles were there?",
             context={},
-            llm_provider=_FakeProvider(error=error),
+            llm_provider=_FakeProvider(error=RuntimeError(message) if fallback_reason == "qwen_unavailable" else TimeoutError(message)),
         )
-        assert parser_used == "rule_based"
+        assert parser_used == "rule_based_fallback"
         assert parsed.include_classes == ["MOTORCYCLE"]
+        assert diagnostics["fallback_reason"] == fallback_reason
 
 
 def test_video_chat_qwen_invalid_schema_without_rule_fallback_returns_rule_error() -> None:
@@ -328,7 +364,7 @@ def test_video_chat_qwen_invalid_schema_without_rule_fallback_returns_rule_error
 
 @pytest.mark.parametrize("message", ["hello", "hi", "thanks"])
 def test_video_chat_general_chat_bypasses_qwen_and_has_no_filters(message: str) -> None:
-    provider = _FakeProvider(_valid_payload(intent="COUNT", classes=[], colours=[], show_evidence=False))
+    provider = _FakeProvider(_valid_payload(intent="COUNT", class_include=[], colour_include=[], show_evidence=False))
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message=message,
         context={"previous_filters": {"include_colours": ["BLACK"]}, "previous_vehicle_ids": ["CAM_001:TRACK_1"]},
@@ -351,10 +387,10 @@ def test_video_chat_standalone_group_queries_do_not_inherit_llm_context() -> Non
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message="give the numbers class wise",
         context=context,
-        llm_provider=_FakeProvider(_valid_payload(intent="GROUP", classes=["MOTORCYCLE"], colours=["BLACK"], group_by="vehicle_class", show_evidence=False, context_reference="previous_result")),
+        llm_provider=_FakeProvider(_valid_payload(intent="GROUP", class_include=["MOTORCYCLE"], colour_include=["BLACK"], group_by="vehicle_class", show_evidence=False, context_reference="previous_result")),
     )
 
-    assert parser_used == "rule_based"
+    assert parser_used == "rule_based_fallback"
     assert diagnostics["message_type"] == "NEW_ANALYTICS_QUERY"
     assert diagnostics["llm_rejection_reason"] == "incorrect_group_by:expected_class"
     assert parsed.intent == "GROUP"
@@ -368,10 +404,10 @@ def test_video_chat_qwen_group_colour_must_preserve_explicit_class() -> None:
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message="give me the colours of motorcycles",
         context={},
-        llm_provider=_FakeProvider(_valid_payload(intent="UNIQUE_COLOURS", classes=[], colours=[], show_evidence=False)),
+        llm_provider=_FakeProvider(_valid_payload(intent="UNIQUE_COLOURS", class_include=[], colour_include=[], show_evidence=False)),
     )
 
-    assert parser_used == "qwen"
+    assert parser_used == "qwen_repaired"
     assert diagnostics["semantic_repair_applied"] is True
     assert parsed.intent == "GROUP"
     assert parsed.group_by == "colour"
@@ -382,10 +418,10 @@ def test_video_chat_qwen_group_class_must_preserve_explicit_colour() -> None:
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message="what vehicle classes were black?",
         context={},
-        llm_provider=_FakeProvider(_valid_payload(intent="GROUP", classes=[], colours=[], group_by="vehicle_class", show_evidence=False)),
+        llm_provider=_FakeProvider(_valid_payload(intent="GROUP", class_include=[], colour_include=[], group_by="vehicle_class", show_evidence=False)),
     )
 
-    assert parser_used == "qwen"
+    assert parser_used == "qwen_repaired"
     assert diagnostics["semantic_repair_applied"] is True
     assert parsed.intent == "GROUP"
     assert parsed.group_by == "class"
@@ -415,10 +451,10 @@ def test_video_chat_unknown_vehicle_is_explicit_class_filter(message: str) -> No
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message=message,
         context={},
-        llm_provider=_FakeProvider(_valid_payload(intent="LIST", classes=[], colours=[], show_evidence=True)),
+        llm_provider=_FakeProvider(_valid_payload(intent="LIST", class_include=[], colour_include=[], show_evidence=True)),
     )
 
-    assert parser_used == "qwen"
+    assert parser_used == "qwen_repaired"
     assert diagnostics["semantic_repair_applied"] is True
     assert parsed.intent == "LIST"
     assert parsed.include_classes == ["UNKNOWN"]
@@ -430,7 +466,7 @@ def test_video_chat_qwen_unknown_vehicle_payload_is_accepted() -> None:
     parsed, parser_used = parse_chat_vehicle_query(
         message="Show unknown vehicles",
         context={},
-        llm_provider=_FakeProvider(_valid_payload(intent="LIST", classes=["UNKNOWN"], colours=[], show_evidence=True)),
+        llm_provider=_FakeProvider(_valid_payload(intent="LIST", class_include=["UNKNOWN"], colour_include=[], show_evidence=True)),
     )
 
     assert parser_used == "qwen"
@@ -445,8 +481,8 @@ def test_video_chat_qwen_alias_normalization_and_harmless_fields() -> None:
         llm_provider=_FakeProvider(
             _valid_payload(
                 intent="LIST",
-                classes=["AUTO"],
-                colours=["GRAY"],
+                class_include=["AUTO"],
+                colour_include=["GRAY"],
                 comparison=None,
                 sort_by=None,
                 limit=None,
@@ -466,10 +502,10 @@ def test_video_chat_qwen_negation_is_repaired_against_explicit_language() -> Non
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
         message="show black vehicles except motorcycles",
         context={},
-        llm_provider=_FakeProvider(_valid_payload(intent="LIST", classes=["MOTORCYCLE"], exclude_classes=[], colours=["BLACK"], show_evidence=True)),
+        llm_provider=_FakeProvider(_valid_payload(intent="LIST", class_include=["MOTORCYCLE"], class_exclude=[], colour_include=["BLACK"], show_evidence=True)),
     )
 
-    assert parser_used == "qwen"
+    assert parser_used == "qwen_repaired"
     assert parsed.include_classes == []
     assert parsed.exclude_classes == ["MOTORCYCLE"]
     assert parsed.include_colours == ["BLACK"]
@@ -876,13 +912,121 @@ def test_video_chat_rejects_llm_that_flattens_camera_group_query() -> None:
         run_ids=["RUN_A"],
         records=records,
         repository=_CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"]}),  # type: ignore[arg-type]
-        llm_provider=_FakeProvider(_valid_payload(intent="COUNT", classes=[], colours=[], show_evidence=False)),
+        llm_provider=_FakeProvider(_valid_payload(intent="COUNT", class_include=[], colour_include=[], show_evidence=False)),
     )
 
     assert response["parsed_query"]["intent"] == "GROUP"
     assert response["parsed_query"]["group_by"] == "camera"
-    assert response["parser_used"] == "rule_based"
+    assert response["parser_used"] == "rule_based_fallback"
     assert response["llm_rejection_reason"] == "incorrect_group_by:expected_camera"
+
+
+def test_video_chat_counts_detected_number_plates() -> None:
+    records = [
+        VehicleRecord(
+            run_id="RUN_A",
+            vehicle_id="CAM_001:TRACK_1",
+            local_track_id="CAM_001:TRACK_1",
+            camera_id="CAM_001",
+            vehicle_class="CAR",
+            colour="WHITE",
+            first_seen_seconds=1.0,
+            last_seen_seconds=2.0,
+            observation_count=3,
+            status="COMPLETED",
+            plate_detected=True,
+        ),
+        VehicleRecord(
+            run_id="RUN_A",
+            vehicle_id="CAM_001:TRACK_2",
+            local_track_id="CAM_001:TRACK_2",
+            camera_id="CAM_001",
+            vehicle_class="CAR",
+            colour="BLACK",
+            first_seen_seconds=3.0,
+            last_seen_seconds=4.0,
+            observation_count=3,
+            status="COMPLETED",
+            plate_detected=False,
+        ),
+        VehicleRecord(
+            run_id="RUN_A",
+            vehicle_id="CAM_001:TRACK_3",
+            local_track_id="CAM_001:TRACK_3",
+            camera_id="CAM_001",
+            vehicle_class="BUS",
+            colour="BLUE",
+            first_seen_seconds=5.0,
+            last_seen_seconds=6.0,
+            observation_count=3,
+            status="COMPLETED",
+            plate_text="DL01AB1234",
+        ),
+    ]
+
+    response = handle_video_chat(
+        message="how many cars with number plate",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001"]}),  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["plate_presence"] == "detected"
+    assert response["analytics_result"]["total"] == 1
+    assert response["answer"] == "There is 1 car with number plates."
+
+
+def test_video_chat_counts_runs_in_current_selection() -> None:
+    response = handle_video_chat(
+        message="how many runs are there in this search",
+        run_ids=["RUN_A", "RUN_B", "RUN_C"],
+        records=[_record("RUN_A", "CAM_001", "TRACK_1")],
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001"], "RUN_B": ["CAM_001", "CAM_002"], "RUN_C": ["CAM_003"]}),  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["subject"] == "runs"
+    assert response["analytics_result"]["total"] == 3
+    assert response["answer"] == "There are 3 runs in the current selection."
+
+
+def test_video_chat_lists_runs_with_multiple_cameras() -> None:
+    response = handle_video_chat(
+        message="which run have multiple cameras",
+        run_ids=["RUN_A", "RUN_B", "RUN_C"],
+        records=[_record("RUN_A", "CAM_001", "TRACK_1")],
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001"], "RUN_B": ["CAM_001", "CAM_002"], "RUN_C": ["CAM_003", "CAM_004", "CAM_005"]}),  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["subject"] == "runs"
+    assert response["parsed_query"]["run_filter"] == "multiple_cameras"
+    assert response["analytics_result"]["run_ids"] == ["RUN_B", "RUN_C"]
+    assert "RUN_B (2 cameras)" in response["answer"]
+    assert "RUN_C (3 cameras)" in response["answer"]
+
+
+def test_video_chat_summary_run_and_camera_wise_returns_grouped_summary() -> None:
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_002", "TRACK_2", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_3", "CAR", "WHITE"),
+    ]
+
+    response = handle_video_chat(
+        message="give me the summary run and camera wise",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001"]}),  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["intent"] == "SUMMARY"
+    assert response["parsed_query"]["group_by"] == "run_camera"
+    assert response["analytics_result"]["groups"]["RUN_A / CAM_001"]["total_unique_vehicles"] == 1
+    assert response["analytics_result"]["groups"]["RUN_A / CAM_002"]["total_unique_vehicles"] == 1
+    assert response["analytics_result"]["groups"]["RUN_B / CAM_001"]["total_unique_vehicles"] == 1
 
 
 def test_semantic_query_evaluation_fixture_final_plans() -> None:
@@ -933,15 +1077,42 @@ def test_ollama_provider_posts_schema_think_false_and_ignores_thinking(monkeypat
     assert captured["payload"]["format"]["type"] == "object"
     assert "class_include" in captured["payload"]["format"]["required"]
     assert "classes" not in captured["payload"]["format"]["properties"]
-    assert captured["payload"]["options"]["temperature"] == 0
+    assert captured["payload"]["options"]["temperature"] == DEFAULT_OLLAMA_TEMPERATURE
+    assert captured["payload"]["options"]["num_predict"] == DEFAULT_OLLAMA_NUM_PREDICT
     assert captured["payload"]["keep_alive"] == "10m"
     assert "hidden chain of thought" not in json.dumps(parsed)
+    assert provider.last_metadata["model"] == "qwen3:1.7b"
+    assert provider.last_metadata["num_predict"] == DEFAULT_OLLAMA_NUM_PREDICT
+    assert provider.last_metadata["temperature"] == DEFAULT_OLLAMA_TEMPERATURE
+    assert provider.last_metadata["structured_output"] is True
 
 
 def test_ollama_provider_default_timeout_allows_local_qwen_warmup() -> None:
     provider = OllamaQwenChatLLMProvider()
 
     assert provider.timeout_seconds == 45.0
+    assert provider.model == "qwen3:1.7b"
+    assert provider.num_predict == DEFAULT_OLLAMA_NUM_PREDICT
+    assert provider.temperature == DEFAULT_OLLAMA_TEMPERATURE
+
+
+def test_build_chat_llm_provider_from_env_prefers_explicit_qwen_settings(monkeypatch) -> None:
+    monkeypatch.setenv("VIDEO_CHAT_LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("VIDEO_CHAT_OLLAMA_MODEL", "qwen3:4b")
+    monkeypatch.setenv("VIDEO_CHAT_QWEN_MODEL", "qwen3:1.7b")
+    monkeypatch.setenv("VIDEO_CHAT_QWEN_KEEP_ALIVE", "5m")
+    monkeypatch.setenv("VIDEO_CHAT_QWEN_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("VIDEO_CHAT_QWEN_NUM_PREDICT", "88")
+    monkeypatch.setenv("VIDEO_CHAT_QWEN_TEMPERATURE", "0")
+
+    provider = build_chat_llm_provider_from_env()
+
+    assert provider is not None
+    assert provider.model == "qwen3:1.7b"
+    assert provider.keep_alive == "5m"
+    assert provider.timeout_seconds == 30.0
+    assert provider.num_predict == 88
+    assert provider.temperature == 0.0
 
 
 def test_ollama_provider_malformed_json_and_unavailable_raise_runtime_error(monkeypatch) -> None:
