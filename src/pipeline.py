@@ -42,6 +42,9 @@ from .vehicle_enrichment import VehicleEnrichmentManager, normalize_vehicle_enri
 
 LATENCY_PROFILER_WARMUP_FRAMES = 20
 
+_PLATE_CONFLICT_TIME_WINDOW_SECONDS = 2.0
+_PLATE_CONFLICT_SCORE_MARGIN = 0.03
+
 
 def _normalize_bbox_quality_section(raw_bbox_quality: Any) -> dict[str, Any]:
     bbox_quality = dict(raw_bbox_quality or {})
@@ -1259,6 +1262,7 @@ def run_pipeline(config_path: str) -> tuple[int, str, str]:
             enrichment_results.extend(vehicle_enrichment_manager.enrich_completed_tracks(completed_now, finalized_evidence_now))
             detector_tracker.reset_camera(camera_id)
         enrichment_results.extend(vehicle_enrichment_manager.finalize_async_colour())
+        _resolve_plate_association_conflicts(enrichment_results)
         for enrichment_item in enrichment_results:
             local_track_id = str(getattr(enrichment_item, "local_track_id", ""))
             if not local_track_id:
@@ -2445,6 +2449,159 @@ def _build_plate_ocr_result_rows(enrichment_results: list[Any]) -> list[dict[str
             }
         )
     return rows
+
+
+def _resolve_plate_association_conflicts(enrichment_results: list[Any]) -> None:
+    candidates: list[dict[str, Any]] = []
+    for result in enrichment_results:
+        candidate = _build_plate_assignment_candidate(result)
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        grouped.setdefault((candidate["camera_id"], candidate["plate_text"]), []).append(candidate)
+
+    for candidate_group in grouped.values():
+        ordered = sorted(candidate_group, key=lambda item: (item["timestamp_seconds"], -item["score"]))
+        cluster: list[dict[str, Any]] = []
+        for candidate in ordered:
+            if not cluster:
+                cluster = [candidate]
+                continue
+            if candidate["timestamp_seconds"] - cluster[-1]["timestamp_seconds"] <= _PLATE_CONFLICT_TIME_WINDOW_SECONDS:
+                cluster.append(candidate)
+                continue
+            _apply_plate_conflict_cluster(cluster)
+            cluster = [candidate]
+        _apply_plate_conflict_cluster(cluster)
+
+
+def _apply_plate_conflict_cluster(cluster: list[dict[str, Any]]) -> None:
+    unique_tracks = {item["local_track_id"] for item in cluster}
+    if len(cluster) <= 1 or len(unique_tracks) <= 1:
+        return
+    ranked = sorted(cluster, key=lambda item: item["score"], reverse=True)
+    winner = ranked[0]
+    second_score = ranked[1]["score"] if len(ranked) > 1 else None
+    if second_score is not None and (winner["score"] - second_score) < _PLATE_CONFLICT_SCORE_MARGIN:
+        for candidate in ranked:
+            _clear_plate_assignment(
+                candidate["result"],
+                reason=f"plate_association_rejected:ambiguous_owner:{candidate['plate_text']}",
+            )
+        return
+    for candidate in ranked[1:]:
+        _clear_plate_assignment(
+            candidate["result"],
+            reason=f"plate_association_rejected:duplicate_owner:{winner['local_track_id']}",
+        )
+
+
+def _build_plate_assignment_candidate(result: Any) -> dict[str, Any] | None:
+    plate_text = str(getattr(result, "plate_text", "") or "").strip().upper()
+    plate_bbox = _coerce_bbox(getattr(result, "plate_bbox", None))
+    if not plate_text or plate_bbox is None:
+        return None
+    evidence_item = _match_plate_evidence_item(result)
+    if evidence_item is None:
+        return None
+    vehicle_bbox = _coerce_bbox(getattr(evidence_item, "original_bbox_xyxy", None)) or _coerce_bbox(getattr(evidence_item, "bbox_xyxy", None))
+    crop_bbox = _coerce_bbox(getattr(evidence_item, "expanded_crop_bbox_xyxy", None))
+    if vehicle_bbox is None or crop_bbox is None:
+        return None
+    plate_frame_bbox = (
+        crop_bbox[0] + plate_bbox[0],
+        crop_bbox[1] + plate_bbox[1],
+        crop_bbox[0] + plate_bbox[2],
+        crop_bbox[1] + plate_bbox[3],
+    )
+    containment_ratio = _bbox_intersection_area(plate_frame_bbox, vehicle_bbox) / max(_bbox_area(plate_frame_bbox), 1.0)
+    if containment_ratio <= 0.0:
+        return None
+    vehicle_area = max(_bbox_area(vehicle_bbox), 1.0)
+    plate_area_ratio = min(1.0, _bbox_area(plate_frame_bbox) / (vehicle_area * 0.02))
+    vehicle_center_x = (vehicle_bbox[0] + vehicle_bbox[2]) / 2.0
+    vehicle_center_y = (vehicle_bbox[1] + vehicle_bbox[3]) / 2.0
+    plate_center_x = (plate_frame_bbox[0] + plate_frame_bbox[2]) / 2.0
+    plate_center_y = (plate_frame_bbox[1] + plate_frame_bbox[3]) / 2.0
+    vehicle_width = max(vehicle_bbox[2] - vehicle_bbox[0], 1.0)
+    vehicle_height = max(vehicle_bbox[3] - vehicle_bbox[1], 1.0)
+    normalized_distance = ((abs(plate_center_x - vehicle_center_x) / vehicle_width) ** 2 + (abs(plate_center_y - vehicle_center_y) / vehicle_height) ** 2) ** 0.5
+    center_closeness = max(0.0, 1.0 - min(1.0, normalized_distance))
+    confidence = float(getattr(result, "plate_text_confidence", None) or getattr(result, "plate_detection_confidence", None) or 0.0)
+    score = (containment_ratio * 1.5) + (center_closeness * 0.75) + (plate_area_ratio * 0.35) + (confidence * 0.25)
+    return {
+        "camera_id": str(getattr(result, "camera_id", "") or ""),
+        "local_track_id": str(getattr(result, "local_track_id", "") or ""),
+        "plate_text": plate_text,
+        "timestamp_seconds": float(getattr(evidence_item, "timestamp_seconds", 0.0) or 0.0),
+        "score": score,
+        "result": result,
+    }
+
+
+def _match_plate_evidence_item(result: Any) -> Any | None:
+    evidence_used = list(getattr(result, "evidence_used", []) or [])
+    if not evidence_used:
+        return None
+    plate_crop_path = str(getattr(result, "plate_crop_path", "") or "")
+    if plate_crop_path:
+        plate_stem = Path(plate_crop_path).stem
+        if plate_stem.endswith("_plate"):
+            plate_stem = plate_stem[:-6]
+        for item in evidence_used:
+            crop_path = str(getattr(item, "vehicle_crop_path", "") or "")
+            if crop_path and Path(crop_path).stem == plate_stem:
+                return item
+    return evidence_used[0]
+
+
+def _clear_plate_assignment(result: Any, *, reason: str) -> None:
+    result.plate_detected = False
+    result.plate_readable = False
+    result.plate_text = None
+    result.plate_raw_text = None
+    result.plate_normalized_text = None
+    result.plate_validation_status = None
+    result.plate_validation_reason = None
+    result.plate_format_type = None
+    result.plate_correction_applied = None
+    result.plate_detection_confidence = None
+    result.plate_bbox = None
+    result.plate_crop_path = None
+    result.plate_ocr_raw_response = None
+    result.plate_text_confidence = None
+    result.plate_ocr_reason = reason
+    result.plate_quality_status = "plate_association_rejected"
+
+
+def _coerce_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _bbox_intersection_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    if right <= left or bottom <= top:
+        return 0.0
+    return (right - left) * (bottom - top)
 
 
 def _write_current_vs_ocr_mukul_artifacts(run_directory: Path, enrichment_results: list[Any]) -> None:

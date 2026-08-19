@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -11,8 +12,57 @@ import pytest
 
 import src.pipeline as pipeline_module
 from src.models import BBoxQualityDiagnostic, Detection, TrackedDetection
-from src.pipeline import _build_vehicle_colour_result_rows, _build_vehicle_colour_track_summary_rows, _load_raw_config, _validate_config, run_pipeline
+from src.pipeline import (
+    _build_vehicle_colour_result_rows,
+    _build_vehicle_colour_track_summary_rows,
+    _load_raw_config,
+    _resolve_plate_association_conflicts,
+    _validate_config,
+    run_pipeline,
+)
 from src.vehicle_enrichment.schemas import TrackEnrichmentResult, VehicleBodyTypeResult, VehicleColourResult, AttributePrediction
+
+
+def _plate_result(
+    *,
+    local_track_id: str,
+    vehicle_crop_name: str,
+    plate_crop_name: str,
+    timestamp_seconds: float,
+    vehicle_bbox: tuple[float, float, float, float],
+    crop_bbox: tuple[float, float, float, float],
+    plate_bbox: tuple[float, float, float, float],
+    plate_text: str = "HR38AD4296",
+    plate_text_confidence: float = 0.75,
+):
+    evidence_item = SimpleNamespace(
+        vehicle_crop_path=f"D:/project/multi-camera-vehicle-tracking/outputs/runs/test/{vehicle_crop_name}.jpg",
+        original_bbox_xyxy=vehicle_bbox,
+        bbox_xyxy=vehicle_bbox,
+        expanded_crop_bbox_xyxy=crop_bbox,
+        timestamp_seconds=timestamp_seconds,
+    )
+    return SimpleNamespace(
+        local_track_id=local_track_id,
+        camera_id="CAM_001",
+        plate_detected=True,
+        plate_readable=True,
+        plate_text=plate_text,
+        plate_raw_text=plate_text,
+        plate_normalized_text=plate_text,
+        plate_validation_status="valid",
+        plate_validation_reason="validated_standard_state_registration",
+        plate_format_type="standard_private",
+        plate_correction_applied=False,
+        plate_detection_confidence=plate_text_confidence,
+        plate_bbox=list(plate_bbox),
+        plate_crop_path=f"D:/project/multi-camera-vehicle-tracking/outputs/runs/test/{plate_crop_name}_plate.jpg",
+        plate_ocr_raw_response=plate_text,
+        plate_text_confidence=plate_text_confidence,
+        plate_ocr_reason="validated_standard_state_registration",
+        plate_quality_status="plate_quality_accepted",
+        evidence_used=[evidence_item],
+    )
 
 
 def _create_test_video(path: Path, *, fps: float = 10.0, frame_count: int = 5, width: int = 32, height: int = 24) -> Path:
@@ -1013,6 +1063,7 @@ def test_pipeline_builds_vehicle_colour_only_artifact_rows() -> None:
         vehicle_make=None,
         vehicle_model=None,
         plate_detected=False,
+        plate_readable=False,
         plate_colour=None,
         registration_category=None,
         plate_text=None,
@@ -1035,3 +1086,53 @@ def test_pipeline_builds_vehicle_colour_only_artifact_rows() -> None:
     assert crop_rows[0]["adapter_loaded"] is False
     assert track_rows[0]["final_vehicle_colour"] == "BLACK"
     assert track_rows[0]["colour_inference_count"] == 1
+
+
+def test_plate_association_conflict_resolver_keeps_tighter_owner() -> None:
+    borrowed_bus_plate = _plate_result(
+        local_track_id="CAM_001:TRACK_3",
+        vehicle_crop_name="frame_000165_BEST_OVERALL",
+        plate_crop_name="frame_000165_BEST_OVERALL",
+        timestamp_seconds=5.5,
+        vehicle_bbox=(1.4, 5.1, 680.6, 795.9),
+        crop_bbox=(0.0, 0.0, 735.0, 860.0),
+        plate_bbox=(95.0, 540.0, 218.0, 584.0),
+        plate_text_confidence=0.7445,
+    )
+    actual_car_plate = _plate_result(
+        local_track_id="CAM_001:TRACK_5",
+        vehicle_crop_name="frame_000171_HIGHEST_CONFIDENCE",
+        plate_crop_name="frame_000171_HIGHEST_CONFIDENCE",
+        timestamp_seconds=5.7,
+        vehicle_bbox=(123.3, 314.5, 765.5, 760.8),
+        crop_bbox=(71.0, 278.0, 817.0, 797.0),
+        plate_bbox=(150.0, 257.0, 263.0, 293.0),
+        plate_text_confidence=0.7553,
+    )
+
+    _resolve_plate_association_conflicts([borrowed_bus_plate, actual_car_plate])
+
+    assert borrowed_bus_plate.plate_text is None
+    assert borrowed_bus_plate.plate_detected is False
+    assert borrowed_bus_plate.plate_ocr_reason == "plate_association_rejected:duplicate_owner:CAM_001:TRACK_5"
+    assert actual_car_plate.plate_text == "HR38AD4296"
+    assert actual_car_plate.plate_detected is True
+
+
+def test_plate_association_conflict_resolver_leaves_single_candidate_unchanged() -> None:
+    result = _plate_result(
+        local_track_id="CAM_001:TRACK_5",
+        vehicle_crop_name="frame_000171_HIGHEST_CONFIDENCE",
+        plate_crop_name="frame_000171_HIGHEST_CONFIDENCE",
+        timestamp_seconds=5.7,
+        vehicle_bbox=(123.3, 314.5, 765.5, 760.8),
+        crop_bbox=(71.0, 278.0, 817.0, 797.0),
+        plate_bbox=(150.0, 257.0, 263.0, 293.0),
+        plate_text_confidence=0.7553,
+    )
+
+    _resolve_plate_association_conflicts([result])
+
+    assert result.plate_text == "HR38AD4296"
+    assert result.plate_detected is True
+    assert result.plate_ocr_reason == "validated_standard_state_registration"
