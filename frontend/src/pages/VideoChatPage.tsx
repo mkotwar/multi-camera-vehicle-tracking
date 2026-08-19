@@ -862,6 +862,10 @@ function getResultLead(message: ChatMessage) {
   const parsed = message.debug?.parsed_query;
   const analytics = message.debug?.analytics_result ?? {};
   const intent = parsed?.intent?.toUpperCase();
+  const ranking = getRankingSummary(parsed, analytics);
+  if (ranking?.lead) {
+    return ranking.lead;
+  }
   if (intent === "SUMMARY" && parsed?.group_by) {
     return `Traffic summary by ${formatGroupBy(parsed.group_by)}.`;
   }
@@ -907,6 +911,14 @@ function getResultMetrics(parsed: ChatVehicleQuery | undefined, analytics: Recor
 
 function getPrimaryMetric(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
   const intent = parsed?.intent?.toUpperCase();
+  const ranking = getRankingSummary(parsed, analytics);
+  if (ranking) {
+    return {
+      title: ranking.title,
+      value: ranking.value,
+      label: ranking.label,
+    };
+  }
   const total = readNumericResult(
     analytics.total ??
     analytics.count ??
@@ -965,6 +977,7 @@ function getPrimaryMetricTitle(parsed: ChatVehicleQuery | undefined) {
 
 function getGroupRows(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
   const intent = parsed?.intent?.toUpperCase();
+  if (getRankingSummary(parsed, analytics)) return [];
   if (intent === "SUMMARY" && parsed?.group_by) return [];
   const source = resolveGroupSource(parsed, analytics);
   if (!source) return [];
@@ -1121,6 +1134,49 @@ function resolveGroupSource(parsed: ChatVehicleQuery | undefined, analytics: Rec
   const source = analytics[sourceKey];
   if (!source || typeof source !== "object" || Array.isArray(source)) return null;
   return source as Record<string, unknown>;
+}
+
+function getRankingSummary(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  if (parsed?.intent?.toUpperCase() !== "GROUP" || parsed.limit !== 1 || !parsed.sort_by) return null;
+  const ranking = analytics.ranking_result;
+  if (!ranking || typeof ranking !== "object" || Array.isArray(ranking)) return null;
+  const winners = Array.isArray((ranking as Record<string, unknown>).winners)
+    ? ((ranking as Record<string, unknown>).winners as Array<Record<string, unknown>>)
+    : [];
+  if (!winners.length) return null;
+  const count = readNumericResult(winners[0]?.count);
+  const groupBy = parsed.group_by;
+  const topLabel = parsed.sort_by === "count_asc"
+    ? (groupBy === "run" ? "Lowest run" : "Lowest camera")
+    : (groupBy === "run" ? "Top run" : "Top camera");
+  if (winners.length > 1) {
+    const names = winners.map((item) => formatRankingWinner(item, groupBy)).join(", ");
+    return {
+      title: topLabel,
+      value: `${winners.length} tied`,
+      label: count == null ? "Tie" : `${count} ${count === 1 ? "vehicle" : "vehicles"} each`,
+      lead: names,
+    };
+  }
+  const winner = winners[0];
+  const name = formatRankingWinner(winner, groupBy);
+  const runId = typeof winner.run_id === "string" ? winner.run_id : null;
+  return {
+    title: topLabel,
+    value: name,
+    label: count == null ? "Vehicles" : `${count} ${count === 1 ? "vehicle" : "vehicles"}`,
+    lead: groupBy === "run_camera" && runId ? `Run: ${runId}` : null,
+  };
+}
+
+function formatRankingWinner(entry: Record<string, unknown>, groupBy?: string | null) {
+  if (groupBy === "run_camera" && typeof entry.camera_id === "string" && entry.camera_id) {
+    return entry.camera_id;
+  }
+  if (groupBy === "run" && typeof entry.run_id === "string" && entry.run_id) {
+    return entry.run_id;
+  }
+  return typeof entry.label === "string" ? formatGroupLabel(entry.label, groupBy) : "Result";
 }
 
 function formatGroupBy(value: string) {

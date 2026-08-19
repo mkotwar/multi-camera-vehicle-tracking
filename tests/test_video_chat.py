@@ -170,6 +170,8 @@ def _normalized_payload(**overrides):
         "end_time": None,
         "group_by": None,
         "operator": None,
+        "sort_by": None,
+        "limit": None,
         "show_evidence": True,
         "context_reference": None,
     }
@@ -1107,6 +1109,153 @@ def test_video_chat_rejects_llm_that_flattens_camera_group_query() -> None:
     assert response["parsed_query"]["group_by"] == "camera"
     assert response["parser_used"] == "rule_based_fallback"
     assert response["llm_rejection_reason"] == "incorrect_group_by:expected_camera"
+
+
+def test_video_chat_qwen_repairs_camera_ranking_query() -> None:
+    parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
+        message="which camera out of all have more vehicles",
+        context={},
+        llm_provider=_FakeProvider(
+            _valid_payload(
+                intent="LIST",
+                class_include=[],
+                colour_include=[],
+                group_by="run_camera",
+                run_filter="multiple_cameras",
+                show_evidence=False,
+            )
+        ),
+    )
+
+    assert parser_used == "qwen_repaired"
+    assert diagnostics["qwen_raw_plan"]["intent"] == "LIST"
+    assert diagnostics["normalized_plan"]["intent"] == "GROUP"
+    assert diagnostics["normalized_plan"]["group_by"] == "camera"
+    assert diagnostics["normalized_plan"]["sort_by"] == "count_desc"
+    assert diagnostics["normalized_plan"]["limit"] == 1
+    assert diagnostics["semantic_repair_applied"] is True
+    assert parsed.intent == "GROUP"
+    assert parsed.group_by == "camera"
+    assert parsed.sort_by == "count_desc"
+    assert parsed.limit == 1
+
+
+def test_video_chat_camera_ranking_uses_run_camera_identity_for_multi_run_scope() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_003"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_001", "TRACK_2", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_3", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_4", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_5", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_003", "TRACK_6", "BUS", "BLUE"),
+    ]
+    response = handle_video_chat(
+        message="which camera out of all have more vehicles",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=_FakeProvider(
+            _valid_payload(
+                intent="LIST",
+                class_include=[],
+                colour_include=[],
+                group_by="run_camera",
+                run_filter="multiple_cameras",
+                show_evidence=False,
+            )
+        ),
+    )
+
+    assert response["parser_used"] == "qwen_repaired"
+    assert response["parsed_query"]["group_by"] == "run_camera"
+    assert response["parsed_query"]["sort_by"] == "count_desc"
+    assert response["parsed_query"]["limit"] == 1
+    assert response["analytics_result"]["ranking_result"]["winners"][0]["run_id"] == "RUN_B"
+    assert response["analytics_result"]["ranking_result"]["winners"][0]["camera_id"] == "CAM_003"
+    assert response["answer"] == "CAM_003 in run RUN_B has the highest vehicle count with 3 vehicles."
+
+
+def test_video_chat_camera_ranking_variants_and_filters() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002"], "RUN_B": ["CAM_001", "CAM_003"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_002", "TRACK_2", "MOTORCYCLE", "BLACK"),
+        _record("RUN_A", "CAM_002", "TRACK_3", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_4", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_5", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_003", "TRACK_6", "MOTORCYCLE", "BLACK"),
+        _record("RUN_B", "CAM_003", "TRACK_7", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_8", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_003", "TRACK_9", "MOTORCYCLE", "BLACK"),
+    ]
+
+    busiest = handle_video_chat(
+        message="busiest camera",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    motorcycles = handle_video_chat(
+        message="which camera has the most motorcycles",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    white_cars = handle_video_chat(
+        message="which camera has the most white cars",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    least = handle_video_chat(
+        message="which camera has the least vehicles",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert busiest["answer"] == "CAM_003 in run RUN_B has the highest vehicle count with 5 vehicles."
+    assert motorcycles["parsed_query"]["include_classes"] == ["MOTORCYCLE"]
+    assert motorcycles["answer"] == "CAM_003 in run RUN_B has the highest vehicle count with 3 vehicles."
+    assert white_cars["parsed_query"]["include_classes"] == ["CAR"]
+    assert white_cars["parsed_query"]["include_colours"] == ["WHITE"]
+    assert white_cars["answer"] == "CAM_003 in run RUN_B has the highest vehicle count with 2 vehicles."
+    assert least["parsed_query"]["sort_by"] == "count_asc"
+    assert least["answer"] == "CAM_001 in run RUN_A and CAM_001 in run RUN_B are tied for the lowest vehicle count at 1 vehicle each."
+
+
+def test_video_chat_run_ranking_and_ties() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001"], "RUN_B": ["CAM_001", "CAM_002"], "RUN_C": ["CAM_003"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_001", "TRACK_2", "CAR", "BLACK"),
+        _record("RUN_B", "CAM_001", "TRACK_3", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_002", "TRACK_4", "CAR", "WHITE"),
+        _record("RUN_C", "CAM_003", "TRACK_5", "MOTORCYCLE", "BLACK"),
+    ]
+    response = handle_video_chat(
+        message="which run has the most vehicles",
+        run_ids=["RUN_A", "RUN_B", "RUN_C"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    tie_response = handle_video_chat(
+        message="top run by vehicle count",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records[:4],
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["group_by"] == "run"
+    assert response["answer"] == "RUN_A and RUN_B are tied for the highest vehicle count at 2 vehicles each."
+    assert tie_response["answer"] == "RUN_A and RUN_B are tied for the highest vehicle count at 2 vehicles each."
 
 
 def test_video_chat_counts_detected_number_plates() -> None:

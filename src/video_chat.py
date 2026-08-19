@@ -99,6 +99,8 @@ ORDINAL_WORDS = {
     "eleventh": 11,
     "twelfth": 12,
 }
+RANKING_DESC_PATTERN = re.compile(r"\b(most|highest|largest|maximum|max|top|busiest)\b")
+RANKING_ASC_PATTERN = re.compile(r"\b(least|fewest|lowest|minimum|min)\b")
 
 
 class ChatLLMProvider(Protocol):
@@ -547,19 +549,19 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
         )
     if parsed.intent == "GROUP" and parsed.group_by == "colour":
         counts = count_by_colour(matched)
-        return {"total": len(matched), "by_colour": counts, "top_colour": _top_count(counts), "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+        return _group_result_payload(parsed, matched, counts, result_key="by_colour", top_key="top_colour")
     if parsed.intent == "GROUP" and parsed.group_by == "class":
         counts = count_by_class(matched)
-        return {"total": len(matched), "by_class": counts, "top_class": _top_count(counts), "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+        return _group_result_payload(parsed, matched, counts, result_key="by_class", top_key="top_class")
     if parsed.intent == "GROUP" and parsed.group_by == "camera":
         counts = _count_by_camera(matched)
-        return {"total": len(matched), "by_camera": counts, "top_camera": _top_count(counts), "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+        return _group_result_payload(parsed, matched, counts, result_key="by_camera", top_key="top_camera")
     if parsed.intent == "GROUP" and parsed.group_by == "run":
         counts = _count_by_run(matched)
-        return {"total": len(matched), "by_run": counts, "top_run": _top_count(counts), "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+        return _group_result_payload(parsed, matched, counts, result_key="by_run", top_key="top_run")
     if parsed.intent == "GROUP" and parsed.group_by == "run_camera":
         counts = _count_by_run_camera(matched)
-        return {"total": len(matched), "by_run_camera": counts, "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+        return _group_result_payload(parsed, matched, counts, result_key="by_run_camera", top_key=None)
     return {
         "total": len(matched),
         "by_class": count_by_class(matched),
@@ -1019,6 +1021,9 @@ def format_chat_answer(
             parts.append(f"{no_plate_count} vehicles do not have a detected plate.")
         return " ".join(parts)
     if parsed.intent == "GROUP":
+        ranking_answer = _format_ranking_group_answer(parsed, analytics_result)
+        if ranking_answer is not None:
+            return ranking_answer
         if parsed.group_by in {"camera", "run", "run_camera"}:
             key = {"camera": "by_camera", "run": "by_run", "run_camera": "by_run_camera"}[parsed.group_by]
             label = {"camera": "Camera", "run": "Run", "run_camera": "Run + camera"}[parsed.group_by]
@@ -1230,6 +1235,27 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
         return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if _is_colour_wise_query(text):
         return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
+    if _is_group_ranking_query(text):
+        ranking_group_by = _ranking_group_by(text)
+        ranking_sort_by = _ranking_sort_by(text)
+        if ranking_group_by is not None and ranking_sort_by is not None:
+            return ChatVehicleQuery(
+                intent="GROUP",
+                include_classes=include_classes,
+                exclude_classes=exclude_classes,
+                include_colours=include_colours,
+                exclude_colours=exclude_colours,
+                plate_presence=plate_presence,
+                plate_detected=plate_detected,
+                plate_readable=plate_readable,
+                plate_text=plate_text,
+                include_camera_ids=include_camera_ids,
+                exclude_camera_ids=exclude_camera_ids,
+                group_by=ranking_group_by,
+                sort_by=ranking_sort_by,
+                limit=1,
+                context_reference=context_reference,
+            )
     group_by_scope = _parse_scope_group_by(text)
     if group_by_scope is not None:
         return ChatVehicleQuery(
@@ -1245,6 +1271,8 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             include_camera_ids=include_camera_ids,
             exclude_camera_ids=exclude_camera_ids,
             group_by=group_by_scope,
+            sort_by=_ranking_sort_by(text) if _ranking_sort_by(text) is not None else None,
+            limit=1 if _ranking_sort_by(text) is not None else None,
             context_reference=context_reference,
         )
     if context_reference == "previous_results" and previous_group_by is not None and _is_follow_up_refinement(text) and not show_evidence:
@@ -1356,6 +1384,80 @@ def _parse_general_chat_query(text: str) -> ChatVehicleQuery | None:
 
 def _is_summary_query(text: str) -> bool:
     return bool(re.search(r"\b(summ?ary|summ?ry|summarize|summarise|overview|breakdown)\b", text))
+
+
+def _ranking_group_by(text: str) -> str | None:
+    if re.search(r"\bcamera\b", text) or re.search(r"\bbusiest\s+camera\b|\btop\s+camera\b", text):
+        return "camera"
+    if re.search(r"\brun\b", text) or re.search(r"\btop\s+run\b", text):
+        return "run"
+    return None
+
+
+def _format_ranking_group_answer(parsed: ChatVehicleQuery, analytics_result: dict[str, Any]) -> str | None:
+    ranking = analytics_result.get("ranking_result")
+    if not isinstance(ranking, dict) or parsed.limit != 1 or parsed.sort_by not in {"count_desc", "count_asc"}:
+        return None
+    winners = [dict(item) for item in list(ranking.get("winners", []) or []) if isinstance(item, dict)]
+    if not winners:
+        return f"No matching {_ranking_title(parsed)} counts were found in the current selection."
+    count = int(winners[0].get("count", 0) or 0)
+    noun = "vehicle" if count == 1 else "vehicles"
+    descriptor = "highest" if parsed.sort_by == "count_desc" else "lowest"
+    group_title = _ranking_title(parsed)
+    if len(winners) > 1:
+        labels = [_format_ranking_label(item, group_by=parsed.group_by) for item in winners]
+        joined = ", ".join(labels[:-1]) + f" and {labels[-1]}" if len(labels) > 1 else labels[0]
+        return f"{joined} are tied for the {descriptor} vehicle count at {count} {noun} each."
+    winner = winners[0]
+    return f"{_format_ranking_label(winner, group_by=parsed.group_by)} has the {descriptor} vehicle count with {count} {noun}."
+
+
+def _format_ranking_label(entry: dict[str, Any], *, group_by: str | None) -> str:
+    label = str(entry.get("label") or "")
+    if group_by == "run_camera":
+        camera_id = str(entry.get("camera_id") or "").strip()
+        run_id = str(entry.get("run_id") or "").strip()
+        if camera_id and run_id:
+            return f"{camera_id} in run {run_id}"
+    if group_by == "run":
+        run_id = str(entry.get("run_id") or label).strip()
+        if run_id:
+            return run_id
+    return label
+
+
+def _ranking_sort_by(text: str) -> str | None:
+    if RANKING_ASC_PATTERN.search(text):
+        return "count_asc"
+    if RANKING_DESC_PATTERN.search(text):
+        return "count_desc"
+    if re.search(r"\bwhich\s+(camera|run)\b.*\bmore\b", text) and not re.search(r"\bmore\s+\w+\s+than\b", text):
+        return "count_desc"
+    return None
+
+
+def _is_group_ranking_query(text: str) -> bool:
+    group_by = _ranking_group_by(text)
+    if group_by is None:
+        return False
+    if _ranking_sort_by(text) is not None:
+        return True
+    return bool(re.search(rf"\b{group_by}\s+with\s+(vehicle|traffic|detection)\s+count\b", text))
+
+
+def _aggregate_same_named_cameras_requested(text: str) -> bool:
+    return bool(re.search(r"\b(same\s+named\s+cameras|aggregate\s+cameras\s+across\s+runs|combine\s+cameras\s+across\s+runs)\b", text))
+
+
+def _ranking_title(parsed: ChatVehicleQuery) -> str:
+    if parsed.group_by == "camera":
+        return "camera"
+    if parsed.group_by == "run_camera":
+        return "camera"
+    if parsed.group_by == "run":
+        return "run"
+    return parsed.group_by or "group"
 
 
 def _classify_message_type(text: str, context: dict[str, Any]) -> str:
@@ -1612,6 +1714,8 @@ def normalize_llm_vehicle_query(payload: dict[str, Any]) -> dict[str, Any]:
         "end_time": _optional_float(payload.get("end_time")),
         "group_by": _normalize_llm_group_by(payload.get("group_by")),
         "operator": _normalize_operator(payload.get("operator")),
+        "sort_by": _normalize_sort_by(payload.get("sort_by")),
+        "limit": _optional_int(payload.get("limit")),
         "show_evidence": bool(payload.get("show_evidence")),
         "context_reference": _normalize_llm_context_reference(payload.get("context_reference")),
     }
@@ -1693,11 +1797,15 @@ def _repair_llm_plan_with_explicit_mentions(
         repair_notes.append(f"set plate_text={expected_plate_text}")
 
     if rule_candidate is not None:
+        if rule_candidate.subject == "vehicles" and repaired.get("subject") == "runs":
+            repaired["subject"] = "vehicles"
+            repair_applied = True
+            repair_notes.append("set subject=vehicles from deterministic validator")
         if rule_candidate.subject == "runs" and repaired.get("subject") != "runs":
             repaired["subject"] = "runs"
             repair_applied = True
             repair_notes.append("set subject=runs from deterministic validator")
-        if rule_candidate.run_filter is not None and repaired.get("run_filter") != rule_candidate.run_filter:
+        if repaired.get("run_filter") != rule_candidate.run_filter:
             repaired["run_filter"] = rule_candidate.run_filter
             repair_applied = True
             repair_notes.append(f"set run_filter={rule_candidate.run_filter}")
@@ -1711,14 +1819,30 @@ def _repair_llm_plan_with_explicit_mentions(
             repaired["show_evidence"] = False
             repair_applied = True
             repair_notes.append(f"set intent={rule_candidate.intent} from deterministic validator")
+        if rule_candidate.sort_by is not None and str(repaired.get("intent") or "").upper() != rule_candidate.intent:
+            repaired["intent"] = rule_candidate.intent
+            repair_applied = True
+            repair_notes.append(f"set intent={rule_candidate.intent} for ranking query")
         if rule_candidate.group_by is not None and repaired.get("group_by") is None and str(repaired.get("intent") or "").upper() in {"SUMMARY", "GROUP"}:
             repaired["group_by"] = "vehicle_class" if rule_candidate.group_by == "class" else rule_candidate.group_by
             repair_applied = True
             repair_notes.append(f"set group_by={rule_candidate.group_by}")
+        if rule_candidate.group_by is not None and repaired.get("group_by") != ("vehicle_class" if rule_candidate.group_by == "class" else rule_candidate.group_by) and rule_candidate.sort_by is not None:
+            repaired["group_by"] = "vehicle_class" if rule_candidate.group_by == "class" else rule_candidate.group_by
+            repair_applied = True
+            repair_notes.append(f"set group_by={rule_candidate.group_by} for ranking query")
         if rule_candidate.intent == "SUMMARY" and str(repaired.get("intent") or "").upper() == "GROUP":
             repaired["intent"] = "SUMMARY"
             repair_applied = True
             repair_notes.append("set intent=SUMMARY from deterministic validator")
+        if rule_candidate.sort_by is not None and repaired.get("sort_by") != rule_candidate.sort_by:
+            repaired["sort_by"] = rule_candidate.sort_by
+            repair_applied = True
+            repair_notes.append(f"set sort_by={rule_candidate.sort_by}")
+        if rule_candidate.limit is not None and repaired.get("limit") != rule_candidate.limit:
+            repaired["limit"] = rule_candidate.limit
+            repair_applied = True
+            repair_notes.append(f"set limit={rule_candidate.limit}")
 
     repaired["classes"] = _dedupe(class_include)
     repaired["exclude_classes"] = _dedupe(class_exclude)
@@ -1773,8 +1897,13 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
     comparison = _comparison_from_llm(payload)
     if str(payload["intent"]).upper() in {"COMPARE", "FIND_INTERVALS"} and comparison is None:
         raise VehicleQueryParseError("invalid_comparison:need_two_classes")
-    sort_by = "count_desc" if payload.get("intent") == "GROUP" and "most" in text else None
-    limit = 1 if sort_by else None
+    sort_by = _normalize_sort_by(payload.get("sort_by"))
+    group_by = _normalize_group_by(payload.get("group_by"))
+    if sort_by is None and str(payload.get("intent") or "").upper() == "GROUP" and _ranking_sort_by(text) is not None and group_by in {"camera", "run", "run_camera", "class", "colour"}:
+        sort_by = _ranking_sort_by(text)
+    limit = _optional_int(payload.get("limit"))
+    if limit is None and sort_by is not None:
+        limit = 1
     return ChatVehicleQuery(
         intent=str(payload["intent"]).upper(),
         subject=str(payload.get("subject") or "vehicles"),
@@ -1790,7 +1919,7 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
         start_time=payload.get("start_time"),
         end_time=payload.get("end_time"),
         camera_id=None,
-        group_by=_normalize_group_by(payload.get("group_by")),
+        group_by=group_by,
         comparison=comparison,
         sort_by=sort_by,
         limit=limit,
@@ -1868,6 +1997,70 @@ def _grouped_summary_payload(records: list[VehicleRecord], *, group_by: str) -> 
             for key, items in sorted(grouped.items())
         },
     }
+
+
+def _group_result_payload(
+    parsed: ChatVehicleQuery,
+    matched: list[VehicleRecord],
+    counts: dict[str, int],
+    *,
+    result_key: str,
+    top_key: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "total": len(matched),
+        result_key: counts,
+        "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched],
+    }
+    if top_key is not None:
+        payload[top_key] = _top_count(counts)
+    ranking = _build_ranking_result(parsed, counts)
+    if ranking is not None:
+        payload["ranking_result"] = ranking
+    return payload
+
+
+def _build_ranking_result(parsed: ChatVehicleQuery, counts: dict[str, int]) -> dict[str, Any] | None:
+    if parsed.sort_by not in {"count_desc", "count_asc"}:
+        return None
+    nonzero = _nonzero_counts(counts)
+    if not nonzero:
+        return {
+            "group_by": parsed.group_by,
+            "sort_by": parsed.sort_by,
+            "entries": [],
+            "winners": [],
+            "is_tie": False,
+        }
+    reverse = parsed.sort_by == "count_desc"
+    entries = [
+        {
+            "label": label,
+            "count": count,
+            **_ranking_entry_metadata(label, group_by=parsed.group_by),
+        }
+        for label, count in sorted(nonzero.items(), key=lambda item: ((-item[1], item[0]) if reverse else (item[1], item[0])))
+    ]
+    winner_count = entries[0]["count"]
+    winners = [entry for entry in entries if entry["count"] == winner_count]
+    return {
+        "group_by": parsed.group_by,
+        "sort_by": parsed.sort_by,
+        "entries": entries[: max(parsed.limit or 3, 3)],
+        "winners": winners,
+        "is_tie": len(winners) > 1,
+    }
+
+
+def _ranking_entry_metadata(label: str, *, group_by: str | None) -> dict[str, Any]:
+    if group_by == "run_camera":
+        run_id, camera_id = label.split(" / ", 1) if " / " in label else (label, "")
+        return {"run_id": run_id, "camera_id": camera_id or None}
+    if group_by == "run":
+        return {"run_id": label}
+    if group_by == "camera":
+        return {"camera_id": label}
+    return {}
 
 
 def _vehicle_result_id(record: VehicleRecord, parsed: ChatVehicleQuery) -> str:
@@ -2226,6 +2419,15 @@ def _normalize_operator(value: Any) -> str | None:
     return operator
 
 
+def _normalize_sort_by(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in {"count_desc", "count_asc"}:
+        raise VehicleQueryParseError(f"invalid_sort_by:{value}")
+    return normalized
+
+
 def _normalize_llm_subject(value: Any) -> str:
     if value is None:
         return "vehicles"
@@ -2319,15 +2521,22 @@ def _validate_qwen_plan(
     if rule_candidate is not None and rule_candidate.intent != "GENERAL_CHAT" and raw_intent == "GENERAL_CHAT":
         return "qwen_semantic_validation_failed", "incorrect_intent:general_chat_for_analytics"
     if rule_candidate is not None:
+        if rule_candidate.subject == "vehicles" and repaired_payload.get("subject") == "runs":
+            return "qwen_semantic_validation_failed", "incorrect_subject:expected_vehicles"
         if rule_candidate.subject == "runs" and repaired_payload.get("subject") != "runs":
             return "qwen_semantic_validation_failed", "missing_subject:runs"
         if rule_candidate.run_filter != repaired_payload.get("run_filter"):
             if rule_candidate.run_filter is not None:
                 return "qwen_semantic_validation_failed", f"missing_run_filter:{rule_candidate.run_filter}"
+            return "qwen_semantic_validation_failed", "invented_run_filter"
         if rule_candidate.group_by is not None and str(repaired_payload.get("intent") or "").upper() in {"GROUP", "SUMMARY"}:
             normalized_group_by = _normalize_group_by(repaired_payload.get("group_by"))
             if normalized_group_by != rule_candidate.group_by:
                 return "qwen_semantic_validation_failed", f"incorrect_group_by:expected_{rule_candidate.group_by}"
+        if rule_candidate.sort_by is not None and repaired_payload.get("sort_by") != rule_candidate.sort_by:
+            return "qwen_semantic_validation_failed", f"missing_sort_by:{rule_candidate.sort_by}"
+        if rule_candidate.limit is not None and repaired_payload.get("limit") != rule_candidate.limit:
+            return "qwen_semantic_validation_failed", f"missing_limit:{rule_candidate.limit}"
         expected_classes = set(rule_candidate.include_classes)
         actual_classes = set(_upper_list(repaired_payload.get("classes")))
         if expected_classes and not actual_classes.issuperset(expected_classes):
@@ -2643,6 +2852,8 @@ def _apply_run_and_camera_scope(
     group_by = explicit_group_by or parsed.group_by
     if group_by is None and parsed.context_reference == "previous_results" and _is_follow_up_refinement(text):
         group_by = previous_group_by
+    if group_by == "camera" and parsed.sort_by is not None and len(scoped_run_ids) > 1 and not _aggregate_same_named_cameras_requested(text):
+        group_by = "run_camera"
     intent = parsed.intent
     if group_by is not None and intent == "COUNT":
         intent = "GROUP"

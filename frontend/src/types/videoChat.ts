@@ -37,6 +37,8 @@ export type ChatVehicleQuery = {
   end_time?: number | null;
   camera_id?: string | null;
   group_by?: string | null;
+  sort_by?: string | null;
+  limit?: number | null;
   comparison?: Record<string, unknown> | null;
   show_evidence: boolean;
   context_reference?: string | null;

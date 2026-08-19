@@ -1353,6 +1353,67 @@ describe("VideoChatPage", () => {
     expect(screen.getByText("1 unreadable")).toBeInTheDocument();
   });
 
+  it("renders a compact top-camera ranking result without the full breakdown", async () => {
+    fetchRuns.mockResolvedValueOnce([
+      { run_id: "RUN_A", status: "COMPLETED", track_count: 12, physical_vehicle_count: 12, raw_track_count: 12, camera_count: 2, duration_seconds: 20 },
+      { run_id: "RUN_B", status: "COMPLETED", track_count: 15, physical_vehicle_count: 15, raw_track_count: 15, camera_count: 2, duration_seconds: 20 },
+    ]);
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "RUN_A",
+      run_ids: ["RUN_A", "RUN_B"],
+      session_id: "session-ranking",
+      answer: "CAM_003 in run RUN_B has the highest vehicle count with 115 vehicles.",
+      parser_used: "qwen_repaired",
+      parsed_query: {
+        intent: "GROUP",
+        include_classes: [],
+        exclude_classes: [],
+        include_colours: [],
+        exclude_colours: [],
+        start_time: null,
+        end_time: null,
+        camera_id: null,
+        group_by: "run_camera",
+        sort_by: "count_desc",
+        limit: 1,
+        comparison: null,
+        show_evidence: false,
+        context_reference: null,
+      },
+      analytics_result: {
+        total: 115,
+        by_run_camera: { "RUN_B / CAM_003": 115, "RUN_A / CAM_001": 92 },
+        ranking_result: {
+          group_by: "run_camera",
+          sort_by: "count_desc",
+          winners: [{ label: "RUN_B / CAM_003", count: 115, run_id: "RUN_B", camera_id: "CAM_003" }],
+          entries: [{ label: "RUN_B / CAM_003", count: 115, run_id: "RUN_B", camera_id: "CAM_003" }],
+          is_tie: false,
+        },
+        vehicle_ids: ["RUN_B::CAM_003:TRACK_1"],
+      },
+      matching_vehicle_ids: ["RUN_B::CAM_003:TRACK_1"],
+      evidence: [],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "which camera has the most vehicles" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Top camera")).toBeInTheDocument();
+    expect(screen.getByText("CAM_003")).toBeInTheDocument();
+    expect(screen.getByText("115 vehicles")).toBeInTheDocument();
+    expect(screen.getByText("Run: RUN_B")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Result breakdown")).not.toBeInTheDocument();
+  });
+
   it("renders the VinfoAI brand in the shared header", () => {
     render(
       <MemoryRouter>
