@@ -250,6 +250,66 @@ def test_colour_enrichment_produces_final_value_and_prediction(tmp_path: Path) -
     assert report.rows.colour_predictions[0].normalized_colour == "WHITE"
 
 
+def test_invalid_plate_ocr_does_not_create_plate_reading_row(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    enrichment = json.loads((run_dir / "vehicle_enrichment.json").read_text(encoding="utf-8"))
+    enrichment[0].update(
+        {
+            "plate_detected": True,
+            "plate_readable": False,
+            "plate_text": None,
+            "plate_raw_text": "LIGAJ7519",
+            "plate_normalized_text": "LIGAJ7519",
+            "plate_validation_status": "invalid",
+            "plate_validation_reason": "unsupported_indian_registration_structure",
+        }
+    )
+    _write_json(run_dir / "vehicle_enrichment.json", enrichment)
+
+    report = build_dry_run(run_dir)
+
+    assert len(report.rows.plate_detections) == 1
+    assert len(report.rows.plate_readings) == 0
+    assert report.rows.vehicle_tracks[0].enrichment_summary["plate_readable"] is False
+
+
+def test_run_file_importer_maps_only_enabled_or_runtime_cameras(tmp_path: Path) -> None:
+    run_dir = _base_run(tmp_path)
+    (run_dir / "run_config.yaml").write_text(
+        "\n".join(
+            [
+                "input:",
+                "  cameras:",
+                "    - camera_id: CAM_001",
+                "      source_type: video",
+                "      source: cam1.mp4",
+                "      enabled: true",
+                "    - camera_id: CAM_002",
+                "      source_type: video",
+                "      source: cam2.mp4",
+                "      enabled: false",
+                "    - camera_id: CAM_003",
+                "      source_type: video",
+                "      source: cam3.mp4",
+                "      enabled: false",
+                "ingestion:",
+                "  target_read_fps: 10",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    summary["configured_camera_count"] = 3
+    summary["enabled_camera_count"] = 1
+    summary["frames_by_camera"] = {"CAM_001": 10}
+    summary["detections_by_camera"] = {"CAM_001": 3}
+    _write_json(run_dir / "summary.json", summary)
+
+    report = build_dry_run(run_dir)
+
+    assert [row.camera_key for row in report.rows.run_cameras] == ["CAM_001"]
+
+
 def test_unknown_source_fields_are_not_silently_lost(tmp_path: Path) -> None:
     report = build_dry_run(_base_run(tmp_path))
     assert "tracks.new_debug_field" in report.field_mapping["jsonb"]

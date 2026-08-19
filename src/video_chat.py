@@ -804,10 +804,14 @@ def _display_plate_text(value: Any) -> str | None:
 
 
 def _plate_detected_value(item: dict[str, Any]) -> bool:
-    return bool(item.get("plate_detected")) or _clean_plate_text(item.get("plate_text")) is not None
+    if item.get("plate_detected") is not None:
+        return bool(item.get("plate_detected"))
+    return _clean_plate_text(item.get("plate_text")) is not None
 
 
 def _plate_readable_value(item: dict[str, Any]) -> bool:
+    if item.get("plate_readable") is not None:
+        return bool(item.get("plate_readable"))
     return _clean_plate_text(item.get("plate_text")) is not None
 
 
@@ -1563,6 +1567,8 @@ def _registration_like_token(value: str) -> str | None:
     token = _clean_plate_text(value)
     if token is None:
         return None
+    if any(word in token for word in ("SECOND", "SECONDS", "MINUTE", "MINUTES", "HOUR", "HOURS")):
+        return None
     if len(token) < 6 or len(token) > 12:
         return None
     if not re.fullmatch(r"[A-Z]{1,3}[A-Z0-9]{3,11}", token):
@@ -1977,9 +1983,15 @@ def _build_run_scope(selected_run_ids: list[str], repository: RunRepository) -> 
         if callable(list_cameras):
             cameras = [item for item in list_cameras(run_id=run_id) if item.get("camera_id")]
         camera_ids = sorted({str(item.get("camera_id")) for item in cameras if item.get("camera_id")})
-        camera_count = summary.get("camera_count") or summary_payload.get("configured_camera_count") or metadata_payload.get("camera_count")
+        camera_count = (
+            summary.get("camera_count")
+            or metadata_payload.get("camera_count")
+            or summary_payload.get("enabled_camera_count")
+        )
         if camera_count is None:
             camera_count = len(camera_ids)
+        if camera_count is None:
+            camera_count = summary_payload.get("configured_camera_count")
         scope.append(
             {
                 **summary,

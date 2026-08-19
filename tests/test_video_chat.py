@@ -802,6 +802,37 @@ def test_video_chat_contextual_plate_lookup_handles_missing_plate() -> None:
     assert response["answer"] == "No number plate was detected for this vehicle."
 
 
+def test_video_chat_contextual_plate_lookup_handles_detected_unreadable_plate() -> None:
+    class _UnreadablePlateRepository(_CameraScopeRepository):
+        def get_track(self, *, camera_id: str, track_id: str, run_id: str) -> dict | None:
+            payload = super().get_track(camera_id=camera_id, track_id=track_id, run_id=run_id) or {}
+            payload.update(
+                {
+                    "plate_detected": True,
+                    "plate_readable": False,
+                    "plate_text": None,
+                    "plate_raw_text": "LIGAJ7519",
+                }
+            )
+            return payload
+
+    repository = _UnreadablePlateRepository({"RUN_A": ["CAM_001"]})
+    records = [_record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE")]
+
+    response = handle_video_chat(
+        message="what is its number plate",
+        run_id="RUN_A",
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["CAM_001:TRACK_1"]},
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["intent"] == "PLATE_LOOKUP"
+    assert response["analytics_result"]["detected_unreadable_count"] == 1
+    assert response["answer"] == "A plate was detected on this vehicle, but no readable number plate is available."
+
+
 def test_video_chat_accepts_common_summary_typo() -> None:
     parsed, parser_used = parse_chat_vehicle_query(message="summry of the video", context={}, llm_provider=None)
 
@@ -1162,6 +1193,38 @@ def test_video_chat_lists_runs_with_multiple_cameras() -> None:
     assert response["analytics_result"]["run_ids"] == ["RUN_B", "RUN_C"]
     assert "RUN_B (2 cameras)" in response["answer"]
     assert "RUN_C (3 cameras)" in response["answer"]
+
+
+def test_video_chat_run_scope_prefers_participating_camera_metadata_over_configured_count() -> None:
+    class _RunScopeRepository(_CameraScopeRepository):
+        def get_run(self, run_id: str) -> dict | None:
+            if run_id == "RUN_A":
+                return {
+                    "run_id": run_id,
+                    "camera_count": 1,
+                    "summary": {"configured_camera_count": 3, "enabled_camera_count": 1},
+                    "metadata": {"camera_count": 1},
+                }
+            if run_id == "RUN_B":
+                return {
+                    "run_id": run_id,
+                    "camera_count": 2,
+                    "summary": {"configured_camera_count": 2, "enabled_camera_count": 2},
+                    "metadata": {"camera_count": 2},
+                }
+            return None
+
+    response = handle_video_chat(
+        message="which run have multiple cameras",
+        run_ids=["RUN_A", "RUN_B"],
+        records=[_record("RUN_A", "CAM_001", "TRACK_1")],
+        repository=_RunScopeRepository({"RUN_A": ["CAM_001"], "RUN_B": ["CAM_001", "CAM_002"]}),  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["subject"] == "runs"
+    assert response["analytics_result"]["run_ids"] == ["RUN_B"]
+    assert "RUN_B (2 cameras)" in response["answer"]
 
 
 def test_video_chat_summary_run_and_camera_wise_returns_grouped_summary() -> None:

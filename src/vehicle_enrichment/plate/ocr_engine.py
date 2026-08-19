@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 import cv2
 
+from src.indian_plate_validator import validate_indian_plate
 from ..ocr_mukul.image_preprocessor import resize_proportionally_if_needed
 from ..schemas import ATTRIBUTE_STATUS_DISABLED, ATTRIBUTE_STATUS_ERROR, AttributePrediction, PlateOCRResult
 from ..shared.florence_backend import FlorenceBackend
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PlateOCREngine:
@@ -69,13 +73,33 @@ class PlateOCREngine:
             raw_text = str(parsed_answer.get(self.task_token) or payload.get("generated_text") or "")
         else:
             raw_text = str(parsed_answer or payload.get("generated_text") or "")
-        normalized_text = self.normalize_plate_text(raw_text)
+        validation = validate_indian_plate(raw_text)
+        normalized_text = validation.normalized_text
+        canonical_text = validation.canonical_text
+        reason = validation.reason if validation.valid else f"plate_validation_failed:{validation.reason}"
+        if not validation.valid:
+            LOGGER.debug(
+                "plate OCR rejected raw_text=%r normalized=%r valid=%s reason=%s attempted_candidates=%s",
+                raw_text,
+                normalized_text,
+                validation.valid,
+                validation.reason,
+                validation.attempted_candidates,
+            )
         return PlateOCRResult(
-            text=normalized_text or None,
+            text=canonical_text,
+            raw_text=raw_text or None,
+            normalized_text=normalized_text,
+            format_type=validation.format_type,
+            validation_status="valid" if validation.valid else "invalid",
+            validation_reason=validation.reason,
+            correction_applied=validation.correction_applied,
+            correction_count=validation.correction_count,
+            attempted_candidates=list(validation.attempted_candidates),
             predictions=[
                 AttributePrediction(
                     attribute_name="plate_ocr",
-                    label=normalized_text or None,
+                    label=canonical_text,
                     source_backend="ocr_mukul_adapter",
                     source_model=self.backend.model_identifier,
                     source_frame_number=frame_number,
@@ -88,11 +112,11 @@ class PlateOCREngine:
                     original_crop_width=int(image.shape[1]),
                     original_crop_height=int(image.shape[0]),
                     status="completed",
-                    reason="ocr_completed" if normalized_text else "empty_ocr_response",
+                    reason=reason if normalized_text else "empty_ocr_response",
                     error=None,
                 )
             ],
             status="completed",
             source="plate.ocr_engine",
-            reason="ocr_completed" if normalized_text else "empty_ocr_response",
+            reason=reason if normalized_text else "empty_ocr_response",
         )

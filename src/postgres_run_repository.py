@@ -74,6 +74,7 @@ class PostgresRunRepository:
                 r.completed_at,
                 r.output_directory,
                 r.summary,
+                r.metadata,
                 r.metrics,
                 (select count(*) from {self._table('run_cameras')} c where c.run_id = r.id) as camera_count,
                 (select count(*) from {self._table('vehicle_tracks')} t where t.run_id = r.id) as raw_track_count,
@@ -112,6 +113,7 @@ class PostgresRunRepository:
         metrics = dict(row.get("metrics") or {})
         return {
             "run_id": str(row["run_key"]),
+            "camera_count": self._resolved_camera_count(row),
             "summary": dict(row.get("summary") or {}),
             "metadata": dict(row.get("metadata") or {}),
             "detection_tracking_metrics": dict(metrics.get("detection_tracking_metrics") or {}),
@@ -273,6 +275,7 @@ class PostgresRunRepository:
                 c.camera_key,
                 c.source,
                 c.source_type,
+                c.enabled,
                 c.fps,
                 c.total_frames,
                 c.processed_frames,
@@ -283,11 +286,13 @@ class PostgresRunRepository:
             join {self._table('processing_runs')} r on r.id = c.run_id
             left join {self._table('vehicle_tracks')} t on t.camera_id = c.id
             where r.run_key = %s
-            group by r.run_key, c.id, c.camera_key, c.source, c.source_type, c.fps, c.total_frames, c.processed_frames
+            group by r.run_key, c.id, c.camera_key, c.source, c.source_type, c.enabled, c.fps, c.total_frames, c.processed_frames
             order by c.camera_key
         """
         cameras = []
         for row in self._fetchall(sql, (resolved,)):
+            if not self._camera_row_participates(row):
+                continue
             camera_id = str(row.get("camera_key") or "")
             frame_number = row.get("frame_number")
             cameras.append(
@@ -640,7 +645,7 @@ class PostgresRunRepository:
             "status": row.get("status") or "UNKNOWN",
             "start_time": _iso(row.get("started_at")),
             "completed_at": _iso(row.get("completed_at")),
-            "camera_count": int(row.get("camera_count") or summary.get("configured_camera_count") or 0),
+            "camera_count": self._resolved_camera_count(row),
             "processed_frames": summary.get("processed_frames"),
             "overall_pipeline_runtime_ms": summary.get("overall_pipeline_runtime_ms"),
             "duration_seconds": self._duration_seconds_from_summary(summary),
@@ -652,6 +657,27 @@ class PostgresRunRepository:
             "run_directory": row.get("output_directory"),
             "has_run_config": bool(metrics.get("run_config") or summary),
         }
+
+    def _resolved_camera_count(self, row: dict[str, Any]) -> int:
+        summary = dict(row.get("summary") or {})
+        metadata = dict(row.get("metadata") or {})
+        for candidate in (summary.get("camera_count"), summary.get("enabled_camera_count"), metadata.get("camera_count")):
+            if candidate not in {None, ""}:
+                try:
+                    return int(candidate)
+                except (TypeError, ValueError):
+                    continue
+        return int(row.get("camera_count") or summary.get("configured_camera_count") or 0)
+
+    @staticmethod
+    def _camera_row_participates(row: dict[str, Any]) -> bool:
+        if row.get("enabled") is True:
+            return True
+        for key in ("processed_frames", "total_frames", "active_vehicle_count"):
+            value = row.get(key)
+            if value not in {None, 0, "0"}:
+                return True
+        return False
 
     def _resolve_single_run_id(self, run_id: str | None) -> str | None:
         if run_id is None or str(run_id).strip() == "" or str(run_id).strip().lower() == "all":

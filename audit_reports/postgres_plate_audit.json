@@ -1,0 +1,109 @@
+{
+  "affected_run_ids": [
+    "20260814_181311",
+    "20260817_144739",
+    "20260817_225342",
+    "20260818_130017",
+    "20260819_123642"
+  ],
+  "affected_vehicle_ids_if_available": [
+    "CAM_001:TRACK_1",
+    "CAM_001:TRACK_13",
+    "CAM_001:TRACK_14",
+    "CAM_001:TRACK_16",
+    "CAM_001:TRACK_21",
+    "CAM_001:TRACK_22",
+    "CAM_001:TRACK_27",
+    "CAM_001:TRACK_29",
+    "CAM_001:TRACK_30",
+    "CAM_001:TRACK_31",
+    "CAM_001:TRACK_32",
+    "CAM_001:TRACK_45",
+    "CAM_001:TRACK_47",
+    "CAM_001:TRACK_9",
+    "CAM_003:TRACK_8"
+  ],
+  "invalid_percentage": 8.6,
+  "invalid_readings": 16,
+  "mode": "postgres_plate_readings_audit",
+  "read_only": true,
+  "sample_invalid_values": [
+    {
+      "local_track_id": "CAM_001:TRACK_16",
+      "normalized_text": "HR30T42",
+      "raw_text": "HR30T42",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260814_181311"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_16",
+      "normalized_text": "HR30T42",
+      "raw_text": "HR30T42",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260817_144739"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_31",
+      "normalized_text": "27",
+      "raw_text": "27",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260817_225342"
+    },
+    {
+      "local_track_id": "CAM_003:TRACK_8",
+      "normalized_text": "27",
+      "raw_text": "27",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260818_130017"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_1",
+      "normalized_text": "PU13N0442",
+      "raw_text": "PU13N0442",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_13",
+      "normalized_text": "EB14",
+      "raw_text": "EB14",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_14",
+      "normalized_text": "DEU35Y1387",
+      "raw_text": "DEU35Y1387",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_21",
+      "normalized_text": "11",
+      "raw_text": "11",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_22",
+      "normalized_text": "DPZ4BT",
+      "raw_text": "DPZ4BT",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    },
+    {
+      "local_track_id": "CAM_001:TRACK_27",
+      "normalized_text": "BL10A5210",
+      "raw_text": "BL10A5210",
+      "reason": "unsupported_indian_registration_structure",
+      "run_key": "20260819_123642"
+    }
+  ],
+  "schema": "vehicle_analytics",
+  "total_readings": 186,
+  "valid_format_counts": {
+    "bharat_series": 2,
+    "standard_private": 168
+  },
+  "valid_readings": 170
+}

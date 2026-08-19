@@ -6,43 +6,17 @@ input:
   cameras:
   - camera_id: CAM_001
     source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_001_fa_traff_1min_4.mp4
+    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_001_Raw2_1.mp4
     enabled: true
     tracking_roi:
       enabled: true
       mode: rectangle
       anchor: bottom_center
       rectangle:
-        x_min_fraction: 0.039973
-        y_min_fraction: 0.58071
-        x_max_fraction: 0.982759
-        y_max_fraction: 0.735464
-  - camera_id: CAM_002
-    source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_002_Raw2_2.mp4
-    enabled: true
-    tracking_roi:
-      enabled: true
-      mode: rectangle
-      rectangle:
-        x_min_fraction: 0.073643
-        y_min_fraction: 0.527452
-        x_max_fraction: 1
-        y_max_fraction: 0.74912
-      anchor: bottom_center
-  - camera_id: CAM_003
-    source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_003_WhatsApp-Video-2026-08-13-at-18.20.26_2.mp4
-    enabled: true
-    tracking_roi:
-      enabled: true
-      mode: rectangle
-      rectangle:
-        x_min_fraction: 0.380214
-        y_min_fraction: 0.600349
-        x_max_fraction: 0.866755
-        y_max_fraction: 0.814957
-      anchor: bottom_center
+        x_min_fraction: 0.093915
+        y_min_fraction: 0.540133
+        x_max_fraction: 0.890923
+        y_max_fraction: 0.778033
   max_frames_per_camera: null
 ingestion:
   worker_count: 3

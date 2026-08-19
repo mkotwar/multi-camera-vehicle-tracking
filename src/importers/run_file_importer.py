@@ -490,6 +490,14 @@ def _map_run_cameras(run_key: str, source: dict[str, Any]) -> list[RunCameraRow]
         camera_key = camera.get("camera_id")
         if not camera_key:
             continue
+        enabled = camera.get("enabled")
+        has_runtime_presence = (
+            (isinstance(scheduled_frames, dict) and scheduled_frames.get(camera_key) not in {None, 0, "0"})
+            or (isinstance(frames, dict) and frames.get(camera_key) not in {None, 0, "0"})
+            or (isinstance(detections, dict) and detections.get(camera_key) not in {None, 0, "0"})
+        )
+        if enabled is False and not has_runtime_presence:
+            continue
         seen.add(camera_key)
         rows.append(
             RunCameraRow(
@@ -497,7 +505,7 @@ def _map_run_cameras(run_key: str, source: dict[str, Any]) -> list[RunCameraRow]
                 camera_key=camera_key,
                 source=camera.get("source"),
                 source_type=camera.get("source_type"),
-                enabled=camera.get("enabled"),
+                enabled=enabled,
                 fps=fps,
                 width=None,
                 height=None,
@@ -533,6 +541,7 @@ def _map_vehicle_track(ref: LogicalTrackRef, track: dict[str, Any], enrichment: 
     final_colour = _normalize_label(colour_obj.get("label") if isinstance(colour_obj, dict) else None, "vehicle_colour", ref, normalizations, attempted=bool(colour_obj))
     body_type = _normalize_label(body_obj.get("label") if isinstance(body_obj, dict) else None, "body_type", ref, normalizations, attempted=bool(body_obj))
     plate_detected = (enrichment or {}).get("plate_detected")
+    plate_readable = (enrichment or {}).get("plate_readable")
     plate_text = _empty_to_none((enrichment or {}).get("plate_text"))
     enrichment_summary = {k: v for k, v in (enrichment or {}).items() if k not in ENRICHMENT_FINAL_FIELDS}
     raw_track = {k: v for k, v in track.items() if k not in TRACK_TYPED_FIELDS and k != "vehicle_enrichment"}
@@ -562,13 +571,22 @@ def _map_vehicle_track(ref: LogicalTrackRef, track: dict[str, Any], enrichment: 
         body_type_status=body_obj.get("status") if isinstance(body_obj, dict) else None,
         plate_text=plate_text if plate_detected else None,
         plate_detected=bool(plate_detected) if plate_detected is not None else None,
-        plate_colour=_empty_to_none((enrichment or {}).get("plate_colour")),
         registration_category=_empty_to_none((enrichment or {}).get("registration_category")),
+        plate_colour=_empty_to_none((enrichment or {}).get("plate_colour")),
         class_counts=track.get("class_counts") or {},
         class_confidence_sums=track.get("class_confidence_sums") or {},
         evidence_record_count=_int_or_none(track.get("evidence_record_count")),
         raw_track=raw_track,
-        enrichment_summary=enrichment_summary,
+        enrichment_summary={
+            **enrichment_summary,
+            "plate_readable": plate_readable,
+            "plate_raw_text": _empty_to_none((enrichment or {}).get("plate_raw_text")),
+            "plate_normalized_text": _empty_to_none((enrichment or {}).get("plate_normalized_text")),
+            "plate_validation_status": _empty_to_none((enrichment or {}).get("plate_validation_status")),
+            "plate_validation_reason": _empty_to_none((enrichment or {}).get("plate_validation_reason")),
+            "plate_format_type": _empty_to_none((enrichment or {}).get("plate_format_type")),
+            "plate_correction_applied": (enrichment or {}).get("plate_correction_applied"),
+        },
     )
 
 
@@ -735,7 +753,15 @@ def _map_enrichment(
                     raw_response=enrichment.get("plate_ocr_raw_response"),
                     reason=enrichment.get("plate_ocr_reason"),
                     is_selected=True,
-                    metadata={},
+                    metadata={
+                        "plate_readable": enrichment.get("plate_readable"),
+                        "plate_raw_text": enrichment.get("plate_raw_text"),
+                        "plate_normalized_text": enrichment.get("plate_normalized_text"),
+                        "plate_validation_status": enrichment.get("plate_validation_status"),
+                        "plate_validation_reason": enrichment.get("plate_validation_reason"),
+                        "plate_format_type": enrichment.get("plate_format_type"),
+                        "plate_correction_applied": enrichment.get("plate_correction_applied"),
+                    },
                 )
             )
 

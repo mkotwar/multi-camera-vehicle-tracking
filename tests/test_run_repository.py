@@ -12,6 +12,11 @@ def _write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+
 def test_run_repository_lists_runs_and_tracks(tmp_path: Path) -> None:
     run_dir = tmp_path / "20260808_120000"
     _write_json(run_dir / "summary.json", {"run_id": "20260808_120000", "status": "COMPLETED", "configured_camera_count": 2, "processed_frames": 40})
@@ -142,3 +147,91 @@ def test_run_repository_physical_vehicle_plate_filter_normalizes_text(tmp_path: 
 
     assert len(rows) == 1
     assert rows[0]["vehicle_id"] == "VEHICLE_001"
+
+
+def test_run_repository_camera_count_uses_participating_cameras_not_configured_entries(tmp_path: Path) -> None:
+    run_dir = tmp_path / "20260808_120004"
+    _write_json(
+        run_dir / "summary.json",
+        {
+            "run_id": "20260808_120004",
+            "status": "COMPLETED",
+            "configured_camera_count": 3,
+            "enabled_camera_count": 1,
+            "frames_by_camera": {"CAM_001": 120},
+        },
+    )
+    _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 1})
+    _write_text(
+        run_dir / "run_config.yaml",
+        "\n".join(
+            [
+                "input:",
+                "  cameras:",
+                "    - camera_id: CAM_001",
+                "      source_type: video",
+                "      source: cam1.mp4",
+                "      enabled: true",
+                "    - camera_id: CAM_002",
+                "      source_type: video",
+                "      source: cam2.mp4",
+                "      enabled: false",
+                "    - camera_id: CAM_003",
+                "      source_type: video",
+                "      source: cam3.mp4",
+                "      enabled: false",
+            ]
+        ),
+    )
+    _write_json(run_dir / "tracks.json", [])
+    _write_json(run_dir / "vehicle_enrichment.json", [])
+
+    repository = RunRepository(tmp_path)
+
+    runs = repository.list_runs()
+    cameras = repository.list_cameras(run_id="20260808_120004")
+
+    assert runs[0]["camera_count"] == 1
+    assert [item["camera_id"] for item in cameras] == ["CAM_001"]
+
+
+def test_run_repository_lists_enabled_saved_run_cameras_even_without_tracks(tmp_path: Path) -> None:
+    run_dir = tmp_path / "20260808_120005"
+    _write_json(
+        run_dir / "summary.json",
+        {
+            "run_id": "20260808_120005",
+            "status": "COMPLETED",
+            "configured_camera_count": 3,
+            "enabled_camera_count": 2,
+        },
+    )
+    _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 2})
+    _write_text(
+        run_dir / "run_config.yaml",
+        "\n".join(
+            [
+                "input:",
+                "  cameras:",
+                "    - camera_id: CAM_001",
+                "      source_type: video",
+                "      source: cam1.mp4",
+                "      enabled: true",
+                "    - camera_id: CAM_002",
+                "      source_type: video",
+                "      source: cam2.mp4",
+                "      enabled: true",
+                "    - camera_id: CAM_003",
+                "      source_type: video",
+                "      source: cam3.mp4",
+                "      enabled: false",
+            ]
+        ),
+    )
+    _write_json(run_dir / "tracks.json", [])
+    _write_json(run_dir / "vehicle_enrichment.json", [])
+
+    repository = RunRepository(tmp_path)
+
+    assert repository.list_runs()[0]["camera_count"] == 2
+    assert [item["camera_id"] for item in repository.list_cameras(run_id="20260808_120005")] == ["CAM_001", "CAM_002"]

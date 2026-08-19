@@ -469,6 +469,10 @@ def test_plate_enrichment_passes_detected_crop_to_ocr(tmp_path: Path, monkeypatc
         recognized_paths.append(str(path))
         return PlateOCRResult(
             text="MH12AB1234",
+            raw_text="MH 12 AB 1234",
+            normalized_text="MH12AB1234",
+            validation_status="valid",
+            validation_reason="validated_standard_state_registration",
             status="completed",
             source="plate.ocr_engine",
             reason="ocr_completed",
@@ -494,7 +498,10 @@ def test_plate_enrichment_passes_detected_crop_to_ocr(tmp_path: Path, monkeypatc
 
     assert recognized_paths == [str(plate_path)]
     assert result.plate_detected is True
+    assert result.plate_readable is True
     assert result.plate_text == "MH12AB1234"
+    assert result.plate_validation_status == "valid"
+    assert result.plate_normalized_text == "MH12AB1234"
     assert result.plate_crop_path == str(plate_path)
     assert result.plate_detection_confidence == 0.91
     assert result.plate_ocr_attempted is True
@@ -548,9 +555,92 @@ def test_plate_enrichment_skips_ocr_for_low_quality_plate(tmp_path: Path, monkey
     result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
 
     assert result.plate_detected is True
+    assert result.plate_readable is False
     assert result.plate_text is None
     assert result.plate_ocr_attempted is False
     assert result.plate_ocr_reason == "plate_crop_below_minimum_size"
+
+
+def test_plate_enrichment_keeps_detection_when_ocr_is_invalid(tmp_path: Path, monkeypatch) -> None:
+    manager, _output = _manager(tmp_path, enabled=True)
+    manager.plate_detector.enabled = True
+    manager.plate_quality_validator.enabled = True
+    manager.plate_ocr_engine.enabled = True
+
+    image = np.full((60, 120, 3), 130, dtype=np.uint8)
+    crop_path = tmp_path / "crop_plate_invalid.jpg"
+    plate_path = tmp_path / "plate_invalid.jpg"
+    cv2.imwrite(str(crop_path), image)
+    cv2.imwrite(str(plate_path), image[10:30, 40:95])
+
+    monkeypatch.setattr(
+        manager.plate_detector,
+        "detect",
+        lambda item: PlateDetectionResult(
+            detected=True,
+            status="completed",
+            source="plate.detector",
+            reason="plate_detected",
+            predictions=[
+                AttributePrediction(
+                    attribute_name="plate_detection",
+                    label="PLATE",
+                    source_backend="ultralytics_yolo",
+                    source_model="plate.pt",
+                    source_frame_number=3,
+                    source_crop_path=str(plate_path),
+                    raw_response={
+                        "bbox_xyxy": [40.0, 10.0, 95.0, 30.0],
+                        "confidence": 0.91,
+                        "plate_crop_path": str(plate_path),
+                        "plate_crop_width": 55,
+                        "plate_crop_height": 20,
+                    },
+                    confidence=0.91,
+                    quality_weight=0.91,
+                    status="completed",
+                )
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        manager.plate_ocr_engine,
+        "recognize",
+        lambda path, **kwargs: PlateOCRResult(
+            text=None,
+            raw_text="LIGAJ7519",
+            normalized_text="LIGAJ7519",
+            validation_status="invalid",
+            validation_reason="unsupported_indian_registration_structure",
+            predictions=[
+                AttributePrediction(
+                    attribute_name="plate_ocr",
+                    label=None,
+                    source_backend="ocr_mukul_adapter",
+                    source_model="florence",
+                    source_frame_number=kwargs.get("frame_number"),
+                    source_crop_path=str(path),
+                    raw_response="LIGAJ7519",
+                    confidence=kwargs.get("confidence"),
+                    quality_weight=kwargs.get("confidence"),
+                    status="completed",
+                    reason="plate_validation_failed:unsupported_indian_registration_structure",
+                )
+            ],
+            status="completed",
+            source="plate.ocr_engine",
+            reason="plate_validation_failed:unsupported_indian_registration_structure",
+        ),
+    )
+
+    result = manager.enrich_completed_tracks([_track()], [_record(str(crop_path))])[0]
+
+    assert result.plate_detected is True
+    assert result.plate_readable is False
+    assert result.plate_text is None
+    assert result.plate_raw_text == "LIGAJ7519"
+    assert result.plate_validation_status == "invalid"
+    assert result.plate_validation_reason == "unsupported_indian_registration_structure"
 
 
 def test_plate_detector_saves_best_plate_crop_with_mock_yolo(tmp_path: Path, monkeypatch) -> None:

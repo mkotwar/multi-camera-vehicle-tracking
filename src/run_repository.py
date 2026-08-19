@@ -4,6 +4,7 @@ import csv
 import json
 from pathlib import Path
 from typing import Any
+import yaml
 
 from .plate_text import normalize_plate_text
 from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VEHICLE_COLOUR_LABELS
@@ -37,14 +38,13 @@ class RunRepository:
         for run_dir in self._iter_run_directories():
             summary = self._read_json(run_dir / "summary.json", default={})
             metadata = self._read_json(run_dir / "run_metadata.json", default={})
+            config = self._read_yaml(run_dir / "run_config.yaml")
             run_config = self._read_yaml_text(run_dir / "run_config.yaml")
             tracks = self._read_json(run_dir / "tracks.json", default=[])
             raw_track_count = len([item for item in tracks if isinstance(item, dict)])
             completed_track_count = len([item for item in tracks if isinstance(item, dict) and str(item.get("status") or "").upper() == "COMPLETED"])
             physical_vehicle_count = self._physical_vehicle_count(run_dir)
-            camera_count = summary.get("configured_camera_count")
-            if camera_count is None:
-                camera_count = metadata.get("camera_count")
+            camera_count = self._participating_camera_count(summary=summary, metadata=metadata, config=config)
             runs.append(
                 {
                     "run_id": run_dir.name,
@@ -77,12 +77,14 @@ class RunRepository:
         ingestion = self._read_json(run_dir / "ingestion_metrics.json", default={})
         evidence = self._read_json(run_dir / "evidence_metrics.json", default={})
         enrichment = self._read_json(run_dir / "vehicle_enrichment_metrics.json", default={})
+        config = self._read_yaml(run_dir / "run_config.yaml")
         tracks = self._read_json(run_dir / "tracks.json", default=[])
         raw_track_count = len([item for item in tracks if isinstance(item, dict)])
         completed_track_count = len([item for item in tracks if isinstance(item, dict) and str(item.get("status") or "").upper() == "COMPLETED"])
         physical_vehicle_count = self._physical_vehicle_count(run_dir)
         return {
             "run_id": run_id,
+            "camera_count": self._participating_camera_count(summary=summary, metadata=metadata, config=config),
             "summary": summary,
             "metadata": metadata,
             "detection_tracking_metrics": detection,
@@ -425,6 +427,9 @@ class RunRepository:
         resolved_run_id = self._resolve_single_run_id(run_id)
         if resolved_run_id is None:
             return []
+        run_dir = self._resolve_run_directory(resolved_run_id)
+        summary = self._read_json((run_dir / "summary.json") if run_dir else Path(""), default={}) if run_dir else {}
+        config = self._read_yaml((run_dir / "run_config.yaml") if run_dir else Path("")) if run_dir else {}
         tracks = self._load_run_tracks(run_id=resolved_run_id, include_evidence=False)
         by_camera: dict[str, dict[str, Any]] = {}
         for item in tracks:
@@ -448,7 +453,7 @@ class RunRepository:
                     "run_id": resolved_run_id,
                     "latest_frame_url_parts": None,
                     "source_type": "saved_run",
-                    "source": str(self._resolve_run_directory(resolved_run_id) or ""),
+                    "source": str(run_dir or ""),
                 },
             )
             camera["active_vehicle_count"] = int(camera["active_vehicle_count"]) + 1
@@ -464,6 +469,33 @@ class RunRepository:
                     camera_id=camera_id,
                     frame_number=last_frame,
                 )
+        config_cameras = self._configured_cameras(config)
+        for camera_id in self._participating_camera_ids(summary=summary, config=config):
+            camera = by_camera.setdefault(
+                camera_id,
+                {
+                    "camera_id": camera_id,
+                    "name": camera_id,
+                    "status": "completed",
+                    "frame_number": None,
+                    "timestamp_seconds": None,
+                    "processed_fps": 0.0,
+                    "input_fps": None,
+                    "active_vehicle_count": 0,
+                    "active_track_ids": [],
+                    "detections": [],
+                    "last_update": None,
+                    "run_id": resolved_run_id,
+                    "latest_frame_url_parts": None,
+                    "source_type": "saved_run",
+                    "source": str(run_dir or ""),
+                },
+            )
+            camera_config = config_cameras.get(camera_id, {})
+            if camera_config.get("source_type"):
+                camera["source_type"] = camera_config.get("source_type")
+            if camera_config.get("source"):
+                camera["source"] = camera_config.get("source")
         return sorted(by_camera.values(), key=lambda item: str(item["camera_id"]))
 
     def get_filter_options(self, *, run_id: str | None = None) -> dict[str, list[str]]:
@@ -733,6 +765,15 @@ class RunRepository:
         except Exception:
             return default
 
+    def _read_yaml(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
     def _read_csv_rows(self, path: Path) -> list[dict[str, str]]:
         if not path.exists():
             return []
@@ -749,6 +790,57 @@ class RunRepository:
             return path.read_text(encoding="utf-8")
         except Exception:
             return None
+
+    @staticmethod
+    def _configured_cameras(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        cameras = (((config.get("input") or {}).get("cameras")) or []) if isinstance(config, dict) else []
+        result: dict[str, dict[str, Any]] = {}
+        for camera in cameras:
+            if not isinstance(camera, dict):
+                continue
+            camera_id = str(camera.get("camera_id") or "").strip()
+            if camera_id:
+                result[camera_id] = camera
+        return result
+
+    def _participating_camera_count(self, *, summary: dict[str, Any], metadata: dict[str, Any], config: dict[str, Any]) -> int:
+        camera_ids = self._participating_camera_ids(summary=summary, config=config)
+        if camera_ids:
+            return len(camera_ids)
+        for candidate in (summary.get("camera_count"), summary.get("enabled_camera_count"), metadata.get("camera_count")):
+            if candidate not in {None, ""}:
+                try:
+                    return int(candidate)
+                except (TypeError, ValueError):
+                    continue
+        configured = self._configured_cameras(config)
+        return len([camera_id for camera_id, camera in configured.items() if camera.get("enabled") is not False])
+
+    def _participating_camera_ids(self, *, summary: dict[str, Any], config: dict[str, Any]) -> list[str]:
+        configured = self._configured_cameras(config)
+        participating = {
+            camera_id
+            for camera_id, camera in configured.items()
+            if camera.get("enabled") is True
+        }
+        for key in (
+            "frames_by_camera",
+            "frames_consumed_by_camera",
+            "frames_scheduled_by_camera",
+            "detections_by_camera",
+            "tracked_observations_by_camera",
+            "observations_by_camera",
+            "tracks_completed_by_camera",
+            "tracks_discarded_by_camera",
+        ):
+            payload = summary.get(key) or {}
+            if not isinstance(payload, dict):
+                continue
+            for camera_id, value in payload.items():
+                if value in {None, 0, "0"}:
+                    continue
+                participating.add(str(camera_id))
+        return sorted(participating)
 
     def _is_relative_to(self, path: Path, root: Path) -> bool:
         try:

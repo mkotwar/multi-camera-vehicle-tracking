@@ -333,3 +333,63 @@ def test_postgres_repository_physical_vehicle_plate_filter_uses_normalized_text(
 
     assert "regexp_replace(upper(coalesce(v.consensus_plate_text, '')), '[^A-Z0-9]+', '', 'g') = %s" in repository.last_sql
     assert repository.last_params[-1] == "DL6CQ1126"
+
+
+def test_postgres_repository_camera_count_uses_participating_rows_not_all_configured_rows(tmp_path: Path) -> None:
+    rows = _rows(tmp_path)
+    rows["runs"][0] = {
+        **rows["runs"][0],
+        "summary": {
+            "processed_frames": 100,
+            "overall_pipeline_runtime_ms": 2000,
+            "configured_camera_count": 3,
+            "enabled_camera_count": 1,
+        },
+        "metadata": {"camera_count": 1},
+        "camera_count": 3,
+    }
+    rows["cameras"] = [
+        {
+            "run_key": "20260814_181311",
+            "camera_key": "CAM_001",
+            "source": "video-1.mp4",
+            "source_type": "file",
+            "enabled": True,
+            "fps": 25,
+            "total_frames": 100,
+            "processed_frames": 100,
+            "timestamp_seconds": 25.0,
+            "frame_number": 20,
+            "active_vehicle_count": 3,
+        },
+        {
+            "run_key": "20260814_181311",
+            "camera_key": "CAM_002",
+            "source": "video-2.mp4",
+            "source_type": "file",
+            "enabled": False,
+            "fps": 25,
+            "total_frames": None,
+            "processed_frames": None,
+            "timestamp_seconds": None,
+            "frame_number": None,
+            "active_vehicle_count": 0,
+        },
+        {
+            "run_key": "20260814_181311",
+            "camera_key": "CAM_003",
+            "source": "video-3.mp4",
+            "source_type": "file",
+            "enabled": False,
+            "fps": 25,
+            "total_frames": None,
+            "processed_frames": None,
+            "timestamp_seconds": None,
+            "frame_number": None,
+            "active_vehicle_count": 0,
+        },
+    ]
+    repository = FakePostgresRunRepository(rows, tmp_path)
+
+    assert repository.list_runs()[0]["camera_count"] == 1
+    assert [item["camera_id"] for item in repository.list_cameras(run_id="20260814_181311")] == ["CAM_001"]

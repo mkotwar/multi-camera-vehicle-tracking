@@ -1,0 +1,79 @@
+{
+  "invalid_count": 12,
+  "invalid_examples": [
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_1",
+      "normalized_text": "PU13N0442",
+      "raw_text": "PU13N0442",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_9",
+      "normalized_text": "DL1KAB34004",
+      "raw_text": "DL1KAB34004",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_14",
+      "normalized_text": "DEU35Y1387",
+      "raw_text": "DEU35Y1387",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_13",
+      "normalized_text": "EB14",
+      "raw_text": "EB14",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_21",
+      "normalized_text": "11",
+      "raw_text": "11",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_22",
+      "normalized_text": "DPZ4BT",
+      "raw_text": "DPZ4BT",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_27",
+      "normalized_text": "BL10A5210",
+      "raw_text": "BL10A5210",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_30",
+      "normalized_text": "DL957V3EAS",
+      "raw_text": "DL957V3EAS",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_29",
+      "normalized_text": "B",
+      "raw_text": "B",
+      "reason": "unsupported_indian_registration_structure"
+    },
+    {
+      "camera_id": "CAM_001",
+      "local_track_id": "CAM_001:TRACK_32",
+      "normalized_text": "1",
+      "raw_text": "1",
+      "reason": "unsupported_indian_registration_structure"
+    }
+  ],
+  "mode": "run_file_plate_audit",
+  "read_only": true,
+  "run_dir": "outputs\\runs\\20260819_123642",
+  "valid_count": 32
+}

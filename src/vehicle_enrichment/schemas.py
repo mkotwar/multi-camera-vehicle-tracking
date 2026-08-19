@@ -228,6 +228,14 @@ class PlateColourResult:
 @dataclass(slots=True)
 class PlateOCRResult:
     text: str | None
+    raw_text: str | None = None
+    normalized_text: str | None = None
+    format_type: str | None = None
+    validation_status: str | None = None
+    validation_reason: str | None = None
+    correction_applied: bool = False
+    correction_count: int = 0
+    attempted_candidates: list[str] = field(default_factory=list)
     predictions: list[AttributePrediction] = field(default_factory=list)
     status: str = ATTRIBUTE_STATUS_DISABLED
     source: str | None = None
@@ -248,10 +256,17 @@ class TrackEnrichmentResult:
     vehicle_make: str | None
     vehicle_model: str | None
     plate_detected: bool
+    plate_readable: bool | None
     plate_colour: str | None
     registration_category: str | None
     plate_text: str | None
     status: str
+    plate_raw_text: str | None = None
+    plate_normalized_text: str | None = None
+    plate_validation_status: str | None = None
+    plate_validation_reason: str | None = None
+    plate_format_type: str | None = None
+    plate_correction_applied: bool | None = None
     vehicle_attribute_raw_responses: list[str] = field(default_factory=list)
     vehicle_attribute_selected_crop_paths: list[str] = field(default_factory=list)
     vehicle_attribute_inference_count: int = 0

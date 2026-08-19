@@ -1377,3 +1377,52 @@ def test_api_video_chat_run_scope_and_plate_queries(tmp_path: Path) -> None:
     assert plates.status_code == 200
     assert plates.json()["parsed_query"]["plate_presence"] == "detected"
     assert plates.json()["analytics_result"]["total"] == 1
+
+
+def test_api_run_summary_uses_participating_camera_count_not_configured_entries(tmp_path: Path) -> None:
+    run_id = "20260819_142017"
+    run_dir = tmp_path / run_id
+    _write_json(
+        run_dir / "summary.json",
+        {
+            "run_id": run_id,
+            "status": "COMPLETED",
+            "configured_camera_count": 3,
+            "enabled_camera_count": 1,
+            "frames_by_camera": {"CAM_001": 120},
+            "processed_frames": 120,
+        },
+    )
+    _write_json(run_dir / "run_metadata.json", {"status": "COMPLETED", "camera_count": 1})
+    (run_dir / "run_config.yaml").write_text(
+        "\n".join(
+            [
+                "input:",
+                "  cameras:",
+                "    - camera_id: CAM_001",
+                "      source_type: video",
+                "      source: cam1.mp4",
+                "      enabled: true",
+                "    - camera_id: CAM_002",
+                "      source_type: video",
+                "      source: cam2.mp4",
+                "      enabled: false",
+                "    - camera_id: CAM_003",
+                "      source_type: video",
+                "      source: cam3.mp4",
+                "      enabled: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _write_json(run_dir / "tracks.json", [])
+    _write_json(run_dir / "vehicle_enrichment.json", [])
+    client = TestClient(create_app(outputs_root=tmp_path))
+
+    runs_response = client.get("/api/runs")
+    cameras_response = client.get("/api/cameras", params={"run_id": run_id})
+
+    assert runs_response.status_code == 200
+    assert runs_response.json()[0]["camera_count"] == 1
+    assert cameras_response.status_code == 200
+    assert [item["camera_id"] for item in cameras_response.json()] == ["CAM_001"]
