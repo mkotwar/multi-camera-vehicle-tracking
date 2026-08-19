@@ -6,42 +6,42 @@ input:
   cameras:
   - camera_id: CAM_001
     source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_001_fa_traff_1min_2.mp4
+    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_001_fa_traff_1min_4.mp4
     enabled: true
     tracking_roi:
       enabled: true
       mode: rectangle
       anchor: bottom_center
       rectangle:
-        x_min_fraction: 0.059372
-        y_min_fraction: 0.592422
-        x_max_fraction: 0.978344
-        y_max_fraction: 0.68559
+        x_min_fraction: 0.039973
+        y_min_fraction: 0.58071
+        x_max_fraction: 0.982759
+        y_max_fraction: 0.735464
   - camera_id: CAM_002
     source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_002_Raw2_1.mp4
+    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_002_Raw2_2.mp4
     enabled: true
     tracking_roi:
       enabled: true
       mode: rectangle
       rectangle:
-        x_min_fraction: 0.164202
-        y_min_fraction: 0.53652
-        x_max_fraction: 0.891338
-        y_max_fraction: 0.786904
+        x_min_fraction: 0.073643
+        y_min_fraction: 0.527452
+        x_max_fraction: 1
+        y_max_fraction: 0.74912
       anchor: bottom_center
   - camera_id: CAM_003
     source_type: video
-    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_003_WhatsApp-Video-2026-08-13-at-18.20.26_1.mp4
+    source: D:\project\multi-camera-vehicle-tracking\data\uploads\config_videos\CAM_003_WhatsApp-Video-2026-08-13-at-18.20.26_2.mp4
     enabled: true
     tracking_roi:
       enabled: true
       mode: rectangle
       rectangle:
-        x_min_fraction: 0.328403
-        y_min_fraction: 0.587149
-        x_max_fraction: 0.925144
-        y_max_fraction: 0.7597
+        x_min_fraction: 0.380214
+        y_min_fraction: 0.600349
+        x_max_fraction: 0.866755
+        y_max_fraction: 0.814957
       anchor: bottom_center
   max_frames_per_camera: null
 ingestion:

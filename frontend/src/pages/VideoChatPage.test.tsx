@@ -255,7 +255,8 @@ describe("VideoChatPage", () => {
     expect(await screen.findByText("Track: TRACK_13")).toBeInTheDocument();
     expect(screen.getAllByText("CAR").length).toBeGreaterThan(0);
     expect(screen.getAllByText("WHITE").length).toBeGreaterThan(0);
-    expect(screen.getByText("Plate: MP09AB1234")).toBeInTheDocument();
+    expect(screen.getByText("Number plate")).toBeInTheDocument();
+    expect(screen.getByText("MP09AB1234")).toBeInTheDocument();
     expect(screen.getByText("Showing 1 of 2 vehicles")).toBeInTheDocument();
     fireEvent.click(screen.getAllByRole("button", { name: "View Track" })[0]);
     await waitFor(() => expect(fetchTrack).toHaveBeenCalledWith("CAM_001", "TRACK_13", "20260812_113742"));
@@ -318,7 +319,8 @@ describe("VideoChatPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("VEHICLE_108")).toBeInTheDocument();
-    expect(screen.getByText("Plate: Not detected")).toBeInTheDocument();
+    expect(screen.getByText("Number plate")).toBeInTheDocument();
+    expect(screen.getByText("No plate detected")).toBeInTheDocument();
     expect(screen.getByText("Showing 6 of 108 vehicles")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "CAR BLACK crop for VEHICLE_108" })).toHaveAttribute(
       "src",
@@ -1284,6 +1286,71 @@ describe("VideoChatPage", () => {
     expect(screen.getByText("WHITE 1")).toBeInTheDocument();
     expect(screen.getByText("RUN_B")).toBeInTheDocument();
     expect(screen.getByText("CAM_003")).toBeInTheDocument();
+  });
+
+  it("renders contextual plate lookup results with readable and unreadable plate states", async () => {
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "RUN_A",
+      session_id: "session-plates",
+      answer: "1 of the 2 matched vehicles have readable number plates. 1 vehicles have detected but unreadable plates.",
+      parser_used: "rule",
+      parsed_query: {
+        intent: "PLATE_LOOKUP",
+        include_classes: [],
+        exclude_classes: [],
+        include_colours: [],
+        exclude_colours: [],
+        show_evidence: false,
+        context_reference: "previous_results",
+        context_resolution: "multiple",
+      },
+      analytics_result: {
+        total: 2,
+        target_total: 2,
+        readable_count: 1,
+        detected_unreadable_count: 1,
+        no_plate_count: 0,
+        plate_rows: [
+          {
+            vehicle_id: "RUN_A::CAM_001:TRACK_1",
+            run_id: "RUN_A",
+            camera_id: "CAM_001",
+            track_id: "TRACK_1",
+            plate_text: "DL6CQ1126",
+            plate_detected: true,
+            plate_readable: true,
+          },
+          {
+            vehicle_id: "RUN_A::CAM_001:TRACK_2",
+            run_id: "RUN_A",
+            camera_id: "CAM_001",
+            track_id: "TRACK_2",
+            plate_text: null,
+            plate_detected: true,
+            plate_readable: false,
+          },
+        ],
+      },
+      matching_vehicle_ids: ["RUN_A::CAM_001:TRACK_1", "RUN_A::CAM_001:TRACK_2"],
+      evidence: [],
+      context_used: true,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "what are their number plates" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Number plate results")).toBeInTheDocument();
+    expect(screen.getByText("DL6CQ1126")).toBeInTheDocument();
+    expect(screen.getByText("Plate detected, unreadable")).toBeInTheDocument();
+    expect(screen.getByText("1 readable")).toBeInTheDocument();
+    expect(screen.getByText("1 unreadable")).toBeInTheDocument();
   });
 
   it("renders the VinfoAI brand in the shared header", () => {

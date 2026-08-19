@@ -118,3 +118,27 @@ def test_run_repository_filter_options_return_supported_vocabularies(tmp_path: P
     assert options["vehicle_classes"] == list(SUPPORTED_VEHICLE_CLASSES)
     assert options["colours"] == list(SUPPORTED_VEHICLE_COLOUR_LABELS)
     assert options["cameras"] == ["CAM_001"]
+
+
+def test_run_repository_physical_vehicle_plate_filter_normalizes_text(tmp_path: Path) -> None:
+    run_dir = tmp_path / "20260808_120003"
+    _write_json(
+        run_dir / "physical_vehicles.json",
+        {
+            "physical_vehicles": [
+                {
+                    "vehicle_key": "VEHICLE_001",
+                    "vehicle_class": "CAR",
+                    "vehicle_colour": "WHITE",
+                    "consensus_plate_text": "DL6C Q1126",
+                    "member_track_ids": ["CAM_001:TRACK_1"],
+                }
+            ]
+        },
+    )
+    repository = RunRepository(tmp_path)
+
+    rows = repository.list_physical_vehicles(run_id="20260808_120003", plate_text="dl6cq-1126")
+
+    assert len(rows) == 1
+    assert rows[0]["vehicle_id"] == "VEHICLE_001"

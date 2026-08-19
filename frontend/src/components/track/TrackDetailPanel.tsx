@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchTrack, fetchTrackEvidence } from "../../api/tracks";
 import type { EvidenceRecord, TrackRecord } from "../../types/track";
+import { resolvePlatePresentation } from "../../utils/plates";
 import { formatVideoTime } from "../../utils/time";
 
 export type TrackSelection = {
@@ -23,12 +24,6 @@ function labelForRole(role?: string | null): string {
 function formatScore(value: unknown): string {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(3) : "Unavailable";
-}
-
-function plateLabel(track: TrackRecord): string {
-  const text = String(track.plate_text ?? "").trim();
-  if (text) return text.toUpperCase();
-  return track.plate_detected ? "Plate detected, no readable text" : "No readable plate";
 }
 
 export function TrackDetailPanel({ selection, compact = false, showFullPageAction = false }: TrackDetailPanelProps) {
@@ -104,6 +99,12 @@ export function TrackDetailContent({
   const duration = track.duration_seconds;
   const timelineRange = Math.max(duration ?? 0, 0.001);
   const fullTrackUrl = `/tracks/${encodeURIComponent(track.camera_id)}/${encodeURIComponent(track.track_id)}${track.run_id ? `?run_id=${encodeURIComponent(track.run_id)}` : ""}`;
+  const plate = resolvePlatePresentation({
+    plateText: track.plate_text,
+    plateDetected: track.plate_detected,
+    readableMissingLabel: "No plate detected",
+    unreadableLabel: "Plate detected, unreadable",
+  });
 
   return (
     <section className={`track-detail-panel ${compact ? "compact" : ""}`}>
@@ -114,7 +115,7 @@ export function TrackDetailContent({
             <p className="muted">Run {track.run_id ?? "runtime"} / Camera {track.camera_id}</p>
           </div>
           <div className="track-header-actions">
-            <span className={`plate-badge ${track.plate_text ? "readable" : "empty"}`}>{plateLabel(track)}</span>
+            <span className={`plate-badge ${plate.state}`}>{plate.label}</span>
             <span className="status">{track.status ?? "Unavailable"}</span>
             {showFullPageAction ? <Link className="secondary-button compact-action" to={fullTrackUrl}>Open full track page</Link> : null}
           </div>
@@ -123,7 +124,7 @@ export function TrackDetailContent({
         <div className="stats-grid detail-overview">
           <div><strong>Vehicle Class</strong><span>{(track.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></div>
           <div><strong>Colour</strong><span>{track.colour ?? track.colour_status ?? "Colour pending"}</span></div>
-          <div><strong>Licence Plate</strong><span>{plateLabel(track)}</span></div>
+          <div><strong>Licence Plate</strong><span>{plate.label}</span></div>
           <div><strong>Plate Confidence</strong><span>{track.plate_text ? formatScore(track.plate_text_confidence) : formatScore(track.plate_detection_confidence)}</span></div>
           <div><strong>First Seen</strong><span>{formatVideoTime(firstSeen)}</span></div>
           <div><strong>Last Seen</strong><span>{formatVideoTime(lastSeen)}</span></div>

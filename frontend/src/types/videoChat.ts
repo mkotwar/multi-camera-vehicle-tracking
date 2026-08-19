@@ -9,6 +9,8 @@ export type VehicleEvidence = {
   vehicle_class: string;
   colour: string;
   plate_text?: string | null;
+  plate_detected?: boolean | null;
+  plate_readable?: boolean | null;
   first_seen_seconds?: number | null;
   last_seen_seconds?: number | null;
   best_crop_url?: string | null;
@@ -28,6 +30,7 @@ export type ChatVehicleQuery = {
   include_colours: string[];
   exclude_colours: string[];
   plate_presence?: string | null;
+  plate_detected?: boolean | null;
   plate_text?: string | null;
   plate_readable?: boolean | null;
   start_time?: number | null;
@@ -37,6 +40,7 @@ export type ChatVehicleQuery = {
   comparison?: Record<string, unknown> | null;
   show_evidence: boolean;
   context_reference?: string | null;
+  context_resolution?: string | null;
   evidence_navigation?: string | null;
 };
 

@@ -298,3 +298,38 @@ def test_postgres_repository_connection_failure_is_clear(tmp_path: Path) -> None
 
     with pytest.raises(PostgresRepositoryError, match="PostgreSQL read failed"):
         repository.list_runs()
+
+
+def test_postgres_repository_physical_vehicle_plate_filter_uses_normalized_text(tmp_path: Path) -> None:
+    class CapturingRepository(FakePostgresRunRepository):
+        def __init__(self, rows_by_kind: dict[str, list[dict[str, Any]]], tmp_path: Path) -> None:
+            super().__init__(rows_by_kind, tmp_path)
+            self.last_sql = ""
+            self.last_params: tuple[Any, ...] = ()
+
+        def _fetchall(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            normalized = " ".join(sql.split())
+            if "from \"vehicle_analytics\".\"physical_vehicles\" v" in normalized:
+                self.last_sql = normalized
+                self.last_params = params
+                return self.rows_by_kind.get("physical_vehicles", [])
+            return super()._fetchall(sql, params)
+
+    rows = _rows(tmp_path)
+    rows["physical_vehicles"] = [
+        {
+            "run_key": "20260814_181311",
+            "vehicle_key": "VEHICLE_001",
+            "vehicle_class": "CAR",
+            "vehicle_colour": "WHITE",
+            "consensus_plate_text": "DL6C Q1126",
+            "member_track_ids": ["CAM_001:TRACK_5"],
+            "camera_ids": ["CAM_001"],
+        }
+    ]
+    repository = CapturingRepository(rows, tmp_path)
+
+    repository.list_physical_vehicles(run_id="20260814_181311", plate_text="dl6cq-1126")
+
+    assert "regexp_replace(upper(coalesce(v.consensus_plate_text, '')), '[^A-Z0-9]+', '', 'g') = %s" in repository.last_sql
+    assert repository.last_params[-1] == "DL6CQ1126"

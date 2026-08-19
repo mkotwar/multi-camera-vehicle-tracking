@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .env_loader import load_env_file
+from .plate_text import normalize_plate_text
 from .vehicle_analytics import vehicle_records_from_physical_vehicles, vehicle_records_from_repository_tracks
 from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VEHICLE_COLOUR_LABELS
 
@@ -196,9 +197,10 @@ class PostgresRunRepository:
         if colour:
             clauses.append("upper(coalesce(v.vehicle_colour, 'UNKNOWN')) = upper(%s)")
             params.append(colour)
-        if plate_text:
-            clauses.append("upper(coalesce(v.consensus_plate_text, '')) = upper(%s)")
-            params.append(plate_text)
+        normalized_plate_text = normalize_plate_text(plate_text)
+        if normalized_plate_text:
+            clauses.append("regexp_replace(upper(coalesce(v.consensus_plate_text, '')), '[^A-Z0-9]+', '', 'g') = %s")
+            params.append(normalized_plate_text)
         where = f"where {' and '.join(clauses)}" if clauses else ""
         sql = f"""
             select

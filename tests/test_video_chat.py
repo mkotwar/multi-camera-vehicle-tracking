@@ -446,6 +446,43 @@ def test_video_chat_explicit_follow_up_uses_previous_context() -> None:
     assert parsed.context_reference == "previous_results"
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_plate", "expected_show_evidence"),
+    [
+        ("find DL6CQ1126", "DL6CQ1126", True),
+        ("show vehicle DL6C Q1126", "DL6CQ1126", True),
+        ("find plate DL6C-Q1126", "DL6CQ1126", True),
+    ],
+)
+def test_video_chat_direct_plate_queries_normalize_registration_like_tokens(
+    message: str,
+    expected_plate: str,
+    expected_show_evidence: bool,
+) -> None:
+    parsed, parser_used = parse_chat_vehicle_query(message=message, context={}, llm_provider=None)
+
+    assert parser_used == "rule_based"
+    assert parsed.intent == "LIST"
+    assert parsed.plate_text == expected_plate
+    assert parsed.show_evidence is expected_show_evidence
+
+
+def test_video_chat_contextual_plate_lookup_uses_internal_plate_intent() -> None:
+    parsed, parser_used = parse_chat_vehicle_query(
+        message="what is its number plate",
+        context={
+            "previous_vehicle_ids": ["VEHICLE_001"],
+            "previous_filters": {"selected_run_ids": ["RUN_A"]},
+        },
+        llm_provider=None,
+    )
+
+    assert parser_used == "rule_based"
+    assert parsed.intent == "PLATE_LOOKUP"
+    assert parsed.context_reference == "previous_results"
+    assert parsed.context_resolution == "single"
+
+
 @pytest.mark.parametrize("message", ["unknown vehicle", "Show unknown vehicles"])
 def test_video_chat_unknown_vehicle_is_explicit_class_filter(message: str) -> None:
     parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
@@ -643,6 +680,126 @@ def test_video_chat_physical_vehicle_show_them_resolves_member_track_evidence(tm
     assert response["evidence"][0]["image_url"] == response["evidence"][0]["best_crop_url"]
     assert response["evidence"][1]["vehicle_id"] == "VEHICLE_002"
     assert response["evidence"][1]["plate_text"] == "MH12XY9876"
+
+
+def test_video_chat_contextual_plate_lookup_returns_single_readable_plate(tmp_path: Path) -> None:
+    run_id = "20260815_170454"
+    repository = _PhysicalEvidenceRepository(tmp_path / run_id)
+    records = [
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_001",
+            "vehicle_class": "CAR",
+            "colour": "WHITE",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 1.0,
+            "last_seen_seconds": 9.0,
+        })(),
+    ]
+
+    response = handle_video_chat(
+        message="what is its number plate",
+        run_id=run_id,
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["VEHICLE_001"]},
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["intent"] == "PLATE_LOOKUP"
+    assert response["analytics_result"]["readable_count"] == 1
+    assert response["analytics_result"]["plate_rows"][0]["plate_text"] == "MP09AB1234"
+    assert response["answer"] == "The number plate is MP09AB1234."
+
+
+def test_video_chat_contextual_plate_lookup_returns_multiple_plate_states(tmp_path: Path) -> None:
+    run_id = "20260815_170454"
+    repository = _PhysicalEvidenceRepository(tmp_path / run_id)
+    records = [
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_001",
+            "vehicle_class": "CAR",
+            "colour": "WHITE",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 1.0,
+            "last_seen_seconds": 9.0,
+        })(),
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_002",
+            "vehicle_class": "MOTORCYCLE",
+            "colour": "BLACK",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 10.0,
+            "last_seen_seconds": 12.0,
+        })(),
+    ]
+
+    response = handle_video_chat(
+        message="what are their number plates",
+        run_id=run_id,
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["VEHICLE_001", "VEHICLE_002"]},
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["intent"] == "PLATE_LOOKUP"
+    assert response["parsed_query"]["context_resolution"] == "multiple"
+    assert response["analytics_result"]["readable_count"] == 2
+    assert response["analytics_result"]["detected_unreadable_count"] == 0
+    assert response["answer"] == "2 of the 2 matched vehicles have readable number plates."
+
+
+def test_video_chat_contextual_plate_lookup_requests_clarification_for_ambiguous_single_reference(tmp_path: Path) -> None:
+    run_id = "20260815_170454"
+    repository = _PhysicalEvidenceRepository(tmp_path / run_id)
+    records = [
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_001",
+            "vehicle_class": "CAR",
+            "colour": "WHITE",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 1.0,
+            "last_seen_seconds": 9.0,
+        })(),
+        type("Record", (), {
+            "vehicle_id": "VEHICLE_002",
+            "vehicle_class": "MOTORCYCLE",
+            "colour": "BLACK",
+            "camera_id": "CAM_001",
+            "first_seen_seconds": 10.0,
+            "last_seen_seconds": 12.0,
+        })(),
+    ]
+
+    response = handle_video_chat(
+        message="what is its number plate",
+        run_id=run_id,
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["VEHICLE_001", "VEHICLE_002"]},
+        llm_provider=None,
+    )
+
+    assert response["analytics_result"]["ambiguous"] is True
+    assert response["answer"].startswith("There are multiple vehicles in the current result.")
+
+
+def test_video_chat_contextual_plate_lookup_handles_missing_plate() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001"]})
+    records = [_record("RUN_A", "CAM_001", "TRACK_1", "CAR", "WHITE")]
+
+    response = handle_video_chat(
+        message="what is its number plate",
+        run_id="RUN_A",
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        session_context={"previous_vehicle_ids": ["CAM_001:TRACK_1"]},
+        llm_provider=None,
+    )
+
+    assert response["parsed_query"]["intent"] == "PLATE_LOOKUP"
+    assert response["analytics_result"]["no_plate_count"] == 1
+    assert response["answer"] == "No number plate was detected for this vehicle."
 
 
 def test_video_chat_accepts_common_summary_typo() -> None:

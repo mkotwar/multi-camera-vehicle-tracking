@@ -14,6 +14,7 @@ import {
   saveActiveVideoChatRunIds,
   saveVideoChatSessionForRun,
 } from "../utils/videoChatPersistence";
+import { resolvePlatePresentation } from "../utils/plates";
 import { formatVideoTime } from "../utils/time";
 
 const PROMPT_SUGGESTIONS = [
@@ -472,6 +473,9 @@ function ResultPresentation({ message }: { message: ChatMessage }) {
   const groupedSummary = getGroupedSummary(parsed, analytics);
   const filterChips = getFilterChips(parsed);
   const listValues = getValueList(parsed, analytics);
+  const plateRows = getPlateLookupRows(parsed, analytics);
+  const plateSummary = getPlateLookupSummary(parsed, analytics);
+  const isPlateLookup = parsed?.intent?.toUpperCase() === "PLATE_LOOKUP";
 
   return (
     <div className="result-block">
@@ -560,6 +564,46 @@ function ResultPresentation({ message }: { message: ChatMessage }) {
           ))}
         </div>
       ) : null}
+      {isPlateLookup && plateSummary ? (
+        <section className="plate-lookup-summary" aria-label="Plate lookup summary">
+          <div className="plate-lookup-summary__header">
+            <strong>{plateSummary.title}</strong>
+            {plateSummary.subtitle ? <span>{plateSummary.subtitle}</span> : null}
+          </div>
+          {plateSummary.chips.length ? (
+            <div className="result-chip-row" aria-label="Plate lookup details">
+              {plateSummary.chips.map((chip) => (
+                <span key={chip}>{chip}</span>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+      {plateRows.length ? (
+        <div className="plate-lookup-list" aria-label="Number plate results">
+          {plateRows.map((row) => {
+            const plate = resolvePlatePresentation({
+              plateText: row.plate_text,
+              plateDetected: row.plate_detected,
+              readableMissingLabel: "No plate detected",
+              unreadableLabel: "Plate detected, unreadable",
+            });
+            return (
+              <article key={`${row.run_id ?? "run"}-${row.vehicle_id}`} className="plate-lookup-card">
+                <div className="plate-lookup-card__meta">
+                  <strong>{row.vehicle_id}</strong>
+                  <span>{row.run_id ? `Run ${row.run_id}` : "Run unavailable"}</span>
+                </div>
+                <span className={`plate-badge ${plate.state}`}>{plate.label}</span>
+                <div className="plate-lookup-card__detail">
+                  <span>{row.camera_id ? `Camera ${row.camera_id}` : "Camera unavailable"}</span>
+                  <span>{row.track_id ? `Track ${row.track_id}` : "Track unavailable"}</span>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -616,7 +660,12 @@ function EvidenceGrid({
         const imageUrl = item.best_crop_url ?? item.image_url;
         const memberTracks = item.member_track_ids ?? [];
         const displayTrack = memberTracks.length > 1 ? `${memberTracks.length} tracklets` : item.track_id;
-        const plateText = item.plate_text?.trim() || "Not detected";
+        const plate = resolvePlatePresentation({
+          plateText: item.plate_text,
+          plateDetected: item.plate_detected ?? item.plate_readable,
+          readableMissingLabel: "No plate detected",
+          unreadableLabel: "Plate detected, unreadable",
+        });
         const isSelected =
           selectedTrack?.cameraId === item.camera_id &&
           selectedTrack?.trackId === item.track_id &&
@@ -638,7 +687,10 @@ function EvidenceGrid({
                 <span className={`vehicle-colour-badge colour-${item.colour.toLowerCase()}`}>{item.colour}</span>
               </div>
               <span className="evidence-seen">Track: {displayTrack}</span>
-              <span className={`evidence-plate ${item.plate_text ? "readable" : ""}`}>Plate: {plateText}</span>
+              <div className="evidence-plate-block">
+                <span className="evidence-seen evidence-seen--label">Number plate</span>
+                <span className={`plate-badge ${plate.state}`}>{plate.label}</span>
+              </div>
               <span className="evidence-seen">Seen {formatVideoTime(item.first_seen_seconds)} - {formatVideoTime(item.last_seen_seconds)}</span>
               {onSelectTrack ? (
                 <button
@@ -846,6 +898,10 @@ function getResultMetrics(parsed: ChatVehicleQuery | undefined, analytics: Recor
     ];
     return metrics.filter(Boolean) as Array<{ label: string; value: string }>;
   }
+  if (intent === "PLATE_LOOKUP") {
+    const total = readNumericResult(analytics.target_total ?? analytics.total);
+    return total == null ? [] : [{ label: total === 1 ? "Vehicle inspected" : "Vehicles inspected", value: String(total) }];
+  }
   return [];
 }
 
@@ -871,6 +927,13 @@ function getPrimaryMetric(parsed: ChatVehicleQuery | undefined, analytics: Recor
       label: total === 1 ? "vehicle" : "vehicles",
     };
   }
+  if (intent === "PLATE_LOOKUP" && total != null) {
+    return {
+      title: getPrimaryMetricTitle(parsed),
+      value: String(total),
+      label: total === 1 ? "plate lookup" : "plate lookups",
+    };
+  }
   return null;
 }
 
@@ -893,6 +956,9 @@ function getPrimaryMetricTitle(parsed: ChatVehicleQuery | undefined) {
   }
   if (parsed.plate_presence === "detected") {
     return "Vehicles with number plates";
+  }
+  if (parsed.intent?.toUpperCase() === "PLATE_LOOKUP") {
+    return parsed.context_resolution === "multiple" ? "Number plates" : "Number plate";
   }
   return "Result";
 }
@@ -939,6 +1005,10 @@ function getFilterChips(parsed: ChatVehicleQuery | undefined) {
     ...parsed.include_classes.map((value) => formatLabel(value)),
     ...parsed.include_colours.map((value) => formatLabel(value)),
     parsed.plate_presence ? `Plates: ${formatLabel(parsed.plate_presence)}` : null,
+    parsed.plate_detected === true ? "Plate detected" : null,
+    parsed.plate_detected === false ? "No plate detected" : null,
+    parsed.plate_readable === false ? "Unreadable plate" : null,
+    parsed.plate_text ? `Plate: ${parsed.plate_text}` : null,
     parsed.camera_id ? `Camera: ${parsed.camera_id}` : null,
     ...(parsed.include_camera_ids ?? []).map((value) => `Camera: ${value}`),
     parsed.run_filter === "multiple_cameras" ? "Multiple cameras only" : null,
@@ -961,6 +1031,44 @@ function getValueList(parsed: ChatVehicleQuery | undefined, analytics: Record<st
     ].slice(0, 10);
   }
   return [];
+}
+
+function getPlateLookupRows(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  if (parsed?.intent?.toUpperCase() !== "PLATE_LOOKUP") return [];
+  const rows = analytics.plate_rows;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row): row is {
+    vehicle_id: string;
+    run_id?: string | null;
+    camera_id?: string | null;
+    track_id?: string | null;
+    plate_text?: string | null;
+    plate_detected?: boolean | null;
+  } => Boolean(row && typeof row === "object" && "vehicle_id" in row));
+}
+
+function getPlateLookupSummary(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
+  if (parsed?.intent?.toUpperCase() !== "PLATE_LOOKUP") return null;
+  if (analytics.ambiguous) {
+    return {
+      title: "Plate lookup needs a narrower target",
+      subtitle: "The previous result contains multiple vehicles.",
+      chips: toStringList(analytics.candidate_vehicle_ids).slice(0, 5).map((value) => `Candidate: ${value}`),
+    };
+  }
+  const readable = readNumericResult(analytics.readable_count) ?? 0;
+  const unreadable = readNumericResult(analytics.detected_unreadable_count) ?? 0;
+  const missing = readNumericResult(analytics.no_plate_count) ?? 0;
+  const chips = [
+    readable ? `${readable} readable` : null,
+    unreadable ? `${unreadable} unreadable` : null,
+    missing ? `${missing} not detected` : null,
+  ].filter(Boolean) as string[];
+  return {
+    title: parsed.context_resolution === "multiple" ? "Number plate results" : "Number plate result",
+    subtitle: chips.length ? undefined : "No plate details are available for the selected result.",
+    chips,
+  };
 }
 
 function normalizeRunIds(runIds: string[], runs: RunSummary[]): string[] {

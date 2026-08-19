@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .plate_text import normalize_plate_text
 from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VEHICLE_COLOUR_LABELS
 from .vehicle_analytics import vehicle_records_from_physical_vehicles, vehicle_records_from_repository_tracks
 
@@ -512,7 +513,7 @@ class RunRepository:
                     continue
                 if colour and str(record.get("vehicle_colour", "")).upper() != colour.upper():
                     continue
-                if plate_text and str(record.get("consensus_plate_text", "")).upper() != str(plate_text).upper():
+                if plate_text and normalize_plate_text(record.get("consensus_plate_text")) != normalize_plate_text(plate_text):
                     continue
                 rows.append(record)
         rows.sort(key=lambda item: (str(item.get("run_id", "")), float(item.get("last_seen_seconds") or 0.0)), reverse=True)

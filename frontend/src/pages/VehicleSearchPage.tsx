@@ -10,6 +10,7 @@ import type { FilterOptions } from "../types/filters";
 import type { ExperimentalVehicleIdentityResult, PlateAssistedIdentityResult, ReconciliationAssociation, ReconciliationTrack, StationaryRecoveryResult, TrackReconciliationResult } from "../types/run";
 import type { PhysicalVehicleRecord, TrackRecord } from "../types/track";
 import type { VehicleSearchResponse } from "../types/vehicleSearch";
+import { resolvePlatePresentation } from "../utils/plates";
 import { formatVideoTime, parseVideoTime } from "../utils/time";
 
 type Filters = {
@@ -68,12 +69,6 @@ function formatScore(value: unknown): string {
 function formatSeconds(value: unknown): string {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? `${numeric.toFixed(2)}s` : "Unavailable";
-}
-
-function formatPlate(track: TrackRecord): string {
-  const text = String(track.plate_text ?? "").trim();
-  if (text) return text.toUpperCase();
-  return track.plate_detected ? "Detected, unreadable" : "No readable plate";
 }
 
 function shortTrackId(value: string): string {
@@ -486,21 +481,29 @@ export function VehicleSearchPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {pagedRows.map((row) => (
-                    <tr key={`${row.run_id ?? "runtime"}-${row.local_track_id}`} className="vehicle-table-row">
+                  {pagedRows.map((row) => {
+                    const plate = resolvePlatePresentation({
+                      plateText: row.plate_text,
+                      plateDetected: row.plate_detected,
+                      readableMissingLabel: "No plate detected",
+                      unreadableLabel: "Plate detected, unreadable",
+                    });
+                    return (
+                      <tr key={`${row.run_id ?? "runtime"}-${row.local_track_id}`} className="vehicle-table-row">
                       <td>{row.best_crop_url ? <img src={row.best_crop_url} alt={`${row.local_track_id} crop`} className="table-thumb" /> : <div className="thumb-placeholder small">No crop</div>}</td>
                       <td><span className="table-badge table-badge--camera">{row.run_id ?? "runtime"}</span></td>
                       <td><span className="table-badge table-badge--camera">{row.camera_id}</span></td>
                       <td><Link to={`/tracks/${row.camera_id}/${row.track_id}?run_id=${encodeURIComponent(row.run_id ?? "latest")}`}>{row.track_id}</Link></td>
-                      <td><span className={`plate-badge ${row.plate_text ? "readable" : "empty"}`}>{formatPlate(row)}</span></td>
+                      <td><span className={`plate-badge ${plate.state}`}>{plate.label}</span></td>
                       <td><span className={`table-badge table-badge--class ${classBadgeClass(row.vehicle_class)}`}>{(row.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></td>
                       <td><span className={`table-badge table-badge--colour ${colourBadgeClass(row.colour ?? row.colour_status)}`}>{row.colour ?? row.colour_status ?? "Unavailable"}</span></td>
                       <td>{formatVideoTime(row.first_seen_seconds ?? row.first_seen)}</td>
                       <td>{formatVideoTime(row.last_seen_seconds ?? row.last_seen)}</td>
                       <td>{formatVideoTime(row.duration_seconds)}</td>
                       <td><span className={`table-badge table-badge--status ${statusBadgeClass(row.status)}`}>{row.status ?? "-"}</span></td>
-                    </tr>
-                  ))}
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -593,6 +596,11 @@ function PhysicalVehiclesView({
             {rows.map((vehicle) => {
               const memberTracks = vehicle.member_track_ids ?? [];
               const cameras = vehicle.camera_ids?.length ? vehicle.camera_ids : [vehicle.primary_camera_id ?? "-"];
+              const plate = resolvePlatePresentation({
+                plateText: vehicle.consensus_plate_text,
+                readableMissingLabel: "No readable plate",
+                unreadableLabel: "Plate detected, unreadable",
+              });
               return (
                 <tr key={`${vehicle.run_id ?? "latest"}-${vehicle.vehicle_id}`} className="vehicle-table-row">
                   <td>{vehicle.best_crop_url ? <img src={vehicle.best_crop_url} alt={`${vehicle.vehicle_id} crop`} className="table-thumb" /> : <div className="thumb-placeholder small">No crop</div>}</td>
@@ -605,7 +613,7 @@ function PhysicalVehiclesView({
                   <td><span className="table-badge table-badge--camera">{cameras.join(", ")}</span></td>
                   <td><span className={`table-badge table-badge--class ${classBadgeClass(vehicle.vehicle_class)}`}>{String(vehicle.vehicle_class ?? "UNKNOWN").toUpperCase()}</span></td>
                   <td><span className={`table-badge table-badge--colour ${colourBadgeClass(vehicle.vehicle_colour)}`}>{vehicle.vehicle_colour ?? "Unavailable"}</span></td>
-                  <td><span className={`plate-badge ${vehicle.consensus_plate_text ? "readable" : "empty"}`}>{vehicle.consensus_plate_text ?? "No readable plate"}</span></td>
+                  <td><span className={`plate-badge ${plate.state}`}>{plate.label}</span></td>
                   <td>{formatVideoTime(vehicle.first_seen_seconds)}</td>
                   <td>{formatVideoTime(vehicle.last_seen_seconds)}</td>
                   <td><span className="table-badge table-badge--confidence">{formatScore(vehicle.identity_confidence)}</span></td>

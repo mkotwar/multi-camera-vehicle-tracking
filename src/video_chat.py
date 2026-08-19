@@ -5,6 +5,7 @@ import re
 import time
 from typing import Any, Protocol
 
+from .plate_text import display_plate_text, normalize_plate_text
 from .run_repository import RunRepository
 from .vehicle_analytics import (
     CLASS_COUNT_KEYS,
@@ -30,6 +31,7 @@ SUPPORTED_CHAT_INTENTS = {
     "GENERAL_CHAT",
     "COUNT",
     "LIST",
+    "PLATE_LOOKUP",
     "SUMMARY",
     "GROUP",
     "COMPARE",
@@ -129,6 +131,7 @@ class ChatVehicleQuery:
     limit: int | None = None
     show_evidence: bool = False
     context_reference: str | None = None
+    context_resolution: str | None = None
     evidence_navigation: str | None = None
 
     def __post_init__(self) -> None:
@@ -167,6 +170,8 @@ class ChatVehicleQuery:
                 object.__setattr__(self, "plate_presence", "detected")
         if self.group_by not in {None, "class", "colour", "camera", "run", "run_camera"}:
             raise VehicleQueryParseError(f"Unsupported group_by: {self.group_by}")
+        if self.context_resolution not in {None, "single", "multiple"}:
+            raise VehicleQueryParseError(f"Unsupported context_resolution: {self.context_resolution}")
         if self.evidence_navigation not in {None, "next", "restart"}:
             raise VehicleQueryParseError(f"Unsupported evidence_navigation: {self.evidence_navigation}")
         if self.limit is not None and int(self.limit) < 1:
@@ -222,6 +227,14 @@ def handle_video_chat(
         "run_scope": _build_run_scope(selected_run_ids, repository),
     }
     analytics_result = execute_chat_vehicle_query(records, parsed, context=execution_context) if parsed.intent in ANALYTICS_INTENTS else {}
+    if parsed.intent == "PLATE_LOOKUP":
+        analytics_result = _plate_lookup_result(
+            repository=repository,
+            default_run_id=default_run_id,
+            run_ids=selected_run_ids,
+            parsed=parsed,
+            analytics_result=analytics_result,
+        )
     matching_vehicle_ids = list(analytics_result.get("vehicle_ids", []) or [])
     previous_ids = list(context.get("previous_vehicle_ids", []) or [])
     is_evidence_navigation = parsed.evidence_navigation is not None
@@ -473,6 +486,11 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
     if parsed.intent == "UNIQUE_COLOURS":
         counts = count_by_colour(matched)
         return {"colours_present": [label for label, count in counts.items() if count > 0], "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
+    if parsed.intent == "PLATE_LOOKUP":
+        return {
+            "total": len(matched),
+            "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched],
+        }
     if parsed.intent == "COMPARE":
         left = str((parsed.comparison or {}).get("left") or "").upper()
         right = str((parsed.comparison or {}).get("right") or "").upper()
@@ -550,6 +568,84 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
     }
 
 
+def _plate_lookup_result(
+    *,
+    repository: RunRepository,
+    default_run_id: str,
+    run_ids: list[str],
+    parsed: ChatVehicleQuery,
+    analytics_result: dict[str, Any],
+) -> dict[str, Any]:
+    vehicle_ids = [str(item) for item in list(analytics_result.get("vehicle_ids", []) or [])]
+    if parsed.context_resolution == "single" and len(vehicle_ids) > 1:
+        return {
+            **analytics_result,
+            "ambiguous": True,
+            "plate_rows": [],
+            "candidate_vehicle_ids": vehicle_ids[:5],
+        }
+    rows = [
+        _plate_lookup_row(
+            repository=repository,
+            scoped_vehicle_id=vehicle_id,
+            default_run_id=default_run_id,
+        )
+        for vehicle_id in vehicle_ids
+    ]
+    plate_rows = [row for row in rows if row is not None]
+    readable_count = sum(1 for row in plate_rows if row["plate_readable"])
+    detected_unreadable_count = sum(1 for row in plate_rows if row["plate_detected"] and not row["plate_readable"])
+    no_plate_count = sum(1 for row in plate_rows if not row["plate_detected"])
+    return {
+        **analytics_result,
+        "plate_rows": plate_rows,
+        "total": len(vehicle_ids),
+        "target_total": len(vehicle_ids),
+        "readable_count": readable_count,
+        "detected_unreadable_count": detected_unreadable_count,
+        "no_plate_count": no_plate_count,
+        "run_ids": run_ids,
+    }
+
+
+def _plate_lookup_row(
+    *,
+    repository: RunRepository,
+    scoped_vehicle_id: str,
+    default_run_id: str,
+) -> dict[str, Any] | None:
+    run_id, vehicle_id = _split_scoped_vehicle_id(scoped_vehicle_id, default_run_id=default_run_id)
+    physical_vehicle = _get_physical_vehicle(repository, vehicle_id=vehicle_id, run_id=run_id)
+    if physical_vehicle is not None:
+        evidence = _physical_vehicle_evidence(repository=repository, run_id=run_id, vehicle=physical_vehicle)
+        return {
+            "vehicle_id": vehicle_id,
+            "run_id": run_id,
+            "camera_id": evidence.get("camera_id"),
+            "track_id": evidence.get("track_id"),
+            "plate_text": evidence.get("plate_text"),
+            "plate_detected": bool(evidence.get("plate_detected")),
+            "plate_readable": bool(evidence.get("plate_readable")),
+            "track_detail_url": evidence.get("track_detail_url"),
+        }
+    camera_id, track_id = _split_vehicle_id(vehicle_id)
+    if not camera_id or not track_id:
+        return None
+    track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
+    if track is None:
+        return None
+    return {
+        "vehicle_id": vehicle_id,
+        "run_id": run_id,
+        "camera_id": camera_id,
+        "track_id": track_id,
+        "plate_text": _display_plate_text(track.get("plate_text")),
+        "plate_detected": _plate_detected_value(track),
+        "plate_readable": _plate_readable_value(track),
+        "track_detail_url": f"/tracks/{camera_id}/{track_id}?run_id={run_id}",
+    }
+
+
 def resolve_vehicle_evidence(
     *,
     repository: RunRepository,
@@ -592,7 +688,9 @@ def resolve_vehicle_evidence(
                 "member_track_ids": [str(track.get("local_track_id") or vehicle_id)],
                 "vehicle_class": str(track.get("vehicle_class") or "UNKNOWN").upper(),
                 "colour": str(track.get("colour") or "UNKNOWN").upper(),
-                "plate_text": _clean_plate_text(track.get("plate_text")),
+                "plate_text": _display_plate_text(track.get("plate_text")),
+                "plate_detected": _plate_detected_value(track),
+                "plate_readable": _plate_readable_value(track),
                 "first_seen_seconds": track.get("first_seen_seconds"),
                 "last_seen_seconds": track.get("last_seen_seconds"),
                 "best_crop_url": image_url,
@@ -619,6 +717,7 @@ def _physical_vehicle_evidence(*, repository: RunRepository, run_id: str, vehicl
     track_id = str(_split_vehicle_id(primary_track_id)[1] or primary_track_id or vehicle_id)
     image_url = _physical_vehicle_image_url(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids)
     plate_text = _physical_vehicle_plate_text(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids)
+    plate_detected = _physical_vehicle_plate_detected(repository=repository, run_id=run_id, vehicle=vehicle, member_track_ids=member_track_ids, plate_text=plate_text)
     return {
         "vehicle_id": vehicle_id,
         "run_id": run_id,
@@ -628,6 +727,8 @@ def _physical_vehicle_evidence(*, repository: RunRepository, run_id: str, vehicl
         "vehicle_class": str(vehicle.get("vehicle_class") or vehicle.get("final_class") or "UNKNOWN").upper(),
         "colour": str(vehicle.get("vehicle_colour") or vehicle.get("colour") or "UNKNOWN").upper(),
         "plate_text": plate_text,
+        "plate_detected": plate_detected,
+        "plate_readable": plate_text is not None,
         "first_seen_seconds": vehicle.get("first_seen_seconds") or vehicle.get("first_timestamp_seconds"),
         "last_seen_seconds": vehicle.get("last_seen_seconds") or vehicle.get("last_timestamp_seconds"),
         "best_crop_url": image_url,
@@ -644,7 +745,7 @@ def _physical_vehicle_plate_text(
     member_track_ids: list[str],
 ) -> str | None:
     plate_payload = vehicle.get("plate")
-    consensus = _clean_plate_text(
+    consensus = _display_plate_text(
         vehicle.get("consensus_plate_text")
         or (plate_payload.get("consensus_text") if isinstance(plate_payload, dict) else None)
     )
@@ -653,7 +754,7 @@ def _physical_vehicle_plate_text(
     for item in list(vehicle.get("representative_evidence") or []):
         if not isinstance(item, dict):
             continue
-        plate_text = _clean_plate_text(item.get("plate_text") or item.get("normalized_plate_text"))
+        plate_text = _display_plate_text(item.get("plate_text") or item.get("raw_plate_text") or item.get("normalized_plate_text"))
         if plate_text:
             return plate_text
     for local_track_id in member_track_ids:
@@ -663,15 +764,51 @@ def _physical_vehicle_plate_text(
         track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
         if not track:
             continue
-        plate_text = _clean_plate_text(track.get("plate_text"))
+        plate_text = _display_plate_text(track.get("plate_text"))
         if plate_text:
             return plate_text
     return None
 
 
+def _physical_vehicle_plate_detected(
+    *,
+    repository: RunRepository,
+    run_id: str,
+    vehicle: dict[str, Any],
+    member_track_ids: list[str],
+    plate_text: str | None,
+) -> bool:
+    if plate_text is not None:
+        return True
+    if bool(vehicle.get("plate_detected")):
+        return True
+    plate_payload = vehicle.get("plate")
+    if isinstance(plate_payload, dict) and bool(plate_payload.get("detected")):
+        return True
+    for local_track_id in member_track_ids:
+        camera_id, track_id = _split_vehicle_id(local_track_id)
+        if not camera_id or not track_id:
+            continue
+        track = repository.get_track(camera_id=camera_id, track_id=track_id, run_id=run_id)
+        if track and _plate_detected_value(track):
+            return True
+    return False
+
+
 def _clean_plate_text(value: Any) -> str | None:
-    text = str(value or "").strip().upper()
-    return text or None
+    return normalize_plate_text(value)
+
+
+def _display_plate_text(value: Any) -> str | None:
+    return display_plate_text(value)
+
+
+def _plate_detected_value(item: dict[str, Any]) -> bool:
+    return bool(item.get("plate_detected")) or _clean_plate_text(item.get("plate_text")) is not None
+
+
+def _plate_readable_value(item: dict[str, Any]) -> bool:
+    return _clean_plate_text(item.get("plate_text")) is not None
 
 
 def _physical_vehicle_image_url(
@@ -852,6 +989,31 @@ def format_chat_answer(
         return f"{answer} {analytics_result.get('left')} = {analytics_result.get('left_total')}; {analytics_result.get('right')} = {analytics_result.get('right_total')}."
     if parsed.intent == "FIND_INTERVALS":
         return _format_interval_answer(analytics_result)
+    if parsed.intent == "PLATE_LOOKUP":
+        if analytics_result.get("ambiguous"):
+            candidates = ", ".join(str(item) for item in list(analytics_result.get("candidate_vehicle_ids", []) or []))
+            suffix = f" Matching vehicles: {candidates}." if candidates else ""
+            return f"There are multiple vehicles in the current result. Which vehicle do you mean?{suffix}"
+        rows = list(analytics_result.get("plate_rows", []) or [])
+        if not rows:
+            return "No matching vehicles are available for plate lookup."
+        if parsed.context_resolution == "single" and len(rows) == 1:
+            row = dict(rows[0])
+            if row.get("plate_readable") and row.get("plate_text"):
+                return f"The number plate is {row.get('plate_text')}."
+            if row.get("plate_detected"):
+                return "A plate was detected on this vehicle, but no readable number plate is available."
+            return "No number plate was detected for this vehicle."
+        readable_count = int(analytics_result.get("readable_count", 0) or 0)
+        total = int(analytics_result.get("target_total", len(rows)) or len(rows))
+        detected_unreadable_count = int(analytics_result.get("detected_unreadable_count", 0) or 0)
+        no_plate_count = int(analytics_result.get("no_plate_count", 0) or 0)
+        parts = [f"{readable_count} of the {total} matched vehicles have readable number plates."]
+        if detected_unreadable_count:
+            parts.append(f"{detected_unreadable_count} vehicles have detected but unreadable plates.")
+        if no_plate_count:
+            parts.append(f"{no_plate_count} vehicles do not have a detected plate.")
+        return " ".join(parts)
     if parsed.intent == "GROUP":
         if parsed.group_by in {"camera", "run", "run_camera"}:
             key = {"camera": "by_camera", "run": "by_run", "run_camera": "by_run_camera"}[parsed.group_by]
@@ -1019,6 +1181,18 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     exclude_camera_ids = _parse_excluded_camera_ids(text) or list(previous_filters.get("exclude_camera_ids", []) or [])
     camera_id = include_camera_ids[0] if len(include_camera_ids) == 1 else (_parse_camera_id(text) or previous_filters.get("camera_id"))
     previous_group_by = _normalize_group_by(previous_filters.get("group_by"))
+    contextual_plate_lookup = _parse_contextual_plate_lookup_query(
+        text,
+        context=context,
+        selected_run_ids=list(previous_filters.get("selected_run_ids", []) or []),
+        include_camera_ids=include_camera_ids,
+        plate_presence=plate_presence,
+        plate_detected=plate_detected,
+        plate_readable=plate_readable,
+        plate_text=plate_text,
+    )
+    if contextual_plate_lookup is not None:
+        return contextual_plate_lookup
 
     if _is_show_previous(text) and context.get("previous_vehicle_ids"):
         return ChatVehicleQuery(intent="LIST", show_evidence=True, context_reference="previous_results", evidence_navigation="next")
@@ -1308,11 +1482,96 @@ def _parse_plate_filters(text: str) -> tuple[str | None, bool | None, bool | Non
 
 
 def _parse_plate_text_query(text: str) -> str | None:
-    match = re.search(r"\b(?:plate|number\s+plate|registration)\s+([A-Z0-9-]{4,})\b", text.upper())
-    if not match:
+    explicit_match = re.search(r"\b(?:plate|number\s+plate|registration)\s+([A-Z0-9][A-Z0-9\s-]{3,})\b", text.upper())
+    if explicit_match:
+        token = _registration_like_token(explicit_match.group(1))
+        if token is not None:
+            return token
+    return _extract_registration_like_token(text)
+
+
+def _parse_contextual_plate_lookup_query(
+    text: str,
+    *,
+    context: dict[str, Any],
+    selected_run_ids: list[str],
+    include_camera_ids: list[str],
+    plate_presence: str | None,
+    plate_detected: bool | None,
+    plate_readable: bool | None,
+    plate_text: str | None,
+) -> ChatVehicleQuery | None:
+    if not context.get("previous_vehicle_ids"):
         return None
-    token = _clean_plate_text(match.group(1))
-    if token in {"WITH", "WITHOUT"}:
+    if not _mentions_plate_attribute(text):
+        return None
+    if _parse_plate_text_query(text) is not None:
+        return None
+    resolution = _plate_reference_resolution(text, previous_count=len(list(context.get("previous_vehicle_ids", []) or [])))
+    if resolution is None:
+        return None
+    return ChatVehicleQuery(
+        intent="PLATE_LOOKUP",
+        selected_run_ids=selected_run_ids,
+        include_camera_ids=include_camera_ids,
+        plate_presence=plate_presence if plate_text is None else None,
+        plate_detected=plate_detected if plate_text is None else None,
+        plate_readable=plate_readable if plate_text is None else None,
+        plate_text=None,
+        show_evidence=False,
+        context_reference="previous_results",
+        context_resolution=resolution,
+    )
+
+
+def _mentions_plate_attribute(text: str) -> bool:
+    if not re.search(r"\b(number\s+plate|plates?|registration|registration\s+number)\b", text):
+        return False
+    return bool(
+        re.search(r"\b(what|which|show|give|tell|list)\b", text)
+        or re.search(r"\b(its|their|this|that|these|those|them)\b", text)
+    )
+
+
+def _plate_reference_resolution(text: str, *, previous_count: int) -> str | None:
+    if re.search(r"\b(their|these|those|them|all\s+of\s+these|all\s+of\s+those)\b", text):
+        return "multiple"
+    if re.search(r"\b(its|this\s+vehicle|that\s+vehicle|this\s+car|that\s+car)\b", text):
+        return "single"
+    if previous_count == 1:
+        return "single"
+    if re.search(r"\bwhat\s+is\s+the\s+number\s+plate\b|\bshow\s+me\s+the\s+number\s+plate\b|\bgive\s+me\s+the\s+plates?\b", text):
+        return "single"
+    if re.search(r"\bwhat\s+are\b|\bwhich\s+of\s+(these|those|them)\b", text):
+        return "multiple"
+    return None
+
+
+def _extract_registration_like_token(text: str) -> str | None:
+    candidates: list[str] = []
+    uppercase = text.upper()
+    parts = re.findall(r"[A-Z0-9]+", uppercase)
+    for size in range(1, min(4, len(parts)) + 1):
+        for start in range(0, len(parts) - size + 1):
+            token = _registration_like_token("".join(parts[start : start + size]))
+            if token is not None:
+                candidates.append(token)
+    return candidates[-1] if candidates else None
+
+
+def _registration_like_token(value: str) -> str | None:
+    token = _clean_plate_text(value)
+    if token is None:
+        return None
+    if len(token) < 6 or len(token) > 12:
+        return None
+    if not re.fullmatch(r"[A-Z]{1,3}[A-Z0-9]{3,11}", token):
+        return None
+    if sum(character.isdigit() for character in token) < 2:
+        return None
+    if not re.search(r"[A-Z]", token):
+        return None
+    if any(token.startswith(prefix) for prefix in ("TRACK", "CAM", "RUN", "VEHICLE")):
         return None
     return token
 
@@ -1483,6 +1742,28 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
         if not colours:
             colours = list(previous_filters.get("include_colours", []) or [])
     internal_context_reference = "previous_results" if context_reference == "previous_result" else context_reference
+    if context_reference == "previous_result" and _mentions_plate_attribute(text) and payload.get("plate_text") is None:
+        resolution = _plate_reference_resolution(text, previous_count=len(list(context.get("previous_vehicle_ids", []) or [])))
+        if resolution is not None:
+            return ChatVehicleQuery(
+                intent="PLATE_LOOKUP",
+                subject=str(payload.get("subject") or "vehicles"),
+                run_filter=payload.get("run_filter"),
+                include_classes=classes,
+                exclude_classes=list(payload.get("exclude_classes", []) or []),
+                include_colours=colours,
+                exclude_colours=list(payload.get("exclude_colours", []) or []),
+                plate_presence=payload.get("plate_presence"),
+                plate_detected=payload.get("plate_detected"),
+                plate_readable=payload.get("plate_readable"),
+                plate_text=None,
+                start_time=payload.get("start_time"),
+                end_time=payload.get("end_time"),
+                camera_id=None,
+                show_evidence=False,
+                context_reference=internal_context_reference,
+                context_resolution=resolution,
+            )
     comparison = _comparison_from_llm(payload)
     if str(payload["intent"]).upper() in {"COMPARE", "FIND_INTERVALS"} and comparison is None:
         raise VehicleQueryParseError("invalid_comparison:need_two_classes")
@@ -2367,6 +2648,9 @@ def _apply_run_and_camera_scope(
         include_colours=list(parsed.include_colours),
         exclude_colours=list(parsed.exclude_colours),
         plate_presence=parsed.plate_presence,
+        plate_detected=parsed.plate_detected,
+        plate_readable=parsed.plate_readable,
+        plate_text=parsed.plate_text,
         start_time=parsed.start_time,
         end_time=parsed.end_time,
         camera_id=include_camera_ids[0] if len(include_camera_ids) == 1 else parsed.camera_id,
@@ -2376,6 +2660,7 @@ def _apply_run_and_camera_scope(
         limit=parsed.limit,
         show_evidence=parsed.show_evidence,
         context_reference=parsed.context_reference,
+        context_resolution=parsed.context_resolution,
         evidence_navigation=parsed.evidence_navigation,
     )
 
