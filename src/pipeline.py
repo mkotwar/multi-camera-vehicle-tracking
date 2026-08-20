@@ -44,6 +44,7 @@ LATENCY_PROFILER_WARMUP_FRAMES = 20
 
 _PLATE_CONFLICT_TIME_WINDOW_SECONDS = 2.0
 _PLATE_CONFLICT_SCORE_MARGIN = 0.03
+_PLATE_OWNER_SCORE_MARGIN = 0.05
 
 
 def _normalize_bbox_quality_section(raw_bbox_quality: Any) -> dict[str, Any]:
@@ -2452,6 +2453,7 @@ def _build_plate_ocr_result_rows(enrichment_results: list[Any]) -> list[dict[str
 
 
 def _resolve_plate_association_conflicts(enrichment_results: list[Any]) -> None:
+    _enforce_plate_geometric_ownership(enrichment_results)
     candidates: list[dict[str, Any]] = []
     for result in enrichment_results:
         candidate = _build_plate_assignment_candidate(result)
@@ -2500,6 +2502,57 @@ def _apply_plate_conflict_cluster(cluster: list[dict[str, Any]]) -> None:
         )
 
 
+def _enforce_plate_geometric_ownership(enrichment_results: list[Any]) -> None:
+    frame_owners: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for result in enrichment_results:
+        owner = _build_frame_owner_candidate(result)
+        if owner is None:
+            continue
+        frame_owners.setdefault((owner["camera_id"], owner["frame_number"]), []).append(owner)
+
+    for result in enrichment_results:
+        candidate = _build_plate_assignment_candidate(result)
+        if candidate is None:
+            continue
+        owner_pool = frame_owners.get((candidate["camera_id"], candidate["frame_number"]), [])
+        if not owner_pool:
+            continue
+        scored_owners = []
+        for owner in owner_pool:
+            owner_score = _score_plate_owner(
+                candidate["plate_frame_bbox"],
+                owner["vehicle_bbox"],
+                confidence=candidate["confidence"],
+            )
+            if owner_score is None:
+                continue
+            scored_owners.append(
+                {
+                    "local_track_id": owner["local_track_id"],
+                    "score": owner_score,
+                }
+            )
+        if not scored_owners:
+            _clear_plate_assignment(result, reason="plate_association_rejected:no_geometric_owner")
+            continue
+        ranked = sorted(scored_owners, key=lambda item: item["score"], reverse=True)
+        best_owner = ranked[0]
+        target_owner = next(
+            (item for item in ranked if item["local_track_id"] == candidate["local_track_id"]),
+            None,
+        )
+        if target_owner is None:
+            _clear_plate_assignment(result, reason="plate_association_rejected:target_not_in_owner_pool")
+            continue
+        if best_owner["local_track_id"] != candidate["local_track_id"]:
+            if (best_owner["score"] - target_owner["score"]) >= _PLATE_OWNER_SCORE_MARGIN:
+                _clear_plate_assignment(
+                    result,
+                    reason=f"plate_association_rejected:geometric_owner:{best_owner['local_track_id']}",
+                )
+                continue
+
+
 def _build_plate_assignment_candidate(result: Any) -> dict[str, Any] | None:
     plate_text = str(getattr(result, "plate_text", "") or "").strip().upper()
     plate_bbox = _coerce_bbox(getattr(result, "plate_bbox", None))
@@ -2518,28 +2571,39 @@ def _build_plate_assignment_candidate(result: Any) -> dict[str, Any] | None:
         crop_bbox[0] + plate_bbox[2],
         crop_bbox[1] + plate_bbox[3],
     )
-    containment_ratio = _bbox_intersection_area(plate_frame_bbox, vehicle_bbox) / max(_bbox_area(plate_frame_bbox), 1.0)
-    if containment_ratio <= 0.0:
-        return None
-    vehicle_area = max(_bbox_area(vehicle_bbox), 1.0)
-    plate_area_ratio = min(1.0, _bbox_area(plate_frame_bbox) / (vehicle_area * 0.02))
-    vehicle_center_x = (vehicle_bbox[0] + vehicle_bbox[2]) / 2.0
-    vehicle_center_y = (vehicle_bbox[1] + vehicle_bbox[3]) / 2.0
-    plate_center_x = (plate_frame_bbox[0] + plate_frame_bbox[2]) / 2.0
-    plate_center_y = (plate_frame_bbox[1] + plate_frame_bbox[3]) / 2.0
-    vehicle_width = max(vehicle_bbox[2] - vehicle_bbox[0], 1.0)
-    vehicle_height = max(vehicle_bbox[3] - vehicle_bbox[1], 1.0)
-    normalized_distance = ((abs(plate_center_x - vehicle_center_x) / vehicle_width) ** 2 + (abs(plate_center_y - vehicle_center_y) / vehicle_height) ** 2) ** 0.5
-    center_closeness = max(0.0, 1.0 - min(1.0, normalized_distance))
     confidence = float(getattr(result, "plate_text_confidence", None) or getattr(result, "plate_detection_confidence", None) or 0.0)
-    score = (containment_ratio * 1.5) + (center_closeness * 0.75) + (plate_area_ratio * 0.35) + (confidence * 0.25)
+    owner_score = _score_plate_owner(plate_frame_bbox, vehicle_bbox, confidence=confidence)
+    if owner_score is None:
+        return None
     return {
         "camera_id": str(getattr(result, "camera_id", "") or ""),
         "local_track_id": str(getattr(result, "local_track_id", "") or ""),
         "plate_text": plate_text,
+        "frame_number": int(getattr(evidence_item, "frame_number", -1) or -1),
         "timestamp_seconds": float(getattr(evidence_item, "timestamp_seconds", 0.0) or 0.0),
-        "score": score,
+        "score": owner_score,
+        "confidence": confidence,
+        "vehicle_bbox": vehicle_bbox,
+        "plate_frame_bbox": plate_frame_bbox,
         "result": result,
+    }
+
+
+def _build_frame_owner_candidate(result: Any) -> dict[str, Any] | None:
+    evidence_item = _match_plate_evidence_item(result)
+    if evidence_item is None:
+        return None
+    vehicle_bbox = _coerce_bbox(getattr(evidence_item, "original_bbox_xyxy", None)) or _coerce_bbox(getattr(evidence_item, "bbox_xyxy", None))
+    if vehicle_bbox is None:
+        return None
+    frame_number = int(getattr(evidence_item, "frame_number", -1) or -1)
+    if frame_number < 0:
+        return None
+    return {
+        "camera_id": str(getattr(result, "camera_id", "") or ""),
+        "local_track_id": str(getattr(result, "local_track_id", "") or ""),
+        "frame_number": frame_number,
+        "vehicle_bbox": vehicle_bbox,
     }
 
 
@@ -2602,6 +2666,28 @@ def _bbox_intersection_area(a: tuple[float, float, float, float], b: tuple[float
     if right <= left or bottom <= top:
         return 0.0
     return (right - left) * (bottom - top)
+
+
+def _score_plate_owner(
+    plate_frame_bbox: tuple[float, float, float, float],
+    vehicle_bbox: tuple[float, float, float, float],
+    *,
+    confidence: float,
+) -> float | None:
+    containment_ratio = _bbox_intersection_area(plate_frame_bbox, vehicle_bbox) / max(_bbox_area(plate_frame_bbox), 1.0)
+    if containment_ratio <= 0.0:
+        return None
+    vehicle_area = max(_bbox_area(vehicle_bbox), 1.0)
+    plate_area_ratio = min(1.0, _bbox_area(plate_frame_bbox) / (vehicle_area * 0.02))
+    vehicle_center_x = (vehicle_bbox[0] + vehicle_bbox[2]) / 2.0
+    vehicle_center_y = (vehicle_bbox[1] + vehicle_bbox[3]) / 2.0
+    plate_center_x = (plate_frame_bbox[0] + plate_frame_bbox[2]) / 2.0
+    plate_center_y = (plate_frame_bbox[1] + plate_frame_bbox[3]) / 2.0
+    vehicle_width = max(vehicle_bbox[2] - vehicle_bbox[0], 1.0)
+    vehicle_height = max(vehicle_bbox[3] - vehicle_bbox[1], 1.0)
+    normalized_distance = ((abs(plate_center_x - vehicle_center_x) / vehicle_width) ** 2 + (abs(plate_center_y - vehicle_center_y) / vehicle_height) ** 2) ** 0.5
+    center_closeness = max(0.0, 1.0 - min(1.0, normalized_distance))
+    return (containment_ratio * 1.5) + (center_closeness * 0.75) + (plate_area_ratio * 0.35) + (confidence * 0.25)
 
 
 def _write_current_vs_ocr_mukul_artifacts(run_directory: Path, enrichment_results: list[Any]) -> None:

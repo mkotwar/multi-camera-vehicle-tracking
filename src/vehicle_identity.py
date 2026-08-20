@@ -287,7 +287,8 @@ def _plate_reliability(
 ) -> tuple[float, str]:
     if not detected or not normalized or len(normalized) < int(config.get("minimum_text_length", 6)):
         return 0.0, "UNUSABLE"
-    if reason and reason not in {"ocr_completed", "completed"}:
+    normalized_reason = str(reason or "").strip().lower()
+    if normalized_reason and normalized_reason not in {"ocr_completed", "completed"} and not normalized_reason.startswith("validated_"):
         return 0.15, "LOW"
     det = float(det_conf or 0.0)
     ocr = float(ocr_conf if ocr_conf is not None else det)
@@ -308,11 +309,17 @@ def _apply_plate_to_pair(row: dict[str, Any], consensus: dict[str, PlateConsensu
     relation = _plate_relation(a, b, plate_config)
     base_score = float(out.get("score", 0.0) or 0.0)
     evidence = relation["plate_evidence"]
+    blocked_override = _plate_override_blocked(out)
+    if evidence == "STRONG_POSITIVE" and blocked_override:
+        relation = dict(relation)
+        relation["plate_evidence"] = "GEOMETRY_BLOCKED_PLATE_MATCH"
+        relation["plate_contribution"] = 0.0
+        relation["plate_reason_code"] = "GEOMETRY_BLOCKED_PLATE_MATCH"
     if evidence == "STRONG_NEGATIVE" and bool(plate_config.get("contradiction_veto", True)):
         out["rejected"] = True
         out["rejection_reason"] = "REJECTED_BY_PLATE_CONTRADICTION"
         out["score"] = 0.0
-    elif evidence == "STRONG_POSITIVE":
+    elif evidence == "STRONG_POSITIVE" and not blocked_override:
         out["rejected"] = False
         out["rejection_reason"] = ""
         out["score"] = round(max(base_score, float(plate_config.get("exact_match_override_threshold", 0.64))) + float(plate_config.get("exact_match_bonus", 0.34)), 6)
@@ -329,6 +336,20 @@ def _apply_plate_to_pair(row: dict[str, Any], consensus: dict[str, PlateConsensu
     out["track_b_plate_quality"] = b.reliability_label if b else "UNUSABLE"
     out["plate_score"] = round(max(0.0, min(1.0, (float(relation["plate_contribution"]) + 1.0) / 2.0)), 6)
     return out
+
+
+def _plate_override_blocked(row: dict[str, Any]) -> bool:
+    if bool(row.get("impossible_geometry")):
+        return True
+    if not _bool(row.get("rejected")):
+        return False
+    reason = str(row.get("rejection_reason") or "")
+    return reason in {
+        "different_camera",
+        "reliable_class_conflict",
+        "simultaneous_occupancy_conflict",
+        "overlap_not_same_object",
+    }
 
 
 def _plate_relation(a: PlateConsensus | None, b: PlateConsensus | None, config: dict[str, Any]) -> dict[str, Any]:

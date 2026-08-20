@@ -1526,6 +1526,7 @@ def test_video_chat_plate_search_supports_exact_prefix_suffix_and_contains() -> 
     natural_prefix = handle_video_chat(message="find all the vehicles whose number plate have HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
     natural_prefix_with = handle_video_chat(message="find all vehicles with plate HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
     prefix = handle_video_chat(message="find plates starting with HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    prefix_start_from = handle_video_chat(message="show me the vehicles where the number plate start from HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
     suffix = handle_video_chat(message="find all number plates ending with 62", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
     contains = handle_video_chat(message="find plates containing 84AT", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
     contains_digits = handle_video_chat(message="show vehicles whose number plate contains 590", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
@@ -1546,6 +1547,9 @@ def test_video_chat_plate_search_supports_exact_prefix_suffix_and_contains() -> 
     assert prefix["parsed_query"]["plate_match_mode"] == "prefix"
     assert prefix["matching_vehicle_ids"] == ["VEHICLE_007"]
     assert prefix["answer"].startswith("1 vehicle with plates starting with HR was observed.")
+    assert prefix_start_from["parsed_query"]["plate_match_mode"] == "prefix"
+    assert prefix_start_from["parsed_query"]["plate_text"] == "HR"
+    assert prefix_start_from["matching_vehicle_ids"] == ["VEHICLE_007"]
     assert suffix["parsed_query"]["plate_match_mode"] == "suffix"
     assert suffix["matching_vehicle_ids"] == ["VEHICLE_008"]
     assert suffix["answer"].startswith("1 vehicle with plates ending with 62 was observed.")

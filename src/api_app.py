@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 from dataclasses import asdict
@@ -60,6 +64,26 @@ class PipelineRunStartRequest(BaseModel):
 
 class DbAutoImportRequest(BaseModel):
     enabled: bool
+
+
+APP_START_TIME_EPOCH = time.time()
+PLANNER_VERSION = "analytics_plan_v2"
+
+
+def _git_commit_short(project_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(project_root),
+            timeout=5,
+        )
+    except Exception:
+        return None
+    value = completed.stdout.strip()
+    return value or None
 
 
 def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | Path = "config", env_path: str | Path | None = None) -> Any:
@@ -253,11 +277,42 @@ def create_app(*, outputs_root: str | Path = "outputs/runs", config_dir: str | P
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         current_run = runtime_state.get_current_run()
+        runtime_info = {
+            "pid": os.getpid(),
+            "python_executable": sys.executable,
+            "working_directory": str(Path.cwd()),
+            "backend_start_time_epoch": APP_START_TIME_EPOCH,
+            "planner_version": PLANNER_VERSION,
+            "git_commit_short": _git_commit_short(project_root),
+            "data_source": os.environ.get("DATA_SOURCE"),
+            "repository_class": repository.__class__.__name__,
+            "llm_provider_class": chat_llm_provider.__class__.__name__ if chat_llm_provider is not None else None,
+            "llm_model": getattr(chat_llm_provider, "model", None) if chat_llm_provider is not None else None,
+            "module_paths": {
+                "src.video_chat": str(Path(inspect.getfile(handle_video_chat)).resolve()),
+                "src.ollama_qwen_provider": str(Path(inspect.getfile(build_chat_llm_provider_from_env)).resolve()),
+            },
+        }
+        try:
+            from .video_chat_plan import AnalyticsPlan
+            from .video_chat_execution import compile_analytics_plan
+            from .video_chat_plan_validation import normalize_analytics_plan_payload
+
+            runtime_info["module_paths"].update(
+                {
+                    "src.video_chat_plan": str(Path(inspect.getfile(AnalyticsPlan)).resolve()),
+                    "src.video_chat_execution": str(Path(inspect.getfile(compile_analytics_plan)).resolve()),
+                    "src.video_chat_plan_validation": str(Path(inspect.getfile(normalize_analytics_plan_payload)).resolve()),
+                }
+            )
+        except Exception:
+            pass
         return {
             "status": "ok",
             "pipeline_status": current_run.get("pipeline_status"),
             "run_id": current_run.get("run_id"),
             "run_directory": current_run.get("run_directory"),
+            "runtime": runtime_info,
         }
 
     @app.get("/api/cameras")

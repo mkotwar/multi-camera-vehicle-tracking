@@ -1,8 +1,9 @@
 import type { ChatMessage, PersistedVideoChatSession } from "../types/videoChat";
 
-const ACTIVE_RUN_KEY = "video-chat.active-run-id.v1";
-const ACTIVE_RUNS_KEY = "video-chat.active-run-ids.v1";
-const SESSIONS_BY_RUN_KEY = "video-chat.sessions-by-run.v1";
+const SESSION_STORAGE_VERSION = 2;
+const ACTIVE_RUN_KEY = "video-chat.active-run-id.v2";
+const ACTIVE_RUNS_KEY = "video-chat.active-run-ids.v2";
+const SESSIONS_BY_RUN_KEY = "video-chat.sessions-by-run.v2";
 
 export function scopeKeyForRunIds(runIds: string[]): string {
   const cleaned = runIds.map((item) => item.trim()).filter(Boolean);
@@ -13,7 +14,7 @@ export function createVideoChatSession(runId: string, runIds?: string[]): Persis
   const now = new Date().toISOString();
   const scopedRunIds = runIds?.length ? runIds : [runId];
   return {
-    version: 1,
+    version: SESSION_STORAGE_VERSION,
     session_id: `video-chat-${scopeKeyForRunIds(scopedRunIds)}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     run_id: runId,
     run_ids: scopedRunIds,
@@ -119,7 +120,7 @@ function canUseLocalStorage() {
 function isPersistedVideoChatSession(value: unknown): value is PersistedVideoChatSession {
   if (!value || typeof value !== "object") return false;
   const session = value as Partial<PersistedVideoChatSession>;
-  if (session.version !== 1) return false;
+  if (session.version !== SESSION_STORAGE_VERSION) return false;
   if (typeof session.session_id !== "string" || !session.session_id.trim()) return false;
   if (typeof session.run_id !== "string" || !session.run_id.trim()) return false;
   if (session.run_ids !== undefined && (!Array.isArray(session.run_ids) || !session.run_ids.every((item) => typeof item === "string" && item.trim()))) return false;

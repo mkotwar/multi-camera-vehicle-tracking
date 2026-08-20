@@ -2697,6 +2697,8 @@ def _parse_plate_search_filter(text: str) -> tuple[str | None, str | None]:
         r"\b(?:find|show|count)\s+(?:all\s+)?(?:the\s+)?vehicles?\s+whose\s+(?:number\s+plate|plate|registration(?:\s+number)?)\s+(?:have|has|is|are)\s+([a-z0-9 -]+)\b|"
         r"\b(?:find|show|count)\s+(?:all\s+)?vehicles?\s+with\s+(?:number\s+plate|plate|registration(?:\s+number)?)\s+([a-z0-9 -]+)\b|"
         r"\b(?:plates?|number\s+plates?|registrations?)\s+(?:starting|starts|beginning)\s+with\s+([a-z0-9 -]+)\b|"
+        r"\b(?:plates?|number\s+plates?|registrations?)\s+(?:start|starts|starting|beginning)\s+from\s+([a-z0-9 -]+)\b|"
+        r"\b(?:number\s+plate|plate|registration(?:\s+number)?)\s+(?:start|starts|starting|beginning)\s+from\s+([a-z0-9 -]+)\b|"
         r"\b(?:find|show)\s+all\s+readable\s+plates?\s+from\s+([a-z0-9 -]+)\b|"
         r"\b(?:find|show|count|how\s+many)\s+all\s+([a-z0-9 -]+?)\s+(?:number\s+plates?|plates?)\b|"
         r"\b(?:find|show|count|how\s+many)\s+([a-z0-9 -]+)\s+plates\b|"

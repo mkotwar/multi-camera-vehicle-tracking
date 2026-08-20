@@ -449,16 +449,7 @@ class VehicleDetectorTracker:
         if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
             return self._infer_ocr_mukul_result(packet)
         try:
-            return self._model.predict(
-                source=packet.frame,
-                conf=self.confidence_threshold,
-                iou=self.iou_threshold,
-                imgsz=self.image_size,
-                device=self.runtime_device_info.yolo_device,
-                quantize=self.runtime_device_info.yolo_quantize,
-                agnostic_nms=self.agnostic_nms,
-                verbose=False,
-            )[0]
+            return self._predict_yolo(source=packet.frame, include_iou=True, agnostic_nms=self.agnostic_nms)[0]
         except Exception as exc:
             self._record_inference_error([packet], exc, error_label="Inference failed")
             raise
@@ -468,34 +459,11 @@ class VehicleDetectorTracker:
         try:
             if self.detection_backend == DETECTION_BACKEND_OCR_MUKUL:
                 if callable(self._model):
-                    results = self._model(
-                        frames,
-                        conf=self.confidence_threshold,
-                        imgsz=self.image_size,
-                        device=self.runtime_device_info.yolo_device,
-                        quantize=self.runtime_device_info.yolo_quantize,
-                        verbose=False,
-                    )
+                    results = self._invoke_model_callable(frames)
                 else:
-                    results = self._model.predict(
-                        source=frames,
-                        conf=self.confidence_threshold,
-                        imgsz=self.image_size,
-                        device=self.runtime_device_info.yolo_device,
-                        quantize=self.runtime_device_info.yolo_quantize,
-                        verbose=False,
-                    )
+                    results = self._predict_yolo(source=frames)
             else:
-                results = self._model.predict(
-                    source=frames,
-                    conf=self.confidence_threshold,
-                    iou=self.iou_threshold,
-                    imgsz=self.image_size,
-                    device=self.runtime_device_info.yolo_device,
-                    quantize=self.runtime_device_info.yolo_quantize,
-                    agnostic_nms=self.agnostic_nms,
-                    verbose=False,
-                )
+                results = self._predict_yolo(source=frames, include_iou=True, agnostic_nms=self.agnostic_nms)
         except Exception as exc:
             self._record_inference_error(packets, exc, error_label="Batched inference failed")
             raise
@@ -1152,22 +1120,8 @@ class VehicleDetectorTracker:
     def _infer_ocr_mukul_result(self, packet: FramePacket) -> Any:
         try:
             if callable(self._model):
-                return self._model(
-                    packet.frame,
-                    conf=self.confidence_threshold,
-                    imgsz=self.image_size,
-                    device=self.runtime_device_info.yolo_device,
-                    quantize=self.runtime_device_info.yolo_quantize,
-                    verbose=False,
-                )[0]
-            return self._model.predict(
-                source=packet.frame,
-                conf=self.confidence_threshold,
-                imgsz=self.image_size,
-                device=self.runtime_device_info.yolo_device,
-                quantize=self.runtime_device_info.yolo_quantize,
-                verbose=False,
-            )[0]
+                return self._invoke_model_callable(packet.frame)[0]
+            return self._predict_yolo(source=packet.frame)[0]
         except Exception as exc:
             self._metrics["inference_errors"].append(
                 {
@@ -1187,6 +1141,50 @@ class VehicleDetectorTracker:
                 exc,
             )
             raise
+
+    def _predict_yolo(self, *, source: Any, include_iou: bool = False, agnostic_nms: bool = False) -> Any:
+        kwargs = self._yolo_predict_kwargs(include_iou=include_iou, agnostic_nms=agnostic_nms)
+        return self._call_yolo_predict(source=source, kwargs=kwargs)
+
+    def _invoke_model_callable(self, source: Any) -> Any:
+        kwargs = self._yolo_predict_kwargs(include_iou=False, agnostic_nms=False)
+        try:
+            return self._model(source, **kwargs)
+        except (SyntaxError, TypeError) as exc:
+            if not self._quantize_argument_rejected(exc):
+                raise
+            kwargs.pop("quantize", None)
+            return self._model(source, **kwargs)
+
+    def _call_yolo_predict(self, *, source: Any, kwargs: dict[str, Any]) -> Any:
+        try:
+            return self._model.predict(source=source, **kwargs)
+        except (SyntaxError, TypeError) as exc:
+            if not self._quantize_argument_rejected(exc):
+                raise
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("quantize", None)
+            return self._model.predict(source=source, **retry_kwargs)
+
+    def _yolo_predict_kwargs(self, *, include_iou: bool, agnostic_nms: bool) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "conf": self.confidence_threshold,
+            "imgsz": self.image_size,
+            "device": self.runtime_device_info.yolo_device,
+            "verbose": False,
+        }
+        if include_iou:
+            kwargs["iou"] = self.iou_threshold
+            kwargs["agnostic_nms"] = agnostic_nms
+        quantize = self.runtime_device_info.yolo_quantize
+        if quantize is not None:
+            kwargs["quantize"] = quantize
+        return kwargs
+
+    @staticmethod
+    def _quantize_argument_rejected(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "quantize" in message and "not a valid yolo argument" in message
 
     def _convert_ocr_mukul_result(self, result: Any) -> list[Detection]:
         detections = self._convert_yolo_result(result)

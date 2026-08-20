@@ -58,3 +58,5 @@ node_modules/
 frontend/dist/
 frontend/coverage/
 *.tsbuildinfo
+
+tmp/

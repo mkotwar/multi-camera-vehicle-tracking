@@ -26,6 +26,8 @@ DEFAULT_CONFIG = {
     "ambiguous_vehicle_delta": 0.04,
     "overlap_duplicate_min_iou": 0.15,
     "overlap_duplicate_min_spatial_score": 0.52,
+    "overlap_distinct_max_iou": 0.20,
+    "overlap_distinct_min_normalized_center_distance": 0.55,
     "acceptance_threshold": 0.80,
     "ambiguity_margin": 0.08,
     "weights": {
@@ -129,6 +131,7 @@ class TrackletFeature:
     evidence_quality: float
     median_step_pixels: float
     normalized_displacement: float
+    frame_bboxes: list[dict[str, Any]]
 
 
 def run_vehicle_identity_experiment(run_dir: str | Path, *, output_dir: str | Path | None = None) -> dict[str, Any]:
@@ -273,6 +276,13 @@ def _build_feature(
         evidence_quality=quality,
         median_step_pixels=median_step,
         normalized_displacement=normalized_displacement,
+        frame_bboxes=[
+            {
+                "frame_number": int(row["frame_number"]),
+                "bbox": box,
+            }
+            for row, box in zip(rows, boxes)
+        ],
     )
 
 
@@ -298,8 +308,12 @@ def _score_pair(a: TrackletFeature, b: TrackletFeature, config: dict[str, Any]) 
         rejected, rejection_reason = True, "spatial_jump_too_large"
     overlap_iou = _iou(old.end_bbox, new.start_bbox) if overlap_frames > 0 else 0.0
     duplicate_decision = ""
+    simultaneous_metrics = _simultaneous_overlap_metrics(old, new, config)
     if overlap_frames > 0:
-        if overlap_iou >= float(config["overlap_duplicate_min_iou"]) or spatial_distance <= max_distance * float(config["overlap_duplicate_min_spatial_score"]):
+        if simultaneous_metrics["conflict"]:
+            rejected, rejection_reason = True, "simultaneous_occupancy_conflict"
+            duplicate_decision = "DUPLICATE_OVERLAP_REJECT"
+        elif overlap_iou >= float(config["overlap_duplicate_min_iou"]) or spatial_distance <= max_distance * float(config["overlap_duplicate_min_spatial_score"]):
             duplicate_decision = "DUPLICATE_OVERLAP_ACCEPT"
         elif not rejected:
             rejected, rejection_reason = True, "overlap_not_same_object"
@@ -335,6 +349,9 @@ def _score_pair(a: TrackletFeature, b: TrackletFeature, config: dict[str, Any]) 
         "overlap_frames": overlap_frames,
         "spatial_distance": round(spatial_distance, 6),
         "overlap_iou": round(overlap_iou, 6),
+        "overlap_distinct_frame_count": int(simultaneous_metrics["distinct_frame_count"]),
+        "overlap_median_iou": round(simultaneous_metrics["median_iou"], 6),
+        "overlap_median_normalized_center_distance": round(simultaneous_metrics["median_normalized_center_distance"], 6),
         "duplicate_overlap_decision": duplicate_decision,
         "appearance_quality": round(appearance_quality, 6),
         **{f"{key}_score": round(value, 6) for key, value in components.items()},
@@ -695,6 +712,42 @@ def _iou(a: list[float], b: list[float]) -> float:
     aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
     bb = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
     return inter / (aa + bb - inter) if aa + bb - inter > 0 else 0.0
+
+
+def _simultaneous_overlap_metrics(a: TrackletFeature, b: TrackletFeature, config: dict[str, Any]) -> dict[str, Any]:
+    frame_map_a = {int(item["frame_number"]): list(item["bbox"]) for item in a.frame_bboxes}
+    frame_map_b = {int(item["frame_number"]): list(item["bbox"]) for item in b.frame_bboxes}
+    shared_frames = sorted(set(frame_map_a) & set(frame_map_b))
+    if not shared_frames:
+        return {
+            "conflict": False,
+            "distinct_frame_count": 0,
+            "median_iou": 0.0,
+            "median_normalized_center_distance": 0.0,
+        }
+    ious: list[float] = []
+    normalized_distances: list[float] = []
+    distinct_frames = 0
+    for frame_number in shared_frames:
+        box_a = frame_map_a[frame_number]
+        box_b = frame_map_b[frame_number]
+        iou = _iou(box_a, box_b)
+        center_distance = _distance(_center(box_a), _center(box_b))
+        diag_a = math.hypot(box_a[2] - box_a[0], box_a[3] - box_a[1])
+        diag_b = math.hypot(box_b[2] - box_b[0], box_b[3] - box_b[1])
+        normalized_distance = center_distance / max((diag_a + diag_b) / 2.0, 1.0)
+        ious.append(iou)
+        normalized_distances.append(normalized_distance)
+        if iou <= float(config["overlap_distinct_max_iou"]) and normalized_distance >= float(config["overlap_distinct_min_normalized_center_distance"]):
+            distinct_frames += 1
+    median_iou = float(np.median(np.asarray(ious, dtype=np.float64))) if ious else 0.0
+    median_normalized_distance = float(np.median(np.asarray(normalized_distances, dtype=np.float64))) if normalized_distances else 0.0
+    return {
+        "conflict": distinct_frames > 0 and median_iou <= float(config["overlap_distinct_max_iou"]) and median_normalized_distance >= float(config["overlap_distinct_min_normalized_center_distance"]),
+        "distinct_frame_count": distinct_frames,
+        "median_iou": median_iou,
+        "median_normalized_center_distance": median_normalized_distance,
+    }
 
 
 def _pairs(group: list[str]) -> list[tuple[str, str]]:

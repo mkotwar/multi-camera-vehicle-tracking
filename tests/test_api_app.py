@@ -956,7 +956,13 @@ def test_api_health_tracks_and_latest_regression(tmp_path: Path) -> None:
 
     health_response = client.get("/api/health")
     assert health_response.status_code == 200
-    assert health_response.json()["status"] == "ok"
+    payload = health_response.json()
+    assert payload["status"] == "ok"
+    assert payload["runtime"]["planner_version"] == "analytics_plan_v2"
+    assert payload["runtime"]["module_paths"]["src.video_chat"].endswith("src\\video_chat.py")
+    assert payload["runtime"]["module_paths"]["src.video_chat_plan"].endswith("src\\video_chat_plan.py")
+    assert payload["runtime"]["module_paths"]["src.video_chat_execution"].endswith("src\\video_chat_execution.py")
+    assert payload["runtime"]["module_paths"]["src.video_chat_plan_validation"].endswith("src\\video_chat_plan_validation.py")
 
     tracks_response = client.get("/api/tracks", params={"run_id": run_id})
     assert tracks_response.status_code == 200

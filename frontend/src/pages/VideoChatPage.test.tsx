@@ -715,8 +715,8 @@ describe("VideoChatPage", () => {
   });
 
   it("loads safely with malformed persisted state", async () => {
-    window.localStorage.setItem("video-chat.active-run-id.v1", "broken-run");
-    window.localStorage.setItem("video-chat.sessions-by-run.v1", "{not-json");
+    window.localStorage.setItem("video-chat.active-run-id.v2", "broken-run");
+    window.localStorage.setItem("video-chat.sessions-by-run.v2", "{not-json");
 
     render(
       <MemoryRouter>
@@ -736,10 +736,10 @@ describe("VideoChatPage", () => {
       { run_id: "RUN_B", status: "COMPLETED", track_count: 3, camera_count: 1, duration_seconds: 4 },
       { run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 },
     ]);
-    window.localStorage.setItem("video-chat.active-run-id.v1", "RUN_A");
-    window.localStorage.setItem("video-chat.sessions-by-run.v1", JSON.stringify({
+    window.localStorage.setItem("video-chat.active-run-id.v2", "RUN_A");
+    window.localStorage.setItem("video-chat.sessions-by-run.v2", JSON.stringify({
       RUN_A: {
-        version: 1,
+        version: 2,
         session_id: "persisted-run-a",
         run_id: "RUN_A",
         created_at: "2026-08-13T00:00:00.000Z",
@@ -837,7 +837,7 @@ describe("VideoChatPage", () => {
   it("does not overwrite existing run history with an initial empty state", async () => {
     fetchRuns.mockResolvedValue([{ run_id: "RUN_A", status: "COMPLETED", track_count: 8, camera_count: 1, duration_seconds: 10 }]);
     const storedSession = {
-      version: 1,
+      version: 2,
       session_id: "stored-run-a",
       run_id: "RUN_A",
       created_at: "2026-08-13T00:00:00.000Z",
@@ -854,7 +854,7 @@ describe("VideoChatPage", () => {
         } },
       ],
     };
-    window.localStorage.setItem("video-chat.sessions-by-run.v1", JSON.stringify({ RUN_A: storedSession }));
+    window.localStorage.setItem("video-chat.sessions-by-run.v2", JSON.stringify({ RUN_A: storedSession }));
 
     render(
       <MemoryRouter>
@@ -866,7 +866,7 @@ describe("VideoChatPage", () => {
     const history = screen.getByLabelText("Video analytics chat history");
     expect(within(history).getByText("First stored question")).toBeInTheDocument();
     expect(within(history).getAllByText("First stored answer").length).toBeGreaterThan(0);
-    const persisted = JSON.parse(window.localStorage.getItem("video-chat.sessions-by-run.v1") || "{}");
+    const persisted = JSON.parse(window.localStorage.getItem("video-chat.sessions-by-run.v2") || "{}");
     expect(persisted.RUN_A.messages).toHaveLength(2);
   });
 
@@ -925,11 +925,11 @@ describe("VideoChatPage", () => {
     fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "Show vehicles" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await screen.findByText("Track: TRACK_5");
-    const beforeSelection = window.localStorage.getItem("video-chat.sessions-by-run.v1");
+    const beforeSelection = window.localStorage.getItem("video-chat.sessions-by-run.v2");
 
     fireEvent.click(screen.getByRole("button", { name: "View Track" }));
     expect(await screen.findByText("CAM_001:TRACK_5")).toBeInTheDocument();
-    expect(window.localStorage.getItem("video-chat.sessions-by-run.v1")).toEqual(beforeSelection);
+    expect(window.localStorage.getItem("video-chat.sessions-by-run.v2")).toEqual(beforeSelection);
   });
 
   it("restores messages with evidence cards after remount", async () => {
@@ -1231,9 +1231,9 @@ describe("VideoChatPage", () => {
     openRunSelector();
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     expectSelectedRuns([]);
-    expect(JSON.parse(window.localStorage.getItem("video-chat.active-run-ids.v1") || "null")).toEqual([]);
+    expect(JSON.parse(window.localStorage.getItem("video-chat.active-run-ids.v2") || "null")).toEqual([]);
     expect(screen.getAllByText("No runs selected").length).toBeGreaterThan(0);
-    expect(window.localStorage.getItem("video-chat.active-run-id.v1")).toBeNull();
+    expect(window.localStorage.getItem("video-chat.active-run-id.v2")).toBeNull();
   });
 
   it("renders structured run and camera summary cards instead of a flattened text dump", async () => {

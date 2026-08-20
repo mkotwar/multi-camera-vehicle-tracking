@@ -9,10 +9,24 @@ from src.stationary_recovery_experiment import (
     _score_recovery_pair,
     _stationary_confidence,
 )
+from src.vehicle_identity import _apply_plate_to_pair as _apply_production_plate_to_pair
 from src.vehicle_identity_experiment import DEFAULT_CONFIG, TrackletFeature, _build_vehicles, _score_pair
 
 
 def _feature(track_id: str, *, camera: str = "CAM_001", cls: str = "CAR", first: int = 0, last: int = 10, center=(100.0, 100.0), motion=5.0) -> TrackletFeature:
+    start_box = [center[0] - 20, center[1] - 10, center[0] + 20, center[1] + 10]
+    end_box = [center[0] - 20 + motion, center[1] - 10, center[0] + 20 + motion, center[1] + 10]
+    frame_bboxes = []
+    span = max(last - first, 1)
+    for frame_number in range(first, last + 1):
+        progress = (frame_number - first) / span
+        x_offset = motion * progress
+        frame_bboxes.append(
+            {
+                "frame_number": frame_number,
+                "bbox": [start_box[0] + x_offset, start_box[1], start_box[2] + x_offset, start_box[3]],
+            }
+        )
     return TrackletFeature(
         camera_id=camera,
         local_track_id=track_id,
@@ -27,8 +41,8 @@ def _feature(track_id: str, *, camera: str = "CAM_001", cls: str = "CAR", first:
         final_class=cls,
         class_distribution={cls: last - first + 1},
         colour="UNKNOWN",
-        start_bbox=[center[0] - 20, center[1] - 10, center[0] + 20, center[1] + 10],
-        end_bbox=[center[0] - 20 + motion, center[1] - 10, center[0] + 20 + motion, center[1] + 10],
+        start_bbox=start_box,
+        end_bbox=end_box,
         start_center=[center[0], center[1]],
         end_center=[center[0] + motion, center[1]],
         mean_center=[center[0] + motion / 2.0, center[1]],
@@ -43,6 +57,7 @@ def _feature(track_id: str, *, camera: str = "CAM_001", cls: str = "CAR", first:
         evidence_quality=0.0,
         median_step_pixels=0.0,
         normalized_displacement=0.0,
+        frame_bboxes=frame_bboxes,
     )
 
 
@@ -64,6 +79,15 @@ def test_overlap_duplicate_pair_can_be_scored_not_rejected() -> None:
     assert row["rejected"] is False
 
 
+def test_overlap_duplicate_pair_rejects_simultaneous_distinct_occupancy() -> None:
+    a = _feature("CAM_001:TRACK_1", cls="CAR", first=10, last=30, center=(100.0, 100.0), motion=0.0)
+    b = _feature("CAM_001:TRACK_2", cls="CAR", first=20, last=40, center=(230.0, 100.0), motion=0.0)
+    row = _score_pair(a, b, DEFAULT_CONFIG)
+    assert row["association_mode"] == "DUPLICATE_OVERLAP"
+    assert row["rejected"] is True
+    assert row["rejection_reason"] == "simultaneous_occupancy_conflict"
+
+
 def test_ambiguity_margin_prevents_forced_merge() -> None:
     a = _feature("CAM_001:TRACK_1", first=0, last=10)
     c = _feature("CAM_001:TRACK_3", first=0, last=10)
@@ -81,6 +105,27 @@ def test_deterministic_vehicle_ids_for_accepted_pair() -> None:
     mapping, _decisions = _build_vehicles([b, a], pairs, DEFAULT_CONFIG)
     assert mapping["CAM_001:TRACK_1"] == "VEHICLE_001"
     assert mapping["CAM_001:TRACK_2"] == "VEHICLE_001"
+
+
+def test_production_plate_assistance_cannot_override_reliable_class_conflict() -> None:
+    row = {
+        "score": 0.0,
+        "rejected": True,
+        "rejection_reason": "reliable_class_conflict",
+        "track_a": "CAM_001:TRACK_1",
+        "track_b": "CAM_001:TRACK_2",
+    }
+    consensus = {
+        "CAM_001:TRACK_1": type("Plate", (), {"normalized_plate_text": "HR38AD4296", "reliability_label": "HIGH"})(),
+        "CAM_001:TRACK_2": type("Plate", (), {"normalized_plate_text": "HR38AD4296", "reliability_label": "HIGH"})(),
+    }
+    config = {"plate_assistance": {"exact_match_override_threshold": 0.64, "exact_match_bonus": 0.34, "partial_match_bonus": 0.18, "contradiction_penalty": 0.40, "contradiction_veto": True}}
+
+    updated = _apply_production_plate_to_pair(row, consensus, config)
+
+    assert updated["rejected"] is True
+    assert updated["rejection_reason"] == "reliable_class_conflict"
+    assert updated["plate_reason_code"] == "GEOMETRY_BLOCKED_PLATE_MATCH"
 
 
 def _group(vehicle_id: str, *, first: int = 0, last: int = 30, center=(100.0, 100.0), size=(120.0, 80.0), stationary=0.9, cls="CAR") -> VehicleGroupFeature:

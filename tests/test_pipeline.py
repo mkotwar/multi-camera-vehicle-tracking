@@ -34,6 +34,7 @@ def _plate_result(
     plate_bbox: tuple[float, float, float, float],
     plate_text: str = "HR38AD4296",
     plate_text_confidence: float = 0.75,
+    frame_number: int = 171,
 ):
     evidence_item = SimpleNamespace(
         vehicle_crop_path=f"D:/project/multi-camera-vehicle-tracking/outputs/runs/test/{vehicle_crop_name}.jpg",
@@ -41,26 +42,28 @@ def _plate_result(
         bbox_xyxy=vehicle_bbox,
         expanded_crop_bbox_xyxy=crop_bbox,
         timestamp_seconds=timestamp_seconds,
+        frame_number=frame_number,
     )
+    plate_detected = plate_text is not None
     return SimpleNamespace(
         local_track_id=local_track_id,
         camera_id="CAM_001",
-        plate_detected=True,
-        plate_readable=True,
+        plate_detected=plate_detected,
+        plate_readable=plate_detected,
         plate_text=plate_text,
         plate_raw_text=plate_text,
         plate_normalized_text=plate_text,
-        plate_validation_status="valid",
-        plate_validation_reason="validated_standard_state_registration",
-        plate_format_type="standard_private",
-        plate_correction_applied=False,
-        plate_detection_confidence=plate_text_confidence,
-        plate_bbox=list(plate_bbox),
-        plate_crop_path=f"D:/project/multi-camera-vehicle-tracking/outputs/runs/test/{plate_crop_name}_plate.jpg",
-        plate_ocr_raw_response=plate_text,
-        plate_text_confidence=plate_text_confidence,
-        plate_ocr_reason="validated_standard_state_registration",
-        plate_quality_status="plate_quality_accepted",
+        plate_validation_status="valid" if plate_detected else None,
+        plate_validation_reason="validated_standard_state_registration" if plate_detected else None,
+        plate_format_type="standard_private" if plate_detected else None,
+        plate_correction_applied=False if plate_detected else None,
+        plate_detection_confidence=plate_text_confidence if plate_detected else None,
+        plate_bbox=list(plate_bbox) if plate_detected else None,
+        plate_crop_path=f"D:/project/multi-camera-vehicle-tracking/outputs/runs/test/{plate_crop_name}_plate.jpg" if plate_detected else "",
+        plate_ocr_raw_response=plate_text if plate_detected else None,
+        plate_text_confidence=plate_text_confidence if plate_detected else None,
+        plate_ocr_reason="validated_standard_state_registration" if plate_detected else "no_plate_detected",
+        plate_quality_status="plate_quality_accepted" if plate_detected else None,
         evidence_used=[evidence_item],
     )
 
@@ -1136,3 +1139,34 @@ def test_plate_association_conflict_resolver_leaves_single_candidate_unchanged()
     assert result.plate_text == "HR38AD4296"
     assert result.plate_detected is True
     assert result.plate_ocr_reason == "validated_standard_state_registration"
+
+
+def test_plate_association_conflict_resolver_rejects_borrowed_plate_when_better_same_frame_owner_exists() -> None:
+    borrowed_bus_plate = _plate_result(
+        local_track_id="CAM_001:TRACK_3",
+        vehicle_crop_name="frame_000165_BEST_OVERALL",
+        plate_crop_name="frame_000165_BEST_OVERALL",
+        timestamp_seconds=5.5,
+        frame_number=165,
+        vehicle_bbox=(1.4, 5.1, 680.6, 795.9),
+        crop_bbox=(0.0, 0.0, 735.0, 860.0),
+        plate_bbox=(95.0, 540.0, 218.0, 584.0),
+        plate_text_confidence=0.7445,
+    )
+    actual_car_track = _plate_result(
+        local_track_id="CAM_001:TRACK_5",
+        vehicle_crop_name="frame_000165_HIGHEST_CONFIDENCE",
+        plate_crop_name="frame_000165_HIGHEST_CONFIDENCE",
+        timestamp_seconds=5.5,
+        frame_number=165,
+        vehicle_bbox=(59.7, 321.3, 732.4, 772.9),
+        crop_bbox=(5.0, 285.0, 787.0, 809.0),
+        plate_bbox=(0.0, 0.0, 0.0, 0.0),
+        plate_text=None,
+    )
+
+    _resolve_plate_association_conflicts([borrowed_bus_plate, actual_car_track])
+
+    assert borrowed_bus_plate.plate_text is None
+    assert borrowed_bus_plate.plate_detected is False
+    assert borrowed_bus_plate.plate_ocr_reason == "plate_association_rejected:geometric_owner:CAM_001:TRACK_5"

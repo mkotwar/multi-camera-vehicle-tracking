@@ -135,6 +135,50 @@ def test_planner_route_qwen_repaired() -> None:
     assert response["parsed_query"]["group_by"] == "camera"
 
 
+def test_planner_route_qwen_repaired_for_plate_prefix_start_from_phrase() -> None:
+    response = handle_video_chat(
+        message="show me the vehicles where the number plate start from HR",
+        run_ids=["RUN_A"],
+        records=[
+            VehicleRecord(
+                run_id="RUN_A",
+                vehicle_id="VEHICLE_HR",
+                local_track_id="CAM_001:TRACK_1",
+                camera_id="CAM_001",
+                vehicle_class="CAR",
+                colour="WHITE",
+                first_seen_seconds=1.0,
+                last_seen_seconds=2.0,
+                observation_count=4,
+                status="COMPLETED",
+                plate_text="HR26DK8337",
+                plate_detected=True,
+            ),
+            VehicleRecord(
+                run_id="RUN_A",
+                vehicle_id="VEHICLE_DL",
+                local_track_id="CAM_001:TRACK_2",
+                camera_id="CAM_001",
+                vehicle_class="CAR",
+                colour="BLACK",
+                first_seen_seconds=3.0,
+                last_seen_seconds=4.0,
+                observation_count=4,
+                status="COMPLETED",
+                plate_text="DL8CAF5062",
+                plate_detected=True,
+            ),
+        ],
+        repository=_CameraScopeRepository({"RUN_A": ["CAM_001"]}),  # type: ignore[arg-type]
+        llm_provider=_ProviderSequence([{"entity": "vehicle", "result_shape": "list", "context_reference": "previous_results", "context_resolution": "single"}]),
+    )
+
+    assert response["parser_used"] == "qwen_repaired"
+    assert response["parsed_query"]["plate_match_mode"] == "prefix"
+    assert response["parsed_query"]["plate_text"] == "HR"
+    assert response["matching_vehicle_ids"] == ["VEHICLE_HR"]
+
+
 def test_planner_route_qwen_retry() -> None:
     provider = _ProviderSequence([
         _analytics_payload(group_by=["banana"]),

@@ -117,7 +117,7 @@ export type ChatMessage = {
 };
 
 export type PersistedVideoChatSession = {
-  version: 1;
+  version: 2;
   session_id: string;
   run_id: string;
   run_ids?: string[];
