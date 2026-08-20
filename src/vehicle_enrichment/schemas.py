@@ -256,11 +256,11 @@ class TrackEnrichmentResult:
     vehicle_make: str | None
     vehicle_model: str | None
     plate_detected: bool
-    plate_readable: bool | None
     plate_colour: str | None
     registration_category: str | None
     plate_text: str | None
     status: str
+    plate_readable: bool | None = None
     plate_raw_text: str | None = None
     plate_normalized_text: str | None = None
     plate_validation_status: str | None = None

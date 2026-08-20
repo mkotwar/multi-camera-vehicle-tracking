@@ -8,9 +8,9 @@ import pytest
 
 from src.ollama_qwen_provider import DEFAULT_OLLAMA_NUM_PREDICT, DEFAULT_OLLAMA_TEMPERATURE, OllamaQwenChatLLMProvider, build_chat_llm_provider_from_env
 from src.run_repository import RunRepository
-from src.vehicle_analytics import VehicleRecord, load_vehicle_records_from_tracks_json
+from src.vehicle_analytics import VehicleRecord, load_vehicle_records_from_tracks_json, vehicle_records_from_physical_vehicles
 from src.vehicle_nlp import VehicleQueryParseError
-from src.video_chat import execute_chat_vehicle_query, handle_video_chat, parse_chat_vehicle_query, parse_chat_vehicle_query_detailed
+from src.video_chat import _parse_plate_text_query, execute_chat_vehicle_query, handle_video_chat, parse_chat_vehicle_query, parse_chat_vehicle_query_detailed
 
 
 class _FakeProvider:
@@ -142,6 +142,7 @@ def _valid_payload(**overrides):
         "plate_detected": None,
         "plate_readable": None,
         "plate_text": None,
+        "plate_match_mode": None,
         "start_time": None,
         "end_time": None,
         "group_by": None,
@@ -166,6 +167,7 @@ def _normalized_payload(**overrides):
         "plate_detected": None,
         "plate_readable": None,
         "plate_text": None,
+        "plate_match_mode": None,
         "start_time": None,
         "end_time": None,
         "group_by": None,
@@ -174,6 +176,33 @@ def _normalized_payload(**overrides):
         "limit": None,
         "show_evidence": True,
         "context_reference": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _analytics_payload(**overrides):
+    payload = {
+        "entity": "vehicle",
+        "filters": {
+            "kind": "and",
+            "conditions": [
+                {"kind": "condition", "condition": {"field": "class", "operator": "in", "value": ["CAR"]}},
+                {"kind": "condition", "condition": {"field": "colour", "operator": "in", "value": ["WHITE"]}},
+            ],
+        },
+        "group_by": [],
+        "metric": {"type": "vehicle_count", "operand": {"metric": "vehicle_count", "filters": None}},
+        "comparison": None,
+        "order_by": [],
+        "limit": None,
+        "time": None,
+        "include_camera_ids": [],
+        "exclude_camera_ids": [],
+        "show_evidence": True,
+        "result_shape": "list",
+        "context_reference": None,
+        "context_resolution": None,
     }
     payload.update(overrides)
     return payload
@@ -1107,8 +1136,8 @@ def test_video_chat_rejects_llm_that_flattens_camera_group_query() -> None:
 
     assert response["parsed_query"]["intent"] == "GROUP"
     assert response["parsed_query"]["group_by"] == "camera"
-    assert response["parser_used"] == "rule_based_fallback"
-    assert response["llm_rejection_reason"] == "incorrect_group_by:expected_camera"
+    assert response["parser_used"] == "qwen_repaired"
+    assert response["llm_rejection_reason"] is None
 
 
 def test_video_chat_qwen_repairs_camera_ranking_query() -> None:
@@ -1258,6 +1287,141 @@ def test_video_chat_run_ranking_and_ties() -> None:
     assert tie_response["answer"] == "RUN_A and RUN_B are tied for the highest vehicle count at 2 vehicles each."
 
 
+def test_video_chat_qwen_repairs_vehicle_class_ranking_query() -> None:
+    parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
+        message="which vehicle class have more vehicles",
+        context={},
+        llm_provider=_FakeProvider(
+            _valid_payload(
+                intent="COMPARE",
+                class_include=[],
+                colour_include=[],
+                group_by="vehicle_class",
+                show_evidence=False,
+                operator=">",
+            )
+        ),
+    )
+
+    assert parser_used == "qwen_repaired"
+    assert diagnostics["qwen_raw_plan"]["intent"] == "COMPARE"
+    assert diagnostics["normalized_plan"]["intent"] == "GROUP"
+    assert diagnostics["normalized_plan"]["group_by"] == "vehicle_class"
+    assert diagnostics["normalized_plan"]["sort_by"] == "count_desc"
+    assert diagnostics["normalized_plan"]["limit"] == 1
+    assert parsed.intent == "GROUP"
+    assert parsed.group_by == "class"
+    assert parsed.sort_by == "count_desc"
+
+
+def test_video_chat_class_and_colour_rankings_and_top_k() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001"], "RUN_B": ["CAM_002"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "BLACK"),
+        _record("RUN_A", "CAM_001", "TRACK_2", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_001", "TRACK_3", "MOTORCYCLE", "BLACK"),
+        _record("RUN_A", "CAM_001", "TRACK_4", "BUS", "BLACK"),
+        _record("RUN_B", "CAM_002", "TRACK_5", "CAR", "BLACK"),
+        _record("RUN_B", "CAM_002", "TRACK_6", "CAR", "WHITE"),
+        _record("RUN_B", "CAM_002", "TRACK_7", "TRUCK", "WHITE"),
+        _record("RUN_B", "CAM_002", "TRACK_8", "MOTORCYCLE", "BLACK"),
+    ]
+
+    top_class = handle_video_chat(
+        message="which vehicle class have more vehicles",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    most_common = handle_video_chat(
+        message="which class is most common",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    top_three = handle_video_chat(
+        message="top 3 vehicle classes",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    top_colour = handle_video_chat(
+        message="which colour is most common among cars",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    black_class = handle_video_chat(
+        message="which vehicle class has the most black vehicles",
+        run_ids=["RUN_A", "RUN_B"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert top_class["parsed_query"]["group_by"] == "class"
+    assert top_class["answer"] == "Cars has the highest vehicle count with 4 vehicles."
+    assert most_common["answer"] == "Cars has the highest vehicle count with 4 vehicles."
+    assert top_three["parsed_query"]["limit"] == 3
+    assert "Top 3 vehicle class groups" in top_three["answer"]
+    assert "1. Cars - 4" in top_three["answer"]
+    assert top_colour["parsed_query"]["include_classes"] == ["CAR"]
+    assert top_colour["answer"] == "Black and White are tied for the highest vehicle count at 2 vehicles each."
+    assert black_class["parsed_query"]["include_colours"] == ["BLACK"]
+    assert black_class["answer"] == "Cars and Motorcycles are tied for the highest vehicle count at 2 vehicles each."
+
+
+def test_video_chat_generic_comparisons() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002", "CAM_003"]})
+    records = [
+        _record("RUN_A", "CAM_001", "TRACK_1", "CAR", "BLACK"),
+        _record("RUN_A", "CAM_001", "TRACK_2", "CAR", "WHITE"),
+        _record("RUN_A", "CAM_002", "TRACK_3", "MOTORCYCLE", "BLACK"),
+        _record("RUN_A", "CAM_002", "TRACK_4", "MOTORCYCLE", "BLACK"),
+        _record("RUN_A", "CAM_003", "TRACK_5", "CAR", "BLACK"),
+        _record("RUN_A", "CAM_003", "TRACK_6", "BUS", "WHITE"),
+    ]
+
+    class_compare = handle_video_chat(
+        message="are there more cars or motorcycles",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    class_difference = handle_video_chat(
+        message="how many more cars than motorcycles",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    colour_compare = handle_video_chat(
+        message="are black vehicles more common than white vehicles",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+    camera_compare = handle_video_chat(
+        message="which camera has more cars, CAM_001 or CAM_003",
+        run_ids=["RUN_A"],
+        records=records,
+        repository=repository,  # type: ignore[arg-type]
+        llm_provider=None,
+    )
+
+    assert class_compare["parsed_query"]["intent"] == "COMPARE"
+    assert class_compare["answer"] == "CAR: 3. MOTORCYCLE: 2. Yes. CAR has more vehicles than MOTORCYCLE."
+    assert class_difference["answer"] == "CAR: 3. MOTORCYCLE: 2. CAR has 1 more vehicles than MOTORCYCLE."
+    assert colour_compare["answer"] == "Black: 4. White: 2. Yes. Black has more vehicles than White."
+    assert camera_compare["answer"] == "CAM_001: 2. CAM_003: 1. Yes. CAM_001 has more vehicles than CAM_003."
+
+
 def test_video_chat_counts_detected_number_plates() -> None:
     records = [
         VehicleRecord(
@@ -1312,6 +1476,138 @@ def test_video_chat_counts_detected_number_plates() -> None:
     assert response["parsed_query"]["plate_presence"] == "detected"
     assert response["analytics_result"]["total"] == 1
     assert response["answer"] == "There is 1 car with number plates."
+
+
+def test_vehicle_records_from_physical_vehicles_promotes_valid_plate_evidence_when_consensus_missing() -> None:
+    records = vehicle_records_from_physical_vehicles(
+        [
+            {
+                "run_id": "RUN_A",
+                "vehicle_id": "VEHICLE_006",
+                "primary_camera_id": "CAM_002",
+                "vehicle_class": "CAR",
+                "vehicle_colour": "WHITE",
+                "identity_status": "SINGLE_TRACK",
+                "consensus_plate_text": None,
+                "member_track_ids": ["CAM_002:TRACK_2"],
+                "plate_evidence": [
+                    {
+                        "local_track_id": "CAM_002:TRACK_2",
+                        "normalized_plate_text": "UP84AT5908",
+                        "plate_detected": True,
+                    }
+                ],
+                "representative_evidence": [
+                    {
+                        "local_track_id": "CAM_002:TRACK_2",
+                        "plate_text": "UP84AT5908",
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert len(records) == 1
+    assert records[0].vehicle_id == "VEHICLE_006"
+    assert records[0].plate_text == "UP84AT5908"
+    assert records[0].plate_detected is True
+
+
+def test_video_chat_plate_search_supports_exact_prefix_suffix_and_contains() -> None:
+    repository = _CameraScopeRepository({"RUN_A": ["CAM_001", "CAM_002", "CAM_003"]})
+    records = [
+        VehicleRecord(run_id="RUN_A", vehicle_id="VEHICLE_006", local_track_id="CAM_002:TRACK_2", camera_id="CAM_002", vehicle_class="CAR", colour="WHITE", first_seen_seconds=1.0, last_seen_seconds=2.0, observation_count=3, status="COMPLETED", plate_text="UP84AT5908", plate_detected=True),
+        VehicleRecord(run_id="RUN_A", vehicle_id="VEHICLE_007", local_track_id="CAM_001:TRACK_3", camera_id="CAM_001", vehicle_class="CAR", colour="BLACK", first_seen_seconds=3.0, last_seen_seconds=4.0, observation_count=3, status="COMPLETED", plate_text="HR26DK8337", plate_detected=True),
+        VehicleRecord(run_id="RUN_A", vehicle_id="VEHICLE_008", local_track_id="CAM_003:TRACK_4", camera_id="CAM_003", vehicle_class="MOTORCYCLE", colour="RED", first_seen_seconds=5.0, last_seen_seconds=6.0, observation_count=3, status="COMPLETED", plate_text="DL8CAF5062", plate_detected=True),
+    ]
+
+    exact = handle_video_chat(message="find UP84AT5908", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    prefix_alias = handle_video_chat(message="find all HR number plates", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    natural_prefix = handle_video_chat(message="find all the vehicles whose number plate have HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    natural_prefix_with = handle_video_chat(message="find all vehicles with plate HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    prefix = handle_video_chat(message="find plates starting with HR", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    suffix = handle_video_chat(message="find all number plates ending with 62", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    contains = handle_video_chat(message="find plates containing 84AT", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    contains_digits = handle_video_chat(message="show vehicles whose number plate contains 590", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+    count = handle_video_chat(message="how many HR plates are there", run_ids=["RUN_A"], records=records, repository=repository)  # type: ignore[arg-type]
+
+    assert exact["parsed_query"]["plate_match_mode"] == "exact"
+    assert exact["matching_vehicle_ids"] == ["VEHICLE_006"]
+    assert exact["answer"].startswith("1 vehicle with plate UP84AT5908 was observed.")
+    assert prefix_alias["parsed_query"]["plate_match_mode"] == "prefix"
+    assert prefix_alias["parsed_query"]["plate_text"] == "HR"
+    assert prefix_alias["matching_vehicle_ids"] == ["VEHICLE_007"]
+    assert natural_prefix["parsed_query"]["plate_match_mode"] == "prefix"
+    assert natural_prefix["parsed_query"]["plate_text"] == "HR"
+    assert natural_prefix["matching_vehicle_ids"] == ["VEHICLE_007"]
+    assert natural_prefix_with["parsed_query"]["plate_match_mode"] == "prefix"
+    assert natural_prefix_with["parsed_query"]["plate_text"] == "HR"
+    assert natural_prefix_with["matching_vehicle_ids"] == ["VEHICLE_007"]
+    assert prefix["parsed_query"]["plate_match_mode"] == "prefix"
+    assert prefix["matching_vehicle_ids"] == ["VEHICLE_007"]
+    assert prefix["answer"].startswith("1 vehicle with plates starting with HR was observed.")
+    assert suffix["parsed_query"]["plate_match_mode"] == "suffix"
+    assert suffix["matching_vehicle_ids"] == ["VEHICLE_008"]
+    assert suffix["answer"].startswith("1 vehicle with plates ending with 62 was observed.")
+    assert contains["parsed_query"]["plate_match_mode"] == "contains"
+    assert contains["matching_vehicle_ids"] == ["VEHICLE_006"]
+    assert contains["answer"].startswith("1 vehicle with plates containing 84AT was observed.")
+    assert contains_digits["parsed_query"]["plate_match_mode"] == "contains"
+    assert contains_digits["parsed_query"]["plate_text"] == "590"
+    assert contains_digits["matching_vehicle_ids"] == ["VEHICLE_006"]
+    assert count["parsed_query"]["plate_match_mode"] == "prefix"
+    assert count["analytics_result"]["total"] == 1
+    assert count["answer"] == "There is 1 vehicle with plates starting with HR."
+
+
+@pytest.mark.parametrize("message", ["compare CAM_001 or CAM_003", "show TRACK_2", "find VEHICLE_006", "run 20260819_180937"])
+def test_video_chat_plate_search_does_not_capture_non_plate_tokens(message: str) -> None:
+    assert _parse_plate_text_query(message.lower()) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "match_mode", "expected"),
+    [
+        ("HR", "prefix", "HR"),
+        ("UP84", "prefix", "UP84"),
+        ("62", "suffix", "62"),
+        ("590", "contains", "590"),
+        ("84AT", "contains", "84AT"),
+        ("the vehicles whose", "prefix", None),
+        ("number plate", "prefix", None),
+        ("show vehicles", "contains", None),
+        ("plate have", "prefix", None),
+    ],
+)
+def test_validated_plate_search_fragment_rejects_natural_language(value: str, match_mode: str, expected: str | None) -> None:
+    from src.video_chat import _validated_plate_search_fragment
+
+    assert _validated_plate_search_fragment(value, match_mode=match_mode) == expected
+
+
+def test_video_chat_qwen_repairs_missing_plate_match_mode_for_exact_lookup() -> None:
+    parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(
+        message="find UP84AT5908",
+        context={},
+        llm_provider=_FakeProvider(
+            _valid_payload(
+                intent="LIST",
+                class_include=[],
+                colour_include=[],
+                plate_presence="readable",
+                plate_detected=True,
+                plate_readable=True,
+                plate_text="UP84AT5908",
+                plate_match_mode=None,
+                show_evidence=True,
+            )
+        ),
+    )
+
+    assert parser_used == "qwen_repaired"
+    assert diagnostics["normalized_plan"]["plate_match_mode"] == "exact"
+    assert parsed.plate_text == "UP84AT5908"
+    assert parsed.plate_match_mode == "exact"
 
 
 def test_video_chat_counts_runs_in_current_selection() -> None:
@@ -1429,7 +1725,13 @@ def test_ollama_provider_posts_schema_think_false_and_ignores_thinking(monkeypat
             {
                 "message": {
                     "thinking": "hidden chain of thought",
-                    "content": json.dumps(_valid_payload(intent="COUNT", show_evidence=False)),
+                    "content": json.dumps(
+                        _analytics_payload(
+                            filters={"kind": "condition", "condition": {"field": "class", "operator": "in", "value": ["CAR"]}},
+                            result_shape="scalar",
+                            show_evidence=False,
+                        )
+                    ),
                 }
             }
         )
@@ -1439,13 +1741,14 @@ def test_ollama_provider_posts_schema_think_false_and_ignores_thinking(monkeypat
 
     parsed = provider.parse("How many cars?", {"previous_filters": {}})
 
-    assert parsed["intent"] == "COUNT"
+    assert parsed["entity"] == "vehicle"
     assert captured["payload"]["model"] == "qwen3:1.7b"
     assert captured["payload"]["stream"] is False
     assert captured["payload"]["think"] is False
     assert captured["payload"]["format"]["type"] == "object"
-    assert "class_include" in captured["payload"]["format"]["required"]
-    assert "classes" not in captured["payload"]["format"]["properties"]
+    assert "entity" in captured["payload"]["format"]["required"]
+    assert "filters" not in captured["payload"]["format"]["required"]
+    assert "class_include" not in captured["payload"]["format"]["properties"]
     assert captured["payload"]["options"]["temperature"] == DEFAULT_OLLAMA_TEMPERATURE
     assert captured["payload"]["options"]["num_predict"] == DEFAULT_OLLAMA_NUM_PREDICT
     assert captured["payload"]["keep_alive"] == "10m"
@@ -1490,7 +1793,33 @@ def test_ollama_provider_malformed_json_and_unavailable_raise_runtime_error(monk
 
     monkeypatch.setattr("src.ollama_qwen_provider.urlopen", bad_json_urlopen)
     provider = OllamaQwenChatLLMProvider()
-    with pytest.raises(RuntimeError, match="not valid JSON"):
+    with pytest.raises(RuntimeError, match="reason=qwen_invalid_json"):
+        provider.parse("message", {})
+
+    def fenced_json_urlopen(request, timeout):
+        return _FakeHTTPResponse({"message": {"content": "```json\n{\"entity\":\"vehicle\"}\n```"}, "done_reason": "stop"})
+
+    monkeypatch.setattr("src.ollama_qwen_provider.urlopen", fenced_json_urlopen)
+    assert provider.parse("message", {}) == {"entity": "vehicle"}
+
+    def dict_content_urlopen(request, timeout):
+        return _FakeHTTPResponse({"message": {"content": {"entity": "vehicle"}}, "done_reason": "stop"})
+
+    monkeypatch.setattr("src.ollama_qwen_provider.urlopen", dict_content_urlopen)
+    assert provider.parse("message", {}) == {"entity": "vehicle"}
+
+    def truncated_json_urlopen(request, timeout):
+        return _FakeHTTPResponse({"message": {"content": "{\"entity\":\"vehicle\","}, "done_reason": "length", "eval_count": 128})
+
+    monkeypatch.setattr("src.ollama_qwen_provider.urlopen", truncated_json_urlopen)
+    with pytest.raises(RuntimeError, match="reason=qwen_output_truncated"):
+        provider.parse("message", {})
+
+    def empty_content_urlopen(request, timeout):
+        return _FakeHTTPResponse({"message": {"content": ""}, "done_reason": "stop"})
+
+    monkeypatch.setattr("src.ollama_qwen_provider.urlopen", empty_content_urlopen)
+    with pytest.raises(RuntimeError, match="reason=qwen_empty_content"):
         provider.parse("message", {})
 
     def unavailable_urlopen(request, timeout):

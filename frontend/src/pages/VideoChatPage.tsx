@@ -978,6 +978,18 @@ function getPrimaryMetricTitle(parsed: ChatVehicleQuery | undefined) {
 function getGroupRows(parsed: ChatVehicleQuery | undefined, analytics: Record<string, unknown>) {
   const intent = parsed?.intent?.toUpperCase();
   if (getRankingSummary(parsed, analytics)) return [];
+  if (intent === "GROUP" && parsed?.sort_by && parsed.limit && parsed.limit > 1) {
+    const ranking = analytics.ranking_result;
+    if (ranking && typeof ranking === "object" && !Array.isArray(ranking)) {
+      const entries = Array.isArray((ranking as Record<string, unknown>).entries)
+        ? ((ranking as Record<string, unknown>).entries as Array<Record<string, unknown>>)
+        : [];
+      return entries.slice(0, parsed.limit).map((entry) => ({
+        label: formatRankingWinner(entry, parsed.group_by),
+        value: String(readNumericResult(entry.count) ?? 0),
+      }));
+    }
+  }
   if (intent === "SUMMARY" && parsed?.group_by) return [];
   const source = resolveGroupSource(parsed, analytics);
   if (!source) return [];
@@ -1146,9 +1158,14 @@ function getRankingSummary(parsed: ChatVehicleQuery | undefined, analytics: Reco
   if (!winners.length) return null;
   const count = readNumericResult(winners[0]?.count);
   const groupBy = parsed.group_by;
-  const topLabel = parsed.sort_by === "count_asc"
-    ? (groupBy === "run" ? "Lowest run" : "Lowest camera")
-    : (groupBy === "run" ? "Top run" : "Top camera");
+  const noun = groupBy === "run"
+    ? "run"
+    : groupBy === "run_camera" || groupBy === "camera"
+      ? "camera"
+      : groupBy === "colour"
+        ? "vehicle colour"
+        : "vehicle class";
+  const topLabel = parsed.sort_by === "count_asc" ? `Lowest ${noun}` : `Top ${noun}`;
   if (winners.length > 1) {
     const names = winners.map((item) => formatRankingWinner(item, groupBy)).join(", ");
     return {
@@ -1175,6 +1192,9 @@ function formatRankingWinner(entry: Record<string, unknown>, groupBy?: string | 
   }
   if (groupBy === "run" && typeof entry.run_id === "string" && entry.run_id) {
     return entry.run_id;
+  }
+  if (groupBy === "class" && typeof entry.label === "string") {
+    return formatLabel(entry.label);
   }
   return typeof entry.label === "string" ? formatGroupLabel(entry.label, groupBy) : "Result";
 }

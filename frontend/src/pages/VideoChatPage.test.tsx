@@ -1414,6 +1414,118 @@ describe("VideoChatPage", () => {
     expect(screen.queryByLabelText("Result breakdown")).not.toBeInTheDocument();
   });
 
+  it("renders a compact top-class ranking result", async () => {
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "RUN_A",
+      session_id: "session-top-class",
+      answer: "Cars has the highest vehicle count with 42 vehicles.",
+      parser_used: "qwen_repaired",
+      parsed_query: {
+        intent: "GROUP",
+        include_classes: [],
+        exclude_classes: [],
+        include_colours: [],
+        exclude_colours: [],
+        start_time: null,
+        end_time: null,
+        camera_id: null,
+        group_by: "class",
+        sort_by: "count_desc",
+        limit: 1,
+        comparison: null,
+        show_evidence: false,
+        context_reference: null,
+      },
+      analytics_result: {
+        total: 42,
+        by_class: { CAR: 42, MOTORCYCLE: 31 },
+        ranking_result: {
+          group_by: "class",
+          sort_by: "count_desc",
+          winners: [{ label: "CAR", count: 42 }],
+          entries: [{ label: "CAR", count: 42 }, { label: "MOTORCYCLE", count: 31 }],
+          is_tie: false,
+        },
+        vehicle_ids: ["CAM_001:TRACK_1"],
+      },
+      matching_vehicle_ids: ["CAM_001:TRACK_1"],
+      evidence: [],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "which vehicle class has the most vehicles" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("Top vehicle class")).toBeInTheDocument();
+    expect(screen.getByText("CAR")).toBeInTheDocument();
+    expect(screen.getByText("42 vehicles")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Result breakdown")).not.toBeInTheDocument();
+  });
+
+  it("renders top-k ranked groups in sorted order", async () => {
+    sendVideoChatMessage.mockResolvedValueOnce({
+      run_id: "RUN_A",
+      session_id: "session-top-k",
+      answer: "Top 3 vehicle class groups:\n\n1. Cars - 42\n2. Motorcycles - 31\n3. Buses - 12",
+      parser_used: "rule_based",
+      parsed_query: {
+        intent: "GROUP",
+        include_classes: [],
+        exclude_classes: [],
+        include_colours: [],
+        exclude_colours: [],
+        start_time: null,
+        end_time: null,
+        camera_id: null,
+        group_by: "class",
+        sort_by: "count_desc",
+        limit: 3,
+        comparison: null,
+        show_evidence: false,
+        context_reference: null,
+      },
+      analytics_result: {
+        total: 85,
+        by_class: { CAR: 42, MOTORCYCLE: 31, BUS: 12 },
+        ranking_result: {
+          group_by: "class",
+          sort_by: "count_desc",
+          winners: [{ label: "CAR", count: 42 }],
+          entries: [{ label: "CAR", count: 42 }, { label: "MOTORCYCLE", count: 31 }, { label: "BUS", count: 12 }],
+          is_tie: false,
+        },
+        vehicle_ids: ["CAM_001:TRACK_1"],
+      },
+      matching_vehicle_ids: ["CAM_001:TRACK_1"],
+      evidence: [],
+      context_used: false,
+    });
+
+    render(
+      <MemoryRouter>
+        <VideoChatPage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(fetchRuns).toHaveBeenCalled());
+    fireEvent.change(screen.getByLabelText("Video chat message"), { target: { value: "top 3 vehicle classes" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("CAR")).toBeInTheDocument();
+    expect(screen.getByText("42")).toBeInTheDocument();
+    expect(screen.getByText("MOTORCYCLE")).toBeInTheDocument();
+    expect(screen.getByText("31")).toBeInTheDocument();
+    expect(screen.getByText("BUS")).toBeInTheDocument();
+    expect(screen.getByText("12")).toBeInTheDocument();
+  });
+
   it("renders the VinfoAI brand in the shared header", () => {
     render(
       <MemoryRouter>

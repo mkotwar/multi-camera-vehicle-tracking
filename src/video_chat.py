@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import re
 import time
 from typing import Any, Protocol
+from uuid import uuid4
 
+from .indian_plate_validator import VALID_STATE_CODES, validate_indian_plate
 from .plate_text import display_plate_text, normalize_plate_text
 from .run_repository import RunRepository
 from .vehicle_analytics import (
@@ -99,8 +101,62 @@ ORDINAL_WORDS = {
     "eleventh": 11,
     "twelfth": 12,
 }
-RANKING_DESC_PATTERN = re.compile(r"\b(most|highest|largest|maximum|max|top|busiest)\b")
-RANKING_ASC_PATTERN = re.compile(r"\b(least|fewest|lowest|minimum|min)\b")
+RANKING_DESC_PATTERN = re.compile(r"\b(most|highest|largest|maximum|max|top|busiest|most\s+common|commonest)\b")
+RANKING_ASC_PATTERN = re.compile(r"\b(least|fewest|lowest|minimum|min|least\s+common|rarest|smallest)\b")
+TOP_K_PATTERN = re.compile(r"\b(top|bottom)\s+(\d+)\b")
+PLATE_PARTIAL_STOPWORDS = frozenset(
+    {
+        "A",
+        "ALL",
+        "AN",
+        "ARE",
+        "FOR",
+        "FROM",
+        "HAVE",
+        "HAS",
+        "HAVING",
+        "IN",
+        "IS",
+        "NUMBER",
+        "OF",
+        "PLATE",
+        "PLATES",
+        "REGISTRATION",
+        "SHOW",
+        "THE",
+        "THERE",
+        "THEIR",
+        "THEM",
+        "THESE",
+        "THAT",
+        "THIS",
+        "THOSE",
+        "VEHICLE",
+        "VEHICLES",
+        "WHOSE",
+        "WITH",
+    }
+)
+from .video_chat_execution import compile_analytics_plan, execute_analytics_plan
+from .video_chat_plan import (
+    AnalyticsPlan,
+    ComparisonDefinition,
+    FilterExpression,
+    MetricDefinition,
+    MetricOperand,
+    OrderBy,
+    TimeRange,
+    and_filter,
+    condition,
+    not_filter,
+)
+from .video_chat_plan_validation import (
+    PlanValidationIssue,
+    analytics_plan_from_payload,
+    normalize_analytics_plan_payload,
+    validate_analytics_plan_schema,
+    validate_analytics_plan_semantics,
+)
 
 
 class ChatLLMProvider(Protocol):
@@ -124,6 +180,7 @@ class ChatVehicleQuery:
     plate_detected: bool | None = None
     plate_readable: bool | None = None
     plate_text: str | None = None
+    plate_match_mode: str | None = None
     start_time: float | None = None
     end_time: float | None = None
     camera_id: str | None = None
@@ -153,6 +210,10 @@ class ChatVehicleQuery:
             raise VehicleQueryParseError(f"Unsupported plate_presence: {self.plate_presence}")
         normalized_plate_text = _clean_plate_text(self.plate_text)
         object.__setattr__(self, "plate_text", normalized_plate_text)
+        if self.plate_match_mode not in {None, "exact", "prefix", "suffix", "contains"}:
+            raise VehicleQueryParseError(f"Unsupported plate_match_mode: {self.plate_match_mode}")
+        if self.plate_text is not None and self.plate_match_mode is None:
+            object.__setattr__(self, "plate_match_mode", "exact")
         if self.plate_presence == "readable":
             object.__setattr__(self, "plate_detected", True if self.plate_detected is None else self.plate_detected)
             object.__setattr__(self, "plate_readable", True if self.plate_readable is None else self.plate_readable)
@@ -207,7 +268,10 @@ def handle_video_chat(
     session_context: dict[str, Any] | None = None,
     llm_provider: ChatLLMProvider | None = None,
 ) -> dict[str, Any]:
+    request_started = time.perf_counter()
+    query_id = uuid4().hex
     context = dict(session_context or {})
+    text = _normalize(message)
     selected_run_ids = _dedupe([str(item).strip() for item in (run_ids or ([run_id] if run_id else [])) if str(item).strip()])
     if not selected_run_ids:
         raise ValueError("At least one run_id is required.")
@@ -216,19 +280,43 @@ def handle_video_chat(
         if tracks_path is None:
             raise ValueError("Either tracks_path or records is required.")
         records = load_vehicle_records_from_tracks_json(tracks_path)
-    parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(message=message, context=context, llm_provider=llm_provider)
-    parsed = _apply_run_and_camera_scope(
-        parsed,
-        text=_normalize(message),
-        selected_run_ids=selected_run_ids,
-        repository=repository,
-        context=context,
-    )
+    analytics_plan: AnalyticsPlan | None = None
+    if llm_provider is not None:
+        analytics_plan, parsed, parser_used, diagnostics = plan_video_chat_query_detailed(
+            message=message,
+            context=context,
+            selected_run_ids=selected_run_ids,
+            repository=repository,
+            llm_provider=llm_provider,
+        )
+    else:
+        parsed, parser_used, diagnostics = parse_chat_vehicle_query_detailed(message=message, context=context, llm_provider=llm_provider)
+        parsed = _apply_run_and_camera_scope(
+            parsed,
+            text=text,
+            selected_run_ids=selected_run_ids,
+            repository=repository,
+            context=context,
+        )
+        analytics_plan = analytics_plan_from_chat_query(parsed, provenance="rule_based_fallback" if parser_used == "rule_based" else parser_used)
+    diagnostics["query_id"] = query_id
+    diagnostics["selected_runs"] = list(selected_run_ids)
     execution_context = {
         **context,
         "run_scope": _build_run_scope(selected_run_ids, repository),
     }
-    analytics_result = execute_chat_vehicle_query(records, parsed, context=execution_context) if parsed.intent in ANALYTICS_INTENTS else {}
+    compiled_query = compile_analytics_plan(analytics_plan)
+    execution_started = time.perf_counter()
+    if parsed.subject == "runs":
+        analytics_result = _execute_run_query(parsed, context=execution_context)
+    elif parsed.intent in ANALYTICS_INTENTS:
+        analytics_result = execute_analytics_plan(
+            records,
+            analytics_plan,
+            previous_vehicle_ids=list((context or {}).get("previous_vehicle_ids", []) or []) if parsed.context_reference == "previous_results" else None,
+        )
+    else:
+        analytics_result = {}
     if parsed.intent == "PLATE_LOOKUP":
         analytics_result = _plate_lookup_result(
             repository=repository,
@@ -237,6 +325,7 @@ def handle_video_chat(
             parsed=parsed,
             analytics_result=analytics_result,
         )
+    execution_duration_ms = round((time.perf_counter() - execution_started) * 1000, 3)
     matching_vehicle_ids = list(analytics_result.get("vehicle_ids", []) or [])
     previous_ids = list(context.get("previous_vehicle_ids", []) or [])
     is_evidence_navigation = parsed.evidence_navigation is not None
@@ -293,6 +382,9 @@ def handle_video_chat(
     filters_after_context = _query_filters(parsed)
     diagnostics = {
         **diagnostics,
+        "analytics_plan": analytics_plan.to_dict(),
+        "compiled_execution_plan": compiled_query.to_dict(),
+        "final_provenance": analytics_plan.provenance,
         "context_was_available": bool(context.get("previous_query") or context.get("previous_vehicle_ids")),
         "context_reference": parsed.context_reference,
         "filters_after_context": filters_after_context,
@@ -302,8 +394,24 @@ def handle_video_chat(
         "group_by": parsed.group_by,
         "matching_vehicle_ids_count": len(matching_vehicle_ids),
         "matching_count": len(matching_vehicle_ids),
+        "result_status": _result_status(parsed, analytics_result, matching_vehicle_ids=matching_vehicle_ids),
         "evidence_validation_removed_count": evidence_before_validation - len(evidence),
         "context_saved_vehicle_ids_count": len(next_context.get("previous_vehicle_ids", []) or []),
+        "execution_duration_ms": execution_duration_ms,
+        "total_duration_ms": round((time.perf_counter() - request_started) * 1000, 3),
+    }
+    diagnostics["planner_trace"] = {
+        **dict(diagnostics.get("planner_trace") or {}),
+        "query_id": query_id,
+        "raw_query": message,
+        "selected_runs": list(selected_run_ids),
+        "final_provenance": analytics_plan.provenance,
+        "final_analytics_plan": analytics_plan.to_dict(),
+        "compiled_execution_plan": compiled_query.to_dict(),
+        "repository_source": compiled_query.repository_source,
+        "execution_duration_ms": execution_duration_ms,
+        "total_duration_ms": diagnostics["total_duration_ms"],
+        "result_status": diagnostics["result_status"],
     }
     diagnostics.setdefault("filters_before_context", filters_after_context)
     return {
@@ -319,6 +427,186 @@ def handle_video_chat(
         "context_used": parsed.context_reference == "previous_results",
         "next_context": next_context,
     }
+
+
+def plan_video_chat_query_detailed(
+    *,
+    message: str,
+    context: dict[str, Any] | None = None,
+    selected_run_ids: list[str],
+    repository: RunRepository,
+    llm_provider: ChatLLMProvider,
+) -> tuple[AnalyticsPlan, ChatVehicleQuery, str, dict[str, Any]]:
+    planner_started = time.perf_counter()
+    context = dict(context or {})
+    text = _normalize(str(message or ""))
+    if not text:
+        raise VehicleQueryParseError("Query is empty.")
+    diagnostics: dict[str, Any] = {
+        "llm_attempted": True,
+        "llm_accepted": False,
+        "llm_rejection_reason": None,
+        "llm_raw_structured_output": None,
+        "qwen_raw_plan": None,
+        "normalized_llm_output": None,
+        "normalized_plan": None,
+        "semantic_validation_result": "not_run",
+        "semantic_repair_applied": False,
+        "semantic_repair_notes": [],
+        "final_query_plan": None,
+        "message_type": _classify_message_type(text, context),
+        "filters_before_context": None,
+        "parser_primary": "qwen",
+        "parser_fallback": None,
+        "fallback_reason": None,
+        "parser_model": getattr(llm_provider, "model", None),
+        "total_parser_ms": None,
+        "qwen_request_ms": None,
+        "normalize_ms": None,
+        "repair_ms": None,
+        "validation_ms": None,
+        "ollama_metadata": None,
+        "planner_trace": {
+            "planner": "qwen",
+            "raw_query": message,
+            "selected_runs": list(selected_run_ids),
+            "attempts": 0,
+            "qwen_attempt_1": {"used": False, "duration_ms": None, "parse_status": "not_run", "validation_errors": []},
+            "qwen_attempt_2": {"used": False, "duration_ms": None, "parse_status": "not_run", "validation_errors": []},
+            "normalizations": [],
+            "repairs": [],
+            "qwen_retry_used": False,
+            "fallback_used": False,
+            "fallback_reason": None,
+            "validation_errors_attempt_1": [],
+            "validation_errors_attempt_2": [],
+        },
+    }
+    explicit_mentions = _extract_explicit_filter_mentions(text)
+    diagnostics.update(
+        {
+            "explicit_positive_classes": explicit_mentions.positive_classes,
+            "explicit_negative_classes": explicit_mentions.negative_classes,
+            "explicit_positive_colours": explicit_mentions.positive_colours,
+            "explicit_negative_colours": explicit_mentions.negative_colours,
+        }
+    )
+    general_chat = _parse_general_chat_query(text)
+    if general_chat is not None:
+        plan = analytics_plan_from_chat_query(general_chat, provenance="rule_based_fallback")
+        diagnostics["llm_attempted"] = False
+        diagnostics["planner_trace"]["planner"] = "rule_fallback"
+        diagnostics["final_query_plan"] = general_chat.to_dict()
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - planner_started) * 1000, 3)
+        return plan, general_chat, "rule_based", diagnostics
+    navigation = _parse_evidence_navigation_query(text, context)
+    if navigation is not None:
+        plan = analytics_plan_from_chat_query(navigation, provenance="rule_based_fallback")
+        diagnostics["planner_trace"]["planner"] = "rule_fallback"
+        diagnostics["final_query_plan"] = navigation.to_dict()
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - planner_started) * 1000, 3)
+        return plan, navigation, "rule_based", diagnostics
+    attempt_context = _planner_context(context)
+    rule_candidate = _deterministic_rule_candidate(text, context)
+    try:
+        attempt_one = _qwen_attempt_to_analytics_plan(
+            message=message,
+            text=text,
+            attempt_context=attempt_context,
+            selected_run_ids=selected_run_ids,
+            repository=repository,
+            llm_provider=llm_provider,
+            explicit_mentions=explicit_mentions,
+            rule_candidate=rule_candidate,
+            diagnostics=diagnostics,
+            attempt_number=1,
+        )
+    except Exception as exc:
+        fallback_reason = _classify_qwen_failure(exc)
+        diagnostics["fallback_reason"] = fallback_reason
+        diagnostics["llm_rejection_reason"] = _diagnostic_reason(exc)
+        diagnostics["parser_fallback"] = "rule_based_fallback"
+        diagnostics["planner_trace"]["fallback_reason"] = fallback_reason
+        diagnostics["planner_trace"]["qwen_attempt_1"]["parse_status"] = fallback_reason
+        attempt_one = {
+            "plan": None,
+            "errors": [fallback_reason],
+            "failure_reason": fallback_reason,
+            "normalized_payload": None,
+        }
+    if attempt_one["plan"] is not None:
+        plan = attempt_one["plan"]
+        parsed = chat_query_from_analytics_plan(plan)
+        diagnostics["llm_accepted"] = True
+        diagnostics["final_query_plan"] = parsed.to_dict()
+        diagnostics["filters_before_context"] = _query_filters(parsed)
+        diagnostics["total_parser_ms"] = round((time.perf_counter() - planner_started) * 1000, 3)
+        return plan, parsed, str(attempt_one["provenance"]), diagnostics
+    if str(attempt_one.get("failure_reason") or "") not in {"qwen_timeout", "qwen_unavailable"}:
+        diagnostics["planner_trace"]["qwen_retry_used"] = True
+    retry_context = {
+        **attempt_context,
+        "planner_retry": {
+            "original_query": message,
+            "previous_plan": attempt_one.get("normalized_payload"),
+            "validation_errors": attempt_one.get("errors"),
+        },
+    }
+    attempt_two = {"plan": None, "errors": [], "failure_reason": attempt_one.get("failure_reason"), "normalized_payload": None}
+    if diagnostics["planner_trace"]["qwen_retry_used"]:
+        try:
+            attempt_two = _qwen_attempt_to_analytics_plan(
+                message=message,
+                text=text,
+                attempt_context=retry_context,
+                selected_run_ids=selected_run_ids,
+                repository=repository,
+                llm_provider=llm_provider,
+                explicit_mentions=explicit_mentions,
+                rule_candidate=rule_candidate,
+                diagnostics=diagnostics,
+                attempt_number=2,
+            )
+        except Exception as exc:
+            fallback_reason = _classify_qwen_failure(exc)
+            diagnostics["fallback_reason"] = fallback_reason
+            diagnostics["llm_rejection_reason"] = diagnostics["llm_rejection_reason"] or _diagnostic_reason(exc)
+            diagnostics["parser_fallback"] = "rule_based_fallback"
+            diagnostics["planner_trace"]["fallback_reason"] = fallback_reason
+            diagnostics["planner_trace"]["qwen_attempt_2"]["parse_status"] = fallback_reason
+            attempt_two = {
+                "plan": None,
+                "errors": [fallback_reason],
+                "failure_reason": fallback_reason,
+                "normalized_payload": None,
+            }
+        if attempt_two["plan"] is not None:
+            plan = replace(attempt_two["plan"], provenance="qwen_retry")
+            parsed = chat_query_from_analytics_plan(plan)
+            diagnostics["llm_accepted"] = True
+            diagnostics["final_query_plan"] = parsed.to_dict()
+            diagnostics["filters_before_context"] = _query_filters(parsed)
+            diagnostics["total_parser_ms"] = round((time.perf_counter() - planner_started) * 1000, 3)
+            return plan, parsed, "qwen_retry", diagnostics
+    diagnostics["planner_trace"]["fallback_used"] = True
+    diagnostics["parser_fallback"] = "rule_based_fallback"
+    fallback_reason = attempt_two.get("failure_reason") or attempt_one.get("failure_reason") or "qwen_semantic_validation_failed"
+    diagnostics["fallback_reason"] = fallback_reason
+    diagnostics["planner_trace"]["fallback_reason"] = fallback_reason
+    diagnostics["llm_rejection_reason"] = diagnostics["llm_rejection_reason"] or "; ".join(list(attempt_two.get("errors") or [])[:3]) or "qwen_plan_invalid"
+    parsed = _parse_rule_chat_query(text, context)
+    parsed = _apply_run_and_camera_scope(
+        parsed,
+        text=text,
+        selected_run_ids=selected_run_ids,
+        repository=repository,
+        context=context,
+    )
+    plan = analytics_plan_from_chat_query(parsed, provenance="rule_based_fallback")
+    diagnostics["final_query_plan"] = parsed.to_dict()
+    diagnostics["filters_before_context"] = _query_filters(parsed)
+    diagnostics["total_parser_ms"] = round((time.perf_counter() - planner_started) * 1000, 3)
+    return plan, parsed, "rule_based_fallback", diagnostics
 
 
 def parse_chat_vehicle_query(
@@ -454,75 +742,10 @@ def parse_chat_vehicle_query_detailed(
 def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicleQuery, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
     if parsed.subject == "runs":
         return _execute_run_query(parsed, context=context)
-    base_ids = None
-    if parsed.context_reference == "previous_results":
-        base_ids = set(str(item) for item in list((context or {}).get("previous_vehicle_ids", []) or []))
-    matched = _filter_records(
-        records,
-        include_classes=parsed.include_classes,
-        exclude_classes=parsed.exclude_classes,
-        include_colours=parsed.include_colours,
-        exclude_colours=parsed.exclude_colours,
-        start_time=parsed.start_time,
-        end_time=parsed.end_time,
-        include_camera_ids=parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else []),
-        exclude_camera_ids=parsed.exclude_camera_ids,
-        selected_run_ids=parsed.selected_run_ids,
-        plate_presence=parsed.plate_presence,
-        plate_detected=parsed.plate_detected,
-        plate_readable=parsed.plate_readable,
-        plate_text=parsed.plate_text,
-        base_ids=base_ids,
-    )
-    if parsed.intent == "SUMMARY" and parsed.group_by in {"camera", "run", "run_camera"}:
-        payload = _grouped_summary_payload(matched, group_by=parsed.group_by)
-        payload["vehicle_ids"] = [_vehicle_result_id(record, parsed) for record in matched]
-        return payload
-    if parsed.intent == "SUMMARY":
-        payload = _summary_payload(matched)
-        payload["vehicle_ids"] = [_vehicle_result_id(record, parsed) for record in matched]
-        return payload
-    if parsed.intent == "UNIQUE_CLASSES":
-        counts = count_by_class(matched)
-        return {"vehicle_classes_present": [label for label, count in counts.items() if count > 0], "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
-    if parsed.intent == "UNIQUE_COLOURS":
-        counts = count_by_colour(matched)
-        return {"colours_present": [label for label, count in counts.items() if count > 0], "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched]}
-    if parsed.intent == "PLATE_LOOKUP":
-        return {
-            "total": len(matched),
-            "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched],
-        }
-    if parsed.intent == "COMPARE":
-        left = str((parsed.comparison or {}).get("left") or "").upper()
-        right = str((parsed.comparison or {}).get("right") or "").upper()
-        comparison_base = _filter_records(
-            records,
-            exclude_classes=parsed.exclude_classes,
-            include_colours=parsed.include_colours,
-            exclude_colours=parsed.exclude_colours,
-            start_time=parsed.start_time,
-            end_time=parsed.end_time,
-            include_camera_ids=parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else []),
-            exclude_camera_ids=parsed.exclude_camera_ids,
-            selected_run_ids=parsed.selected_run_ids,
-            plate_presence=parsed.plate_presence,
-            plate_detected=parsed.plate_detected,
-            plate_readable=parsed.plate_readable,
-            plate_text=parsed.plate_text,
-            base_ids=base_ids,
-        )
-        left_records = _filter_records(comparison_base, include_classes=[left] if left else [])
-        right_records = _filter_records(comparison_base, include_classes=[right] if right else [])
-        return {
-            "left": left,
-            "right": right,
-            "left_total": len(left_records),
-            "right_total": len(right_records),
-            "answer": "YES" if len(left_records) > len(right_records) else "NO",
-            "vehicle_ids": [_vehicle_result_id(record, parsed) for record in left_records + right_records],
-        }
     if parsed.intent == "FIND_INTERVALS":
+        base_ids = None
+        if parsed.context_reference == "previous_results":
+            base_ids = set(str(item) for item in list((context or {}).get("previous_vehicle_ids", []) or []))
         comparison = parsed.comparison or {}
         interval_base = _filter_records(
             records,
@@ -538,6 +761,7 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
             plate_detected=parsed.plate_detected,
             plate_readable=parsed.plate_readable,
             plate_text=parsed.plate_text,
+            plate_match_mode=parsed.plate_match_mode,
             base_ids=base_ids,
         )
         return find_vehicle_class_comparison_intervals(
@@ -547,27 +771,659 @@ def execute_chat_vehicle_query(records: list[VehicleRecord], parsed: ChatVehicle
             right_class=str(comparison.get("right") or ""),
             window_seconds=float(comparison.get("window_seconds") or 5.0),
         )
-    if parsed.intent == "GROUP" and parsed.group_by == "colour":
-        counts = count_by_colour(matched)
-        return _group_result_payload(parsed, matched, counts, result_key="by_colour", top_key="top_colour")
-    if parsed.intent == "GROUP" and parsed.group_by == "class":
-        counts = count_by_class(matched)
-        return _group_result_payload(parsed, matched, counts, result_key="by_class", top_key="top_class")
-    if parsed.intent == "GROUP" and parsed.group_by == "camera":
-        counts = _count_by_camera(matched)
-        return _group_result_payload(parsed, matched, counts, result_key="by_camera", top_key="top_camera")
-    if parsed.intent == "GROUP" and parsed.group_by == "run":
-        counts = _count_by_run(matched)
-        return _group_result_payload(parsed, matched, counts, result_key="by_run", top_key="top_run")
-    if parsed.intent == "GROUP" and parsed.group_by == "run_camera":
-        counts = _count_by_run_camera(matched)
-        return _group_result_payload(parsed, matched, counts, result_key="by_run_camera", top_key=None)
+    plan = analytics_plan_from_chat_query(parsed, provenance="legacy_adapter")
+    return execute_analytics_plan(
+        records,
+        plan,
+        previous_vehicle_ids=list((context or {}).get("previous_vehicle_ids", []) or []) if parsed.context_reference == "previous_results" else None,
+    )
+
+
+def analytics_plan_from_chat_query(parsed: ChatVehicleQuery, *, provenance: str) -> AnalyticsPlan:
+    filters = _analytics_filters_from_chat_query(parsed)
+    comparison = _analytics_comparison_from_chat_query(parsed)
+    metric = MetricDefinition(type="vehicle_count", operand=MetricOperand(metric="vehicle_count"))
+    group_by = (parsed.group_by,) if parsed.group_by is not None else ()
+    order_by = ()
+    if parsed.sort_by in {"count_desc", "count_asc"} and group_by:
+        order_by = (OrderBy(field="metric", direction="desc" if parsed.sort_by == "count_desc" else "asc"),)
+    result_shape = "scalar"
+    if parsed.intent == "LIST":
+        result_shape = "list"
+    elif parsed.intent == "GROUP":
+        result_shape = "ranking" if parsed.sort_by is not None else "grouped"
+    elif parsed.intent == "SUMMARY":
+        result_shape = "summary"
+    elif parsed.intent == "COMPARE":
+        result_shape = "comparison"
+    elif parsed.intent == "FIND_INTERVALS":
+        result_shape = "comparison"
+    elif parsed.intent == "PLATE_LOOKUP":
+        result_shape = "plate_lookup"
+    plan = AnalyticsPlan(
+        entity="vehicle",
+        filters=filters,
+        group_by=group_by,
+        metric=metric,
+        comparison=comparison,
+        order_by=order_by,
+        limit=parsed.limit,
+        time=TimeRange(
+            start_seconds=parsed.start_time,
+            end_seconds=parsed.end_time,
+            bucket_seconds=float(dict(parsed.comparison or {}).get("window_seconds") or 5.0) if parsed.intent == "FIND_INTERVALS" else None,
+        ) if parsed.start_time is not None or parsed.end_time is not None or parsed.intent == "FIND_INTERVALS" else None,
+        selected_run_ids=tuple(parsed.selected_run_ids),
+        include_camera_ids=tuple(parsed.include_camera_ids or ([parsed.camera_id] if parsed.camera_id else [])),
+        exclude_camera_ids=tuple(parsed.exclude_camera_ids),
+        show_evidence=parsed.show_evidence,
+        result_shape=result_shape,
+        legacy_intent=parsed.intent,
+        context_reference=parsed.context_reference,
+        context_resolution=parsed.context_resolution,
+        evidence_navigation=parsed.evidence_navigation,
+        provenance=provenance,
+    )
+    return plan
+
+
+def chat_query_from_analytics_plan(plan: AnalyticsPlan) -> ChatVehicleQuery:
+    filter_state = _compatibility_filters_from_plan(plan.filters)
+    inferred_intent = _legacy_intent_from_plan(plan)
+    comparison = _compatibility_comparison_from_plan(plan.comparison)
+    return ChatVehicleQuery(
+        intent=inferred_intent,
+        subject="runs" if plan.entity == "run" else "vehicles",
+        run_filter=None,
+        selected_run_ids=list(plan.selected_run_ids),
+        include_camera_ids=list(plan.include_camera_ids),
+        exclude_camera_ids=list(plan.exclude_camera_ids),
+        include_classes=filter_state["include_classes"],
+        exclude_classes=filter_state["exclude_classes"],
+        include_colours=filter_state["include_colours"],
+        exclude_colours=filter_state["exclude_colours"],
+        plate_presence=filter_state["plate_presence"],
+        plate_detected=filter_state["plate_detected"],
+        plate_readable=filter_state["plate_readable"],
+        plate_text=filter_state["plate_text"],
+        plate_match_mode=filter_state["plate_match_mode"],
+        start_time=plan.time.start_seconds if plan.time is not None else None,
+        end_time=plan.time.end_seconds if plan.time is not None else None,
+        camera_id=filter_state["camera_id"],
+        group_by=plan.group_by[0] if plan.group_by else None,
+        comparison=comparison,
+        sort_by=_compatibility_sort_by(plan),
+        limit=plan.limit,
+        show_evidence=plan.show_evidence,
+        context_reference=plan.context_reference,
+        context_resolution=plan.context_resolution,
+        evidence_navigation=plan.evidence_navigation,
+    )
+
+
+def _qwen_attempt_to_analytics_plan(
+    *,
+    message: str,
+    text: str,
+    attempt_context: dict[str, Any],
+    selected_run_ids: list[str],
+    repository: RunRepository,
+    llm_provider: ChatLLMProvider,
+    explicit_mentions: ExplicitFilterMentions,
+    rule_candidate: ChatVehicleQuery | None,
+    diagnostics: dict[str, Any],
+    attempt_number: int,
+) -> dict[str, Any]:
+    request_started = time.perf_counter()
+    diagnostics["planner_trace"]["attempts"] = attempt_number
+    diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["used"] = True
+    payload = llm_provider.parse(message, attempt_context)
+    payload = _coerce_qwen_payload_to_analytics_payload(payload)
+    attempt_duration_ms = round((time.perf_counter() - request_started) * 1000, 3)
+    diagnostics["qwen_request_ms"] = attempt_duration_ms
+    diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["duration_ms"] = attempt_duration_ms
+    diagnostics["ollama_metadata"] = dict(getattr(llm_provider, "last_metadata", {}) or {})
+    diagnostics["llm_raw_structured_output"] = dict(payload) if isinstance(payload, dict) else payload
+    diagnostics["qwen_raw_plan"] = diagnostics["llm_raw_structured_output"]
+    normalize_started = time.perf_counter()
+    normalized_payload, normalization_actions = normalize_analytics_plan_payload(payload if isinstance(payload, dict) else {}, selected_run_ids=selected_run_ids)
+    if not normalization_actions and isinstance(payload, dict) and normalized_payload != payload:
+        normalization_actions = ["canonical_plan_normalization"]
+    diagnostics["normalize_ms"] = round((time.perf_counter() - normalize_started) * 1000, 3)
+    diagnostics["normalized_llm_output"] = normalized_payload
+    diagnostics["planner_trace"]["normalizations"] = normalization_actions
+    validation_started = time.perf_counter()
+    schema_issues = validate_analytics_plan_schema(normalized_payload)
+    if schema_issues:
+        diagnostics["validation_ms"] = round((time.perf_counter() - validation_started) * 1000, 3)
+        errors = [issue.code for issue in schema_issues]
+        diagnostics["llm_rejection_reason"] = errors[0]
+        diagnostics["semantic_validation_result"] = "schema_invalid"
+        diagnostics["planner_trace"][f"validation_errors_attempt_{attempt_number}"] = errors
+        diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["parse_status"] = "schema_invalid"
+        diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["validation_errors"] = errors
+        return {"plan": None, "errors": errors, "failure_reason": "qwen_schema_validation_failed", "normalized_payload": normalized_payload}
+    plan = analytics_plan_from_payload(normalized_payload, provenance="qwen")
+    repair_started = time.perf_counter()
+    repaired_plan, repair_actions = _repair_analytics_plan(
+        plan,
+        explicit_mentions=explicit_mentions,
+        text=text,
+        selected_run_ids=selected_run_ids,
+        repository=repository,
+        rule_candidate=rule_candidate,
+    )
+    diagnostics["repair_ms"] = round((time.perf_counter() - repair_started) * 1000, 3)
+    diagnostics["semantic_repair_applied"] = bool(repair_actions)
+    diagnostics["semantic_repair_notes"] = repair_actions
+    diagnostics["planner_trace"]["repairs"] = repair_actions
+    semantic_issues = validate_analytics_plan_semantics(repaired_plan)
+    diagnostics["validation_ms"] = round((time.perf_counter() - validation_started) * 1000, 3)
+    if semantic_issues:
+        errors = [issue.code for issue in semantic_issues]
+        diagnostics["llm_rejection_reason"] = diagnostics["llm_rejection_reason"] or errors[0]
+        diagnostics["semantic_validation_result"] = "semantic_invalid"
+        diagnostics["planner_trace"][f"validation_errors_attempt_{attempt_number}"] = errors
+        diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["parse_status"] = "semantic_invalid"
+        diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["validation_errors"] = errors
+        diagnostics["normalized_plan"] = repaired_plan.to_dict()
+        return {"plan": None, "errors": errors, "failure_reason": "qwen_semantic_validation_failed", "normalized_payload": normalized_payload}
+    provenance = "qwen_repaired" if repair_actions else "qwen_normalized" if normalization_actions else "qwen"
+    plan = replace(repaired_plan, provenance=provenance)
+    diagnostics["normalized_plan"] = plan.to_dict()
+    diagnostics["semantic_validation_result"] = "valid"
+    diagnostics["planner_trace"][f"qwen_attempt_{attempt_number}"]["parse_status"] = "valid"
+    return {"plan": plan, "errors": [], "provenance": provenance, "normalized_payload": normalized_payload}
+
+
+def _repair_analytics_plan(
+    plan: AnalyticsPlan,
+    *,
+    explicit_mentions: ExplicitFilterMentions,
+    text: str,
+    selected_run_ids: list[str],
+    repository: RunRepository,
+    rule_candidate: ChatVehicleQuery | None = None,
+) -> tuple[AnalyticsPlan, list[str]]:
+    repair_actions: list[str] = []
+    filters = plan.filters
+    filters, class_actions = _ensure_explicit_filters(filters, explicit_mentions=explicit_mentions, comparison=plan.comparison)
+    repair_actions.extend(class_actions)
+    scoped_plan = replace(plan, filters=filters)
+    if rule_candidate is not None:
+        candidate_plan = analytics_plan_from_chat_query(rule_candidate, provenance="rule_based_fallback")
+        expected_filters = _replace_filter_dimensions(
+            scoped_plan.filters,
+            candidate_plan.filters,
+            fields={"class", "colour", "plate_text", "plate_detected", "plate_readable", "plate_presence"},
+        )
+        if expected_filters != scoped_plan.filters:
+            scoped_plan = replace(scoped_plan, filters=expected_filters)
+            repair_actions.append("aligned filters with deterministic validator")
+        if candidate_plan.metric is not None and scoped_plan.metric is None:
+            scoped_plan = replace(scoped_plan, metric=candidate_plan.metric)
+            repair_actions.append("set metric from deterministic validator")
+        if candidate_plan.comparison is not None and scoped_plan.comparison is None:
+            scoped_plan = replace(scoped_plan, comparison=candidate_plan.comparison, result_shape="comparison")
+            repair_actions.append("set comparison from deterministic validator")
+        if candidate_plan.time is not None and scoped_plan.time != candidate_plan.time:
+            scoped_plan = replace(scoped_plan, time=candidate_plan.time)
+            repair_actions.append("set time from deterministic validator")
+        if scoped_plan.show_evidence != candidate_plan.show_evidence:
+            scoped_plan = replace(scoped_plan, show_evidence=candidate_plan.show_evidence)
+            repair_actions.append(f"set show_evidence={str(candidate_plan.show_evidence).lower()}")
+        if scoped_plan.context_reference != candidate_plan.context_reference:
+            scoped_plan = replace(
+                scoped_plan,
+                context_reference=candidate_plan.context_reference,
+                context_resolution=candidate_plan.context_resolution,
+            )
+            repair_actions.append("aligned context reference with deterministic validator")
+    expected_scope_group_by = _parse_scope_group_by(text)
+    if expected_scope_group_by is not None and not scoped_plan.group_by:
+        scoped_plan = replace(
+            scoped_plan,
+            group_by=(expected_scope_group_by,),
+            result_shape="summary" if _is_summary_query(text) else "grouped",
+        )
+        repair_actions.append(f"set group_by={expected_scope_group_by}")
+    expected_ranking_group = _ranking_group_by(text)
+    if expected_ranking_group is not None and not scoped_plan.group_by and _ranking_sort_by(text) is not None:
+        scoped_plan = replace(scoped_plan, group_by=(expected_ranking_group,), result_shape="ranking")
+        repair_actions.append(f"set ranking group_by={expected_ranking_group}")
+    if scoped_plan.group_by == ("camera",) and len(selected_run_ids) > 1 and not _aggregate_same_named_cameras_requested(text):
+        scoped_plan = replace(scoped_plan, group_by=("run_camera",))
+        repair_actions.append("group_by camera -> run_camera for multi-run scope")
+    expected_sort = _ranking_sort_by(text)
+    if expected_sort is not None and not scoped_plan.order_by and scoped_plan.group_by:
+        scoped_plan = replace(
+            scoped_plan,
+            order_by=(OrderBy(field="metric", direction="desc" if expected_sort == "count_desc" else "asc"),),
+            result_shape="ranking",
+        )
+        repair_actions.append(f"set order_by={expected_sort}")
+    if scoped_plan.result_shape == "ranking" and scoped_plan.limit is None:
+        scoped_plan = replace(scoped_plan, limit=_ranking_limit(text))
+        repair_actions.append(f"set ranking limit={_ranking_limit(text)}")
+    if scoped_plan.result_shape == "ranking" and not scoped_plan.order_by:
+        scoped_plan = replace(scoped_plan, order_by=(OrderBy(field="metric", direction="desc"),))
+        repair_actions.append("set ranking order_by metric desc")
+    include_camera_ids = list(scoped_plan.include_camera_ids)
+    exclude_camera_ids = list(scoped_plan.exclude_camera_ids)
+    explicit_camera_ids = _parse_camera_ids(text)
+    explicit_excluded_camera_ids = _parse_excluded_camera_ids(text)
+    plan_already_references_camera = _plan_references_camera(scoped_plan)
+    if explicit_camera_ids and not include_camera_ids and not plan_already_references_camera:
+        include_camera_ids = explicit_camera_ids
+        repair_actions.append("applied explicit camera scope from query")
+    if explicit_excluded_camera_ids and not exclude_camera_ids and not plan_already_references_camera:
+        exclude_camera_ids = explicit_excluded_camera_ids
+        repair_actions.append("applied explicit excluded camera scope from query")
+    if include_camera_ids:
+        _validate_camera_scope(include_camera_ids, selected_run_ids, repository)
+    if exclude_camera_ids:
+        _validate_camera_scope(exclude_camera_ids, selected_run_ids, repository)
+    return replace(
+        scoped_plan,
+        selected_run_ids=tuple(selected_run_ids),
+        include_camera_ids=tuple(include_camera_ids),
+        exclude_camera_ids=tuple(exclude_camera_ids),
+    ), repair_actions
+
+
+def _ensure_explicit_filters(
+    filters: Any,
+    *,
+    explicit_mentions: ExplicitFilterMentions,
+    comparison: ComparisonDefinition | None = None,
+) -> tuple[Any, list[str]]:
+    actions: list[str] = []
+    filter_expression = filters
+    present_classes = set(_filter_values_for_field(filter_expression, field="class"))
+    present_colours = set(_filter_values_for_field(filter_expression, field="colour"))
+    excluded_classes = set(_excluded_filter_values_for_field(filter_expression, field="class"))
+    excluded_colours = set(_excluded_filter_values_for_field(filter_expression, field="colour"))
+    if comparison is not None:
+        for operand in (comparison.left, comparison.right):
+            present_classes.update(_filter_values_for_field(getattr(operand, "filters", None), field="class"))
+            present_colours.update(_filter_values_for_field(getattr(operand, "filters", None), field="colour"))
+            excluded_classes.update(_excluded_filter_values_for_field(getattr(operand, "filters", None), field="class"))
+            excluded_colours.update(_excluded_filter_values_for_field(getattr(operand, "filters", None), field="colour"))
+    for label in explicit_mentions.positive_classes:
+        if label not in present_classes and label not in excluded_classes:
+            filter_expression = and_filter(filter_expression, condition("class", "in", [label]))
+            actions.append(f"added include_class={label}")
+    for label in explicit_mentions.negative_classes:
+        if label not in excluded_classes:
+            filter_expression = and_filter(filter_expression, not_filter(condition("class", "in", [label])))
+            actions.append(f"added exclude_class={label}")
+    for label in explicit_mentions.positive_colours:
+        if label not in present_colours and label not in excluded_colours:
+            filter_expression = and_filter(filter_expression, condition("colour", "in", [label]))
+            actions.append(f"added include_colour={label}")
+    for label in explicit_mentions.negative_colours:
+        if label not in excluded_colours:
+            filter_expression = and_filter(filter_expression, not_filter(condition("colour", "in", [label])))
+            actions.append(f"added exclude_colour={label}")
+    return filter_expression, actions
+
+
+def _replace_filter_dimensions(
+    filters: FilterExpression | None,
+    expected_filters: FilterExpression | None,
+    *,
+    fields: set[str],
+) -> FilterExpression | None:
+    return and_filter(
+        _strip_filter_fields(filters, fields=fields),
+        _retain_filter_fields(expected_filters, fields=fields),
+    )
+
+
+def _strip_filter_fields(filters: FilterExpression | None, *, fields: set[str]) -> FilterExpression | None:
+    if filters is None:
+        return None
+    if filters.kind == "condition":
+        if filters.condition is None or filters.condition.field in fields:
+            return None
+        return filters
+    children = tuple(
+        item
+        for item in (_strip_filter_fields(child, fields=fields) for child in filters.conditions)
+        if item is not None
+    )
+    if not children:
+        return None
+    if filters.kind == "not":
+        return FilterExpression(kind="not", conditions=(children[0],))
+    if len(children) == 1:
+        return children[0]
+    return FilterExpression(kind=filters.kind, conditions=children)
+
+
+def _retain_filter_fields(filters: FilterExpression | None, *, fields: set[str]) -> FilterExpression | None:
+    if filters is None:
+        return None
+    if filters.kind == "condition":
+        if filters.condition is None or filters.condition.field not in fields:
+            return None
+        return filters
+    children = tuple(
+        item
+        for item in (_retain_filter_fields(child, fields=fields) for child in filters.conditions)
+        if item is not None
+    )
+    if not children:
+        return None
+    if filters.kind == "not":
+        return FilterExpression(kind="not", conditions=(children[0],))
+    if len(children) == 1:
+        return children[0]
+    return FilterExpression(kind=filters.kind, conditions=children)
+
+
+def _filter_values_for_field(filters: Any, *, field: str) -> list[str]:
+    if filters is None:
+        return []
+    if getattr(filters, "kind", None) == "condition" and filters.condition is not None:
+        if filters.condition.field == field and filters.condition.operator in {"eq", "in"}:
+            value = filters.condition.value
+            return [str(item) for item in value] if isinstance(value, list) else [str(value)]
+        return []
+    values: list[str] = []
+    for item in getattr(filters, "conditions", ()):
+        values.extend(_filter_values_for_field(item, field=field))
+    return values
+
+
+def _excluded_filter_values_for_field(filters: Any, *, field: str) -> list[str]:
+    if filters is None:
+        return []
+    if getattr(filters, "kind", None) == "not":
+        values: list[str] = []
+        for item in getattr(filters, "conditions", ()):
+            values.extend(_filter_values_for_field(item, field=field))
+        return values
+    values = []
+    for item in getattr(filters, "conditions", ()):
+        values.extend(_excluded_filter_values_for_field(item, field=field))
+    return values
+
+
+def _plan_references_camera(plan: AnalyticsPlan) -> bool:
+    if plan.group_by and any(value in {"camera", "run_camera"} for value in plan.group_by):
+        return True
+    if plan.include_camera_ids or plan.exclude_camera_ids:
+        return True
+    if _filter_values_for_field(plan.filters, field="camera"):
+        return True
+    if _excluded_filter_values_for_field(plan.filters, field="camera"):
+        return True
+    comparison = plan.comparison
+    if comparison is not None:
+        for operand in (comparison.left, comparison.right):
+            if _filter_values_for_field(getattr(operand, "filters", None), field="camera"):
+                return True
+            if _excluded_filter_values_for_field(getattr(operand, "filters", None), field="camera"):
+                return True
+    return False
+
+
+def _planner_context(context: dict[str, Any]) -> dict[str, Any]:
     return {
-        "total": len(matched),
-        "by_class": count_by_class(matched),
-        "by_colour": count_by_colour(matched),
-        "vehicle_ids": [_vehicle_result_id(record, parsed) for record in matched],
+        "previous_query": context.get("previous_query"),
+        "previous_filters": context.get("previous_filters"),
+        "previous_vehicle_ids": list(context.get("previous_vehicle_ids", []) or [])[:20],
     }
+
+
+def _compatibility_filters_from_plan(filters: Any) -> dict[str, Any]:
+    result = {
+        "include_classes": [],
+        "exclude_classes": [],
+        "include_colours": [],
+        "exclude_colours": [],
+        "plate_presence": None,
+        "plate_detected": None,
+        "plate_readable": None,
+        "plate_text": None,
+        "plate_match_mode": None,
+        "camera_id": None,
+    }
+    for condition_payload, negated in _flatten_filter_conditions(filters):
+        field = condition_payload.field
+        operator = condition_payload.operator
+        value = condition_payload.value
+        if field == "class":
+            values = [str(item) for item in value] if isinstance(value, list) else [str(value)]
+            target = "exclude_classes" if negated or operator == "not_in" else "include_classes"
+            result[target] = _dedupe(result[target] + values)
+        elif field == "colour":
+            values = [str(item) for item in value] if isinstance(value, list) else [str(value)]
+            target = "exclude_colours" if negated or operator == "not_in" else "include_colours"
+            result[target] = _dedupe(result[target] + values)
+        elif field == "plate_text":
+            result["plate_text"] = str(value)
+            result["plate_match_mode"] = {"eq": "exact", "starts_with": "prefix", "ends_with": "suffix", "contains": "contains"}.get(operator)
+        elif field == "plate_detected":
+            result["plate_detected"] = False if negated else bool(value)
+            if result["plate_detected"] is True:
+                result["plate_presence"] = "detected"
+        elif field == "plate_readable":
+            result["plate_readable"] = False if negated else bool(value)
+            if result["plate_readable"] is True:
+                result["plate_presence"] = "readable"
+        elif field == "camera":
+            values = [str(item) for item in value] if isinstance(value, list) else [str(value)]
+            if values:
+                result["camera_id"] = values[0]
+    return result
+
+
+def _flatten_filter_conditions(filters: Any, *, negated: bool = False) -> list[tuple[Any, bool]]:
+    if filters is None:
+        return []
+    if getattr(filters, "kind", None) == "condition" and filters.condition is not None:
+        return [(filters.condition, negated)]
+    items: list[tuple[Any, bool]] = []
+    child_negated = negated
+    if getattr(filters, "kind", None) == "not":
+        child_negated = not negated
+    for item in getattr(filters, "conditions", ()):
+        items.extend(_flatten_filter_conditions(item, negated=child_negated))
+    return items
+
+
+def _compatibility_sort_by(plan: AnalyticsPlan) -> str | None:
+    if not plan.order_by:
+        return None
+    return "count_desc" if plan.order_by[0].direction == "desc" else "count_asc"
+
+
+def _compatibility_comparison_from_plan(comparison: ComparisonDefinition | None) -> dict[str, Any] | None:
+    if comparison is None:
+        return None
+    return {
+        "left": _compatibility_operand_label(comparison.left),
+        "right": _compatibility_operand_label(comparison.right),
+        "mode": comparison.operation,
+        "operator": comparison.operation,
+        "metric": "vehicle_count",
+    }
+
+
+def _compatibility_operand_label(operand: MetricOperand) -> str:
+    filters = operand.filters
+    if filters is None or getattr(filters, "condition", None) is None:
+        return "ALL"
+    value = filters.condition.value
+    if isinstance(value, list):
+        return str(value[0]) if value else "ALL"
+    return str(value)
+
+
+def _legacy_intent_from_plan(plan: AnalyticsPlan) -> str:
+    if plan.legacy_intent in SUPPORTED_CHAT_INTENTS:
+        return str(plan.legacy_intent)
+    if plan.result_shape == "summary":
+        return "SUMMARY"
+    if plan.result_shape == "comparison":
+        return "COMPARE"
+    if plan.result_shape == "plate_lookup":
+        return "PLATE_LOOKUP"
+    if plan.result_shape in {"grouped", "ranking"}:
+        return "GROUP"
+    if plan.result_shape == "list":
+        return "LIST"
+    if plan.result_shape == "unsupported_capability":
+        return "LIST"
+    return "COUNT"
+
+
+def _coerce_qwen_payload_to_analytics_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    if "entity" in payload or "group_by" in payload and isinstance(payload.get("group_by"), list):
+        return payload
+    if "intent" not in payload:
+        return payload
+    normalized = normalize_llm_vehicle_query(payload)
+    filters = []
+    classes = list(normalized.get("classes", []) or [])
+    exclude_classes = list(normalized.get("exclude_classes", []) or [])
+    colours = list(normalized.get("colours", []) or [])
+    exclude_colours = list(normalized.get("exclude_colours", []) or [])
+    if classes:
+        filters.append(condition("class", "in", classes))
+    if exclude_classes:
+        filters.append(not_filter(condition("class", "in", exclude_classes)))
+    if colours:
+        filters.append(condition("colour", "in", colours))
+    if exclude_colours:
+        filters.append(not_filter(condition("colour", "in", exclude_colours)))
+    if normalized.get("plate_presence") == "readable":
+        filters.append(condition("plate_readable", "eq", True))
+    elif normalized.get("plate_presence") == "detected":
+        filters.append(condition("plate_detected", "eq", True))
+    if normalized.get("plate_detected") is False:
+        filters.append(condition("plate_detected", "eq", False))
+    if normalized.get("plate_readable") is False:
+        filters.append(condition("plate_readable", "eq", False))
+    if normalized.get("plate_text"):
+        filters.append(
+            condition(
+                "plate_text",
+                {"exact": "eq", "prefix": "starts_with", "suffix": "ends_with", "contains": "contains"}.get(normalized.get("plate_match_mode") or "exact", "eq"),
+                normalized.get("plate_text"),
+            )
+        )
+    result_shape = "list" if normalized.get("show_evidence") else "scalar"
+    intent = str(normalized.get("intent") or "").upper()
+    if intent == "SUMMARY":
+        result_shape = "summary"
+    elif intent == "GROUP":
+        result_shape = "ranking" if normalized.get("sort_by") is not None else "grouped"
+    elif intent == "COMPARE":
+        result_shape = "comparison"
+    elif intent == "PLATE_LOOKUP":
+        result_shape = "plate_lookup"
+    order_by = []
+    if normalized.get("sort_by") in {"count_desc", "count_asc"}:
+        order_by.append({"field": "metric", "direction": "desc" if normalized.get("sort_by") == "count_desc" else "asc"})
+    comparison = None
+    legacy_comparison = _comparison_from_llm(normalized)
+    if legacy_comparison is not None:
+        comparison = {
+            "operation": str(legacy_comparison.get("mode") or "winner"),
+            "left": {"metric": "vehicle_count", "filters": _legacy_comparison_target_filter(legacy_comparison.get("left"))},
+            "right": {"metric": "vehicle_count", "filters": _legacy_comparison_target_filter(legacy_comparison.get("right"))},
+        }
+    return {
+        "entity": "vehicle",
+        "filters": and_filter(*filters).to_dict() if and_filter(*filters) is not None else None,
+        "group_by": [normalized.get("group_by").replace("vehicle_class", "class")] if normalized.get("group_by") else [],
+        "metric": {"type": "vehicle_count", "operand": {"metric": "vehicle_count"}},
+        "comparison": comparison,
+        "order_by": order_by,
+        "limit": normalized.get("limit"),
+        "time": {
+            "start_seconds": normalized.get("start_time"),
+            "end_seconds": normalized.get("end_time"),
+            "bucket_seconds": None,
+        } if normalized.get("start_time") is not None or normalized.get("end_time") is not None else None,
+        "include_camera_ids": [],
+        "exclude_camera_ids": [],
+        "show_evidence": bool(normalized.get("show_evidence")),
+        "result_shape": result_shape,
+        "context_reference": "previous_results" if normalized.get("context_reference") == "previous_result" else None,
+        "context_resolution": None,
+    }
+
+
+def _legacy_comparison_target_filter(target: Any) -> dict[str, Any] | None:
+    target_dict = dict(target or {}) if isinstance(target, dict) else {"kind": "class", "value": target}
+    kind = str(target_dict.get("kind") or "class")
+    value = target_dict.get("value")
+    if value in {None, ""}:
+        return None
+    field = "camera" if kind == "camera" else "colour" if kind == "colour" else "class"
+    return condition(field, "eq", str(value).upper() if field in {"class", "colour"} else str(value)).to_dict()
+
+
+def _analytics_filters_from_chat_query(parsed: ChatVehicleQuery):
+    filters = []
+    if parsed.include_classes:
+        filters.append(condition("class", "in", list(parsed.include_classes)))
+    if parsed.exclude_classes:
+        filters.append(not_filter(condition("class", "in", list(parsed.exclude_classes))))
+    if parsed.include_colours:
+        filters.append(condition("colour", "in", list(parsed.include_colours)))
+    if parsed.exclude_colours:
+        filters.append(not_filter(condition("colour", "in", list(parsed.exclude_colours))))
+    if parsed.plate_presence == "readable":
+        filters.append(condition("plate_readable", "eq", True))
+    elif parsed.plate_presence == "detected":
+        filters.append(condition("plate_detected", "eq", True))
+    if parsed.plate_detected is True and parsed.plate_presence != "detected":
+        filters.append(condition("plate_detected", "eq", True))
+    if parsed.plate_detected is False:
+        filters.append(condition("plate_detected", "eq", False))
+    if parsed.plate_readable is True and parsed.plate_text is None:
+        filters.append(condition("plate_readable", "eq", True))
+    if parsed.plate_readable is False:
+        filters.append(condition("plate_readable", "eq", False))
+    if parsed.plate_text:
+        operator = {
+            "exact": "eq",
+            "prefix": "starts_with",
+            "suffix": "ends_with",
+            "contains": "contains",
+        }.get(parsed.plate_match_mode or "exact", "eq")
+        filters.append(condition("plate_text", operator, parsed.plate_text))
+    return and_filter(*filters)
+
+
+def _analytics_comparison_from_chat_query(parsed: ChatVehicleQuery) -> ComparisonDefinition | None:
+    if parsed.intent not in {"COMPARE", "FIND_INTERVALS"}:
+        return None
+    comparison = dict(parsed.comparison or {})
+    left = comparison.get("left")
+    right = comparison.get("right")
+    if left is None or right is None:
+        return None
+    return ComparisonDefinition(
+        operation=str(comparison.get("operator") if parsed.intent == "FIND_INTERVALS" else comparison.get("mode") or "winner"),
+        left=_comparison_operand(left),
+        right=_comparison_operand(right),
+    )
+
+
+def _comparison_operand(target: Any) -> MetricOperand:
+    target_dict = dict(target or {}) if isinstance(target, dict) else {"kind": "class", "value": target}
+    kind = str(target_dict.get("kind") or "class")
+    field = "class" if kind == "class" else "colour" if kind == "colour" else "camera"
+    value = str(target_dict.get("value") or "").upper() if field in {"class", "colour"} else str(target_dict.get("value") or "")
+    return MetricOperand(metric="vehicle_count", filters=condition(field, "eq", value))
 
 
 def _plate_lookup_result(
@@ -949,6 +1805,8 @@ def format_chat_answer(
     evidence_count: int = 0,
     evidence_page: dict[str, Any] | None = None,
 ) -> str:
+    if analytics_result.get("status") == "unsupported":
+        return str(analytics_result.get("detail") or "That information is not available in the current vehicle analytics data.")
     if parsed.intent == "GENERAL_CHAT":
         return "Hello. I can answer questions about this processed traffic video, such as vehicle counts, classes, colours, time ranges, comparisons, and evidence."
     if parsed.subject == "runs":
@@ -991,8 +1849,23 @@ def format_chat_answer(
     if parsed.intent == "UNIQUE_COLOURS":
         return "Vehicle colours present: " + ", ".join(analytics_result.get("colours_present", [])) + "."
     if parsed.intent == "COMPARE":
+        left = str(analytics_result.get("left") or "")
+        right = str(analytics_result.get("right") or "")
+        left_total = int(analytics_result.get("left_total", 0) or 0)
+        right_total = int(analytics_result.get("right_total", 0) or 0)
+        difference = int(analytics_result.get("difference", abs(left_total - right_total)) or 0)
+        mode = str(analytics_result.get("mode") or "winner")
+        response_style = str(dict(parsed.comparison or {}).get("response_style") or "counts_first")
+        if bool(analytics_result.get("is_tie")):
+            return f"{left} and {right} are tied at {left_total} vehicles each."
+        winner = str(analytics_result.get("winner") or "")
+        loser = right if winner == left else left
+        if mode == "difference":
+            return f"{left}: {left_total}. {right}: {right_total}. {winner} has {difference} more vehicles than {loser}."
         answer = "Yes." if analytics_result.get("answer") == "YES" else "No."
-        return f"{answer} {analytics_result.get('left')} = {analytics_result.get('left_total')}; {analytics_result.get('right')} = {analytics_result.get('right_total')}."
+        if response_style == "leading_answer":
+            return f"{answer} {left}: {left_total}. {right}: {right_total}. {winner} has more vehicles than {loser}."
+        return f"{left}: {left_total}. {right}: {right_total}. {answer} {winner} has more vehicles than {loser}."
     if parsed.intent == "FIND_INTERVALS":
         return _format_interval_answer(analytics_result)
     if parsed.intent == "PLATE_LOOKUP":
@@ -1021,6 +1894,9 @@ def format_chat_answer(
             parts.append(f"{no_plate_count} vehicles do not have a detected plate.")
         return " ".join(parts)
     if parsed.intent == "GROUP":
+        natural = _format_natural_group_answer(parsed, analytics_result)
+        if natural and parsed.limit is None and parsed.group_by in {"class", "colour"}:
+            return natural
         ranking_answer = _format_ranking_group_answer(parsed, analytics_result)
         if ranking_answer is not None:
             return ranking_answer
@@ -1031,7 +1907,6 @@ def format_chat_answer(
         key = "by_colour" if parsed.group_by == "colour" else "by_class"
         top_key = "top_colour" if parsed.group_by == "colour" else "top_class"
         top = analytics_result.get(top_key)
-        natural = _format_natural_group_answer(parsed, analytics_result)
         if natural:
             return natural
         if parsed.limit == 1 and isinstance(top, dict):
@@ -1154,6 +2029,18 @@ def _format_evidence_page_text(parsed: ChatVehicleQuery, evidence_page: dict[str
     return f" Showing {returned} of {total}." if offset == 0 else f" Showing {returned} more - {shown} of {total} shown."
 
 
+def _result_status(parsed: ChatVehicleQuery, analytics_result: dict[str, Any], *, matching_vehicle_ids: list[str]) -> str:
+    if analytics_result.get("status") == "unsupported":
+        return "unsupported"
+    if parsed.intent == "GENERAL_CHAT":
+        return "general_chat"
+    if parsed.intent == "PLATE_LOOKUP" and analytics_result.get("ambiguous"):
+        return "ambiguous"
+    if parsed.intent in ANALYTICS_INTENTS and not matching_vehicle_ids:
+        return "no_data"
+    return "ok"
+
+
 def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQuery:
     unsupported_class = sorted(term for term in UNSUPPORTED_CLASS_TERMS if _contains_phrase(text, term))
     if unsupported_class:
@@ -1170,6 +2057,12 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     explicit_mentions = _extract_explicit_filter_mentions(text)
     show_evidence = bool(re.search(r"\b(show|show me|find|which ones|let me see|want to see|see|evidence|display|show them)\b", text))
     plate_presence, plate_detected, plate_readable, plate_text = _parse_plate_filters(text)
+    plate_match_mode, plate_search_value = _parse_plate_search_filter(text)
+    if plate_search_value is not None:
+        plate_text = plate_search_value
+        plate_presence = plate_presence or "readable"
+        plate_detected = True if plate_detected is None else plate_detected
+        plate_readable = True if plate_readable is None else plate_readable
     include_classes = explicit_mentions.positive_classes or list(previous_filters.get("include_classes", []) or [])
     include_colours = explicit_mentions.positive_colours or list(previous_filters.get("include_colours", []) or [])
     exclude_classes = _dedupe(list(previous_filters.get("exclude_classes", []) or []) + explicit_mentions.negative_classes)
@@ -1182,6 +2075,8 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
         plate_readable = previous_filters.get("plate_readable")
     if plate_text is None and context_reference:
         plate_text = previous_filters.get("plate_text")
+    if plate_match_mode is None and context_reference:
+        plate_match_mode = previous_filters.get("plate_match_mode")
     start_time, end_time = parse_time_range(text)
     if context_reference and start_time is None and end_time is None:
         start_time = previous_filters.get("start_time")
@@ -1216,6 +2111,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -1228,16 +2124,17 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
     if run_metadata_query is not None:
         return run_metadata_query
     if (include_classes or exclude_classes) and _is_colour_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", context_reference=context_reference)
     if (include_colours or exclude_colours) and _is_class_group_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class", sort_by="count_desc", context_reference=context_reference)
     if _is_class_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if _is_colour_wise_query(text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     if _is_group_ranking_query(text):
         ranking_group_by = _ranking_group_by(text)
         ranking_sort_by = _ranking_sort_by(text)
+        ranking_limit = _ranking_limit(text)
         if ranking_group_by is not None and ranking_sort_by is not None:
             return ChatVehicleQuery(
                 intent="GROUP",
@@ -1249,11 +2146,12 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
                 plate_detected=plate_detected,
                 plate_readable=plate_readable,
                 plate_text=plate_text,
+                plate_match_mode=plate_match_mode,
                 include_camera_ids=include_camera_ids,
                 exclude_camera_ids=exclude_camera_ids,
                 group_by=ranking_group_by,
                 sort_by=ranking_sort_by,
-                limit=1,
+                limit=ranking_limit,
                 context_reference=context_reference,
             )
     group_by_scope = _parse_scope_group_by(text)
@@ -1268,11 +2166,12 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             include_camera_ids=include_camera_ids,
             exclude_camera_ids=exclude_camera_ids,
             group_by=group_by_scope,
             sort_by=_ranking_sort_by(text) if _ranking_sort_by(text) is not None else None,
-            limit=1 if _ranking_sort_by(text) is not None else None,
+            limit=_ranking_limit(text) if _ranking_sort_by(text) is not None else None,
             context_reference=context_reference,
         )
     if context_reference == "previous_results" and previous_group_by is not None and _is_follow_up_refinement(text) and not show_evidence:
@@ -1286,35 +2185,47 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             include_camera_ids=include_camera_ids,
             exclude_camera_ids=exclude_camera_ids,
             group_by=previous_group_by,
             context_reference=context_reference,
         )
-    if "most" in text and re.search(r"\b(vehicle\s+)?(class|type|category)\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, group_by="class", sort_by="count_desc", limit=1)
+    if RANKING_DESC_PATTERN.search(text) and re.search(r"\b(vehicle\s+)?(class|type|category)\b", text):
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, group_by="class", sort_by="count_desc", limit=_ranking_limit(text))
     if _is_summary_query(text):
-        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="SUMMARY", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     interval_query = _parse_interval_comparison_query(text)
     if interval_query is not None:
         return interval_query
-    if re.search(r"\bmore\s+\w+\s+than\b", text) or "more cars than motorcycles" in text:
-        classes = _find_labels(text, CLASS_SYNONYMS)
-        if len(classes) < 2:
-            raise VehicleQueryParseError("Compare queries need two vehicle classes.")
-        return ChatVehicleQuery(intent="COMPARE", comparison={"left": classes[0], "right": classes[1]})
+    comparison_query = _parse_direct_comparison_query(
+        text,
+        include_classes=include_classes,
+        exclude_classes=exclude_classes,
+        include_colours=include_colours,
+        exclude_colours=exclude_colours,
+        plate_presence=plate_presence,
+        plate_detected=plate_detected,
+        plate_readable=plate_readable,
+        plate_text=plate_text,
+        include_camera_ids=include_camera_ids,
+        exclude_camera_ids=exclude_camera_ids,
+        context_reference=context_reference,
+    )
+    if comparison_query is not None:
+        return comparison_query
     if re.search(r"\b(types?|classes?|kinds?)\s+of\s+vehicles?\s+(?:are\s+)?present\b", text):
-        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+        return ChatVehicleQuery(intent="UNIQUE_CLASSES", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if _is_colour_group_query(text) or ("most" in text and re.search(r"\bcolou?r\b", text)):
         if include_classes:
-            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
-        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
+            return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour", sort_by="count_desc", limit=1 if "most" in text else None)
+        return ChatVehicleQuery(intent="UNIQUE_COLOURS", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, start_time=start_time, end_time=end_time, camera_id=camera_id, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, context_reference=context_reference)
     if re.search(r"\b(group|breakdown)\s+by\s+class\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="class")
     if re.search(r"\b(group|breakdown)\s+by\s+colou?r\b", text):
-        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
+        return ChatVehicleQuery(intent="GROUP", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, include_camera_ids=include_camera_ids, exclude_camera_ids=exclude_camera_ids, group_by="colour")
     if include_classes and re.fullmatch(r"(unknown|unclassified)\s+vehicles?", text):
-        return ChatVehicleQuery(intent="LIST", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True)
+        return ChatVehicleQuery(intent="LIST", include_classes=include_classes, exclude_classes=exclude_classes, include_colours=include_colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, show_evidence=True)
     if show_evidence or re.search(r"\b(which vehicles|appeared|list|display|want to see)\b", text):
         return ChatVehicleQuery(
             intent="LIST",
@@ -1326,6 +2237,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -1347,6 +2259,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -1365,6 +2278,7 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             plate_detected=plate_detected,
             plate_readable=plate_readable,
             plate_text=plate_text,
+            plate_match_mode=plate_match_mode,
             start_time=start_time,
             end_time=end_time,
             camera_id=camera_id,
@@ -1374,6 +2288,9 @@ def _parse_rule_chat_query(text: str, context: dict[str, Any]) -> ChatVehicleQue
             context_reference=context_reference,
         )
     raise VehicleQueryParseError("Could not determine chat query intent.")
+
+
+_PARSE_RULE_CHAT_QUERY_INTERNAL = _parse_rule_chat_query
 
 
 def _parse_general_chat_query(text: str) -> ChatVehicleQuery | None:
@@ -1387,6 +2304,12 @@ def _is_summary_query(text: str) -> bool:
 
 
 def _ranking_group_by(text: str) -> str | None:
+    if re.search(r"\brun\s+and\s+camera\b|\bcamera\s+and\s+run\b", text):
+        return "run_camera"
+    if re.search(r"\b(vehicle\s+)?(class|classes|type|types|category|categories)\b", text):
+        return "class"
+    if re.search(r"\b(vehicle\s+)?colou?rs?\b", text):
+        return "colour"
     if re.search(r"\bcamera\b", text) or re.search(r"\bbusiest\s+camera\b|\btop\s+camera\b", text):
         return "camera"
     if re.search(r"\brun\b", text) or re.search(r"\btop\s+run\b", text):
@@ -1396,8 +2319,18 @@ def _ranking_group_by(text: str) -> str | None:
 
 def _format_ranking_group_answer(parsed: ChatVehicleQuery, analytics_result: dict[str, Any]) -> str | None:
     ranking = analytics_result.get("ranking_result")
-    if not isinstance(ranking, dict) or parsed.limit != 1 or parsed.sort_by not in {"count_desc", "count_asc"}:
+    if not isinstance(ranking, dict) or parsed.sort_by not in {"count_desc", "count_asc"} or parsed.intent != "GROUP":
         return None
+    if parsed.limit is not None and parsed.limit > 1:
+        entries = [dict(item) for item in list(ranking.get("entries", []) or []) if isinstance(item, dict)][: parsed.limit]
+        if not entries:
+            return f"No matching {_ranking_title(parsed)} counts were found in the current selection."
+        title = "Top" if parsed.sort_by == "count_desc" else "Bottom"
+        rows = "\n".join(
+            f"{index}. {_format_ranking_label(entry, group_by=parsed.group_by)} - {int(entry.get('count', 0) or 0)}"
+            for index, entry in enumerate(entries, start=1)
+        )
+        return f"{title} {parsed.limit} {_ranking_title(parsed)} groups:\n\n{rows}"
     winners = [dict(item) for item in list(ranking.get("winners", []) or []) if isinstance(item, dict)]
     if not winners:
         return f"No matching {_ranking_title(parsed)} counts were found in the current selection."
@@ -1424,15 +2357,23 @@ def _format_ranking_label(entry: dict[str, Any], *, group_by: str | None) -> str
         run_id = str(entry.get("run_id") or label).strip()
         if run_id:
             return run_id
+    if group_by == "class":
+        return _class_label(label, int(entry.get("count", 0) or 0))
+    if group_by == "colour":
+        return label.title()
     return label
 
 
 def _ranking_sort_by(text: str) -> str | None:
+    top_k = TOP_K_PATTERN.search(text)
+    if top_k:
+        return "count_desc" if top_k.group(1) == "top" else "count_asc"
     if RANKING_ASC_PATTERN.search(text):
         return "count_asc"
     if RANKING_DESC_PATTERN.search(text):
         return "count_desc"
-    if re.search(r"\bwhich\s+(camera|run)\b.*\bmore\b", text) and not re.search(r"\bmore\s+\w+\s+than\b", text):
+    dimension = _ranking_group_by(text)
+    if dimension is not None and re.search(r"\bwhich\b.*\bmore\b", text) and not _contains_explicit_comparison_targets(text):
         return "count_desc"
     return None
 
@@ -1443,7 +2384,21 @@ def _is_group_ranking_query(text: str) -> bool:
         return False
     if _ranking_sort_by(text) is not None:
         return True
-    return bool(re.search(rf"\b{group_by}\s+with\s+(vehicle|traffic|detection)\s+count\b", text))
+    group_token = {
+        "class": r"(class|classes|type|types|category|categories)",
+        "colour": r"colou?rs?",
+        "camera": r"camera",
+        "run": r"run",
+        "run_camera": r"(run\s+and\s+camera|camera\s+and\s+run)",
+    }.get(group_by, re.escape(group_by))
+    return bool(re.search(rf"\b{group_token}\b.*\b(count|common)\b", text))
+
+
+def _ranking_limit(text: str) -> int:
+    top_k = TOP_K_PATTERN.search(text)
+    if top_k:
+        return max(1, int(top_k.group(2)))
+    return 1
 
 
 def _aggregate_same_named_cameras_requested(text: str) -> bool:
@@ -1457,6 +2412,10 @@ def _ranking_title(parsed: ChatVehicleQuery) -> str:
         return "camera"
     if parsed.group_by == "run":
         return "run"
+    if parsed.group_by == "class":
+        return "vehicle class"
+    if parsed.group_by == "colour":
+        return "vehicle colour"
     return parsed.group_by or "group"
 
 
@@ -1528,16 +2487,17 @@ def _parse_evidence_navigation_query(text: str, context: dict[str, Any]) -> Chat
     plate_detected = previous_filters.get("plate_detected")
     plate_readable = previous_filters.get("plate_readable")
     plate_text = previous_filters.get("plate_text")
+    plate_match_mode = previous_filters.get("plate_match_mode")
     include_camera_ids = list(previous_filters.get("include_camera_ids", []) or [])
     selected_run_ids = list(previous_filters.get("selected_run_ids", []) or [])
     if re.fullmatch(r"(show|display|list)\s+(from\s+the\s+beginning|again|all)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="restart")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, show_evidence=True, context_reference="previous_results", evidence_navigation="restart")
     if re.fullmatch(r"(show\s+)?(more|next|next\s+\d+|remaining|the\s+rest|rest|the\s+other\s+\d+|other\s+\d+)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     if re.fullmatch(r"(show|display|list)\s+(them|those|these|ones|evidence)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     if re.fullmatch(r"show\s+me\s+(the\s+)?(other\s+\d+|remaining|rest|evidence|them|those)", text):
-        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
+        return ChatVehicleQuery(intent="LIST", selected_run_ids=selected_run_ids, include_camera_ids=include_camera_ids, include_classes=classes, exclude_classes=exclude_classes, include_colours=colours, exclude_colours=exclude_colours, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode, show_evidence=True, context_reference="previous_results", evidence_navigation="next")
     return None
 
 
@@ -1566,6 +2526,129 @@ def _parse_interval_comparison_query(text: str) -> ChatVehicleQuery | None:
     )
 
 
+def _contains_explicit_comparison_targets(text: str) -> bool:
+    return (
+        len(_find_labels(text, CLASS_SYNONYMS)) >= 2
+        or len(_find_labels(text, COLOUR_SYNONYMS)) >= 2
+        or len(_parse_camera_ids(text)) >= 2
+    )
+
+
+def _comparison_mode(text: str) -> str:
+    if re.search(r"\bhow\s+many\s+more\b|\bdifference\s+between\b|\bwhat\s+is\s+the\s+difference\b", text):
+        return "difference"
+    if re.search(r"\bwhich\s+has\s+more\b|\bwhich\s+\w+\s+has\s+more\b|\b(?:are|were)\s+there\s+more\b|\bmore\s+common\s+than\b|\bcompare\b", text):
+        return "winner"
+    return "winner"
+
+
+def _comparison_operator(text: str) -> str:
+    if re.search(r"\bless\s+than\b|\bfewer\s+than\b", text):
+        return "<"
+    return ">"
+
+
+def _comparison_metric_label(text: str) -> str:
+    if re.search(r"\bcars?\b|\bvehicles?\b|\bcount\b|\bcommon\b", text):
+        return "vehicle count"
+    return "count"
+
+
+def _parse_direct_comparison_query(
+    text: str,
+    *,
+    include_classes: list[str],
+    exclude_classes: list[str],
+    include_colours: list[str],
+    exclude_colours: list[str],
+    plate_presence: str | None,
+    plate_detected: bool | None,
+    plate_readable: bool | None,
+    plate_text: str | None,
+    include_camera_ids: list[str],
+    exclude_camera_ids: list[str],
+    context_reference: str | None,
+) -> ChatVehicleQuery | None:
+    if re.search(r"\bother\s+than\b", text):
+        return None
+    has_compare_phrase = bool(
+        re.search(
+            r"\b(compare|vs\b|versus|more\s+common\s+than|how\s+many\s+more|difference\s+between|which\s+has\s+more|which\s+\w+\s+has\s+more|(?:are|were)\s+there\s+more|what\s+is\s+the\s+difference)\b",
+            text,
+        )
+    )
+    has_or_question = bool(re.search(r"\b(which|what)\b.*\bor\b", text) or re.search(r"\b(?:are|were)\s+there\s+more\b", text))
+    if not has_compare_phrase and not has_or_question:
+        return None
+    comparison_mode = _comparison_mode(text)
+    operator = _comparison_operator(text)
+    classes = _find_labels(text, CLASS_SYNONYMS)
+    colours = _find_labels(text, COLOUR_SYNONYMS)
+    cameras = _parse_camera_ids(text)
+    comparison: dict[str, Any] | None = None
+    filters: dict[str, Any] = {}
+    query_include_classes = list(include_classes)
+    query_include_colours = list(include_colours)
+    query_include_cameras = list(include_camera_ids)
+    if len(cameras) >= 2:
+        comparison = {
+            "left": {"kind": "camera", "value": cameras[0]},
+            "right": {"kind": "camera", "value": cameras[1]},
+            "mode": comparison_mode,
+            "operator": operator,
+            "metric": "vehicle_count",
+            "response_style": "leading_answer" if re.search(r"\b(?:are|were)\s+there\s+more\b", text) and re.search(r"\bthan\b", text) else "counts_first",
+        }
+        if include_classes:
+            filters["classes"] = include_classes
+        if include_colours:
+            filters["colours"] = include_colours
+        query_include_cameras = [camera_id for camera_id in include_camera_ids if camera_id not in set(cameras[:2])]
+    elif len(colours) >= 2:
+        comparison = {
+            "left": {"kind": "colour", "value": colours[0]},
+            "right": {"kind": "colour", "value": colours[1]},
+            "mode": comparison_mode,
+            "operator": operator,
+            "metric": "vehicle_count",
+            "response_style": "leading_answer" if re.search(r"\b(?:are|were)\s+there\s+more\b", text) and re.search(r"\bthan\b", text) else "counts_first",
+        }
+        if include_classes:
+            filters["classes"] = include_classes
+        query_include_colours = [colour for colour in include_colours if colour not in set(colours[:2])]
+    elif len(classes) >= 2:
+        comparison = {
+            "left": {"kind": "class", "value": classes[0]},
+            "right": {"kind": "class", "value": classes[1]},
+            "mode": comparison_mode,
+            "operator": operator,
+            "metric": "vehicle_count",
+            "response_style": "leading_answer" if re.search(r"\b(?:are|were)\s+there\s+more\b", text) and re.search(r"\bthan\b", text) else "counts_first",
+        }
+        if include_colours:
+            filters["colours"] = include_colours
+        query_include_classes = [label for label in include_classes if label not in set(classes[:2])]
+    if comparison is None:
+        return None
+    if filters:
+        comparison["filters"] = filters
+    return ChatVehicleQuery(
+        intent="COMPARE",
+        include_classes=query_include_classes,
+        exclude_classes=exclude_classes,
+        include_colours=query_include_colours,
+        exclude_colours=exclude_colours,
+        plate_presence=plate_presence,
+        plate_detected=plate_detected,
+        plate_readable=plate_readable,
+        plate_text=plate_text,
+        include_camera_ids=query_include_cameras,
+        exclude_camera_ids=exclude_camera_ids,
+        comparison=comparison,
+        context_reference=context_reference,
+    )
+
+
 def _parse_plate_presence(text: str) -> str | None:
     return _parse_plate_filters(text)[0]
 
@@ -1587,12 +2670,52 @@ def _parse_plate_filters(text: str) -> tuple[str | None, bool | None, bool | Non
     return None, None, None, None
 
 
+def _parse_plate_search_filter(text: str) -> tuple[str | None, str | None]:
+    exact = _parse_plate_text_query(text)
+    if exact is not None:
+        return "exact", exact
+    if not re.search(r"\b(find|show|where|count|how many)\b", text):
+        return None, None
+    suffix_match = re.search(
+        r"\b(?:number\s+plates?|plates?|registration(?:\s+number)?)\s+(?:ending|ends?)\s+(?:with|in)\s+([a-z0-9 -]+)\b|"
+        r"\b(?:number\s+plates?|plates?|registration(?:\s+number)?)\s+(?:have|has|is|are)\s+ending\s+(?:with|in)\s+([a-z0-9 -]+)\b|"
+        r"\blast\s+\d+\s+digits?\s+(?:are|is)\s+([a-z0-9 -]+)\b",
+        text,
+    )
+    if suffix_match:
+        return "suffix", _extract_valid_plate_search_fragment(next((item for item in suffix_match.groups() if item), None), match_mode="suffix")
+    contains_match = re.search(
+        r"\b(?:find|show|count)\s+(?:all\s+)?(?:the\s+)?vehicles?\s+whose\s+(?:number\s+plate|plate|registration(?:\s+number)?)\s+(?:containing|contains?)\s+([a-z0-9 -]+)\b|"
+        r"\b(?:number\s+plates?|plates?|registration(?:\s+number)?)\s+(?:containing|contains?|with|having)\s+([a-z0-9 -]+)\b|"
+        r"\b(?:number\s+plates?|plates?|registration(?:\s+number)?)\s+(?:have|has|is|are)\s+(?:containing|contains?)\s+([a-z0-9 -]+)\b|"
+        r"\bfind\s+any\s+plate\s+with\s+([a-z0-9 -]+)\b",
+        text,
+    )
+    if contains_match:
+        return "contains", _extract_valid_plate_search_fragment(next((item for item in contains_match.groups() if item), None), match_mode="contains")
+    prefix_match = re.search(
+        r"\b(?:find|show|count)\s+(?:all\s+)?(?:the\s+)?vehicles?\s+whose\s+(?:number\s+plate|plate|registration(?:\s+number)?)\s+(?:have|has|is|are)\s+([a-z0-9 -]+)\b|"
+        r"\b(?:find|show|count)\s+(?:all\s+)?vehicles?\s+with\s+(?:number\s+plate|plate|registration(?:\s+number)?)\s+([a-z0-9 -]+)\b|"
+        r"\b(?:plates?|number\s+plates?|registrations?)\s+(?:starting|starts|beginning)\s+with\s+([a-z0-9 -]+)\b|"
+        r"\b(?:find|show)\s+all\s+readable\s+plates?\s+from\s+([a-z0-9 -]+)\b|"
+        r"\b(?:find|show|count|how\s+many)\s+all\s+([a-z0-9 -]+?)\s+(?:number\s+plates?|plates?)\b|"
+        r"\b(?:find|show|count|how\s+many)\s+([a-z0-9 -]+)\s+plates\b|"
+        r"\bhow\s+many\s+([a-z0-9 -]+)\s+plates?\s+are\s+there\b",
+        text,
+    )
+    if prefix_match:
+        return "prefix", _extract_valid_plate_search_fragment(next((item for item in prefix_match.groups() if item), None), match_mode="prefix")
+    return None, None
+
+
 def _parse_plate_text_query(text: str) -> str | None:
     explicit_match = re.search(r"\b(?:plate|number\s+plate|registration)\s+([A-Z0-9][A-Z0-9\s-]{3,})\b", text.upper())
     if explicit_match:
-        token = _registration_like_token(explicit_match.group(1))
+        token = _validated_plate_candidate(explicit_match.group(1))
         if token is not None:
             return token
+    if _parse_camera_ids(text) and not re.search(r"\b(number\s+plate|plate|registration)\b", text):
+        return None
     return _extract_registration_like_token(text)
 
 
@@ -1659,10 +2782,74 @@ def _extract_registration_like_token(text: str) -> str | None:
     parts = re.findall(r"[A-Z0-9]+", uppercase)
     for size in range(1, min(4, len(parts)) + 1):
         for start in range(0, len(parts) - size + 1):
-            token = _registration_like_token("".join(parts[start : start + size]))
+            token = _validated_plate_candidate("".join(parts[start : start + size]))
             if token is not None:
                 candidates.append(token)
     return candidates[-1] if candidates else None
+
+
+def _validated_plate_candidate(value: str) -> str | None:
+    token = _registration_like_token(value)
+    if token is None:
+        return None
+    validation = validate_indian_plate(token)
+    return validation.canonical_text if validation.valid and validation.canonical_text else None
+
+
+def _extract_valid_plate_search_fragment(value: str | None, *, match_mode: str) -> str | None:
+    if value is None:
+        return None
+    phrase = str(value or "").strip().upper()
+    if not phrase:
+        return None
+    candidates: list[str] = []
+    normalized_whole = _clean_plate_text(phrase)
+    if normalized_whole is not None:
+        candidates.append(normalized_whole)
+    parts = re.findall(r"[A-Z0-9]+", phrase)
+    for size in range(1, min(3, len(parts)) + 1):
+        for start in range(0, len(parts) - size + 1):
+            candidates.append("".join(parts[start : start + size]))
+    for candidate in candidates:
+        fragment = _validated_plate_search_fragment(candidate, match_mode=match_mode)
+        if fragment is not None:
+            return fragment
+    return None
+
+
+def _validated_plate_search_fragment(value: str, *, match_mode: str) -> str | None:
+    token = _clean_plate_text(value)
+    if token is None:
+        return None
+    if token in PLATE_PARTIAL_STOPWORDS:
+        return None
+    if len(token) > 10:
+        return None
+    if any(word in token for word in ("SECOND", "SECONDS", "MINUTE", "MINUTES", "HOUR", "HOURS")):
+        return None
+    if any(token.startswith(prefix) for prefix in ("TRACK", "CAM", "RUN", "VEHICLE")):
+        return None
+    if match_mode == "prefix":
+        if len(token) < 2:
+            return None
+        if len(token) == 2:
+            return token if token in VALID_STATE_CODES else None
+        return token if re.fullmatch(r"(?:AN|AP|AR|AS|BR|CG|CH|DD|DL|DN|GA|GJ|HP|HR|JH|JK|KA|KL|LA|LD|MH|ML|MN|MP|MZ|NL|OD|PB|PY|RJ|SK|TN|TR|TS|UK|UP|WB)(?:\d{1,2}(?:[A-Z]{1,3})?)", token) else None
+    if match_mode == "suffix":
+        return token if re.fullmatch(r"\d{2,4}", token) else None
+    if match_mode == "contains":
+        if len(token) < 2 or len(token) > 6:
+            return None
+        if re.fullmatch(r"\d{2,4}", token):
+            return token
+        if re.fullmatch(r"(?:AN|AP|AR|AS|BR|CG|CH|DD|DL|DN|GA|GJ|HP|HR|JH|JK|KA|KL|LA|LD|MH|ML|MN|MP|MZ|NL|OD|PB|PY|RJ|SK|TN|TR|TS|UK|UP|WB)(?:\d{1,2}(?:[A-Z]{1,3})?)", token):
+            return None
+        if not re.search(r"[A-Z]", token) or not re.search(r"\d", token):
+            return None
+        if re.fullmatch(r"(?:[A-Z]{1,3}\d{1,4}|\d{1,4}[A-Z]{1,3}|[A-Z]{1,2}\d{1,2}[A-Z]{1,2}|\d{1,2}[A-Z]{1,2}\d{1,2})", token):
+            return token
+        return None
+    return None
 
 
 def _registration_like_token(value: str) -> str | None:
@@ -1710,6 +2897,7 @@ def normalize_llm_vehicle_query(payload: dict[str, Any]) -> dict[str, Any]:
         "plate_detected": _optional_bool(payload.get("plate_detected")),
         "plate_readable": _optional_bool(payload.get("plate_readable")),
         "plate_text": _clean_plate_text(payload.get("plate_text")),
+        "plate_match_mode": _normalize_plate_match_mode(payload.get("plate_match_mode")),
         "start_time": _optional_float(payload.get("start_time")),
         "end_time": _optional_float(payload.get("end_time")),
         "group_by": _normalize_llm_group_by(payload.get("group_by")),
@@ -1779,6 +2967,7 @@ def _repair_llm_plan_with_explicit_mentions(
         repair_notes.append("normalized UNIQUE_CLASSES to GROUP by vehicle_class")
 
     expected_plate_presence, expected_plate_detected, expected_plate_readable, expected_plate_text = _parse_plate_filters(text)
+    expected_plate_match_mode, expected_plate_search_value = _parse_plate_search_filter(text)
     if expected_plate_presence is not None and repaired.get("plate_presence") != expected_plate_presence:
         repaired["plate_presence"] = expected_plate_presence
         repair_applied = True
@@ -1795,8 +2984,32 @@ def _repair_llm_plan_with_explicit_mentions(
         repaired["plate_text"] = expected_plate_text
         repair_applied = True
         repair_notes.append(f"set plate_text={expected_plate_text}")
+    if expected_plate_search_value is not None and repaired.get("plate_text") != expected_plate_search_value:
+        repaired["plate_text"] = expected_plate_search_value
+        repair_applied = True
+        repair_notes.append(f"set plate_text={expected_plate_search_value}")
+    if expected_plate_match_mode is not None and repaired.get("plate_match_mode") != expected_plate_match_mode:
+        repaired["plate_match_mode"] = expected_plate_match_mode
+        repair_applied = True
+        repair_notes.append(f"set plate_match_mode={expected_plate_match_mode}")
 
     if rule_candidate is not None:
+        if (
+            rule_candidate.intent == "GROUP"
+            and rule_candidate.sort_by is not None
+            and str(repaired.get("intent") or "").upper() in {"COMPARE", "FIND_INTERVALS"}
+            and _comparison_from_llm(repaired) is None
+        ):
+            repaired["intent"] = "GROUP"
+            repaired["group_by"] = "vehicle_class" if rule_candidate.group_by == "class" else rule_candidate.group_by
+            repaired["sort_by"] = rule_candidate.sort_by
+            repaired["limit"] = rule_candidate.limit
+            repair_applied = True
+            repair_notes.append("converted incomplete comparison into ranking query")
+        if repaired.get("context_reference") is not None and not _context_reference(text):
+            repaired["context_reference"] = None
+            repair_applied = True
+            repair_notes.append("removed invented context_reference")
         if rule_candidate.subject == "vehicles" and repaired.get("subject") == "runs":
             repaired["subject"] = "vehicles"
             repair_applied = True
@@ -1887,6 +3100,7 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
                 plate_detected=payload.get("plate_detected"),
                 plate_readable=payload.get("plate_readable"),
                 plate_text=None,
+                plate_match_mode=None,
                 start_time=payload.get("start_time"),
                 end_time=payload.get("end_time"),
                 camera_id=None,
@@ -1916,6 +3130,7 @@ def chat_query_from_llm_vehicle_query(payload: dict[str, Any], *, text: str, con
         plate_detected=payload.get("plate_detected"),
         plate_readable=payload.get("plate_readable"),
         plate_text=payload.get("plate_text"),
+        plate_match_mode=payload.get("plate_match_mode"),
         start_time=payload.get("start_time"),
         end_time=payload.get("end_time"),
         camera_id=None,
@@ -1945,6 +3160,7 @@ def _filter_records(
     plate_detected: bool | None = None,
     plate_readable: bool | None = None,
     plate_text: str | None = None,
+    plate_match_mode: str | None = None,
     base_ids: set[str] | None = None,
 ) -> list[VehicleRecord]:
     include_classes_set = {item.upper() for item in include_classes or []}
@@ -1965,10 +3181,52 @@ def _filter_records(
         and record.colour not in exclude_colours_set
         and (not include_camera_set or record.camera_id in include_camera_set)
         and record.camera_id not in exclude_camera_set
-        and _matches_plate_filters(record, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text)
+        and _matches_plate_filters(record, plate_presence=plate_presence, plate_detected=plate_detected, plate_readable=plate_readable, plate_text=plate_text, plate_match_mode=plate_match_mode)
         and not (start_time is not None and record.last_seen_seconds is not None and record.last_seen_seconds < start_time)
         and not (end_time is not None and record.first_seen_seconds is not None and record.first_seen_seconds > end_time)
     ]
+
+
+def _comparison_target_records(records: list[VehicleRecord], target: Any, *, comparison: dict[str, Any]) -> list[VehicleRecord]:
+    target_dict = dict(target or {}) if isinstance(target, dict) else {"kind": "class", "value": target}
+    kind = str(target_dict.get("kind") or "class")
+    value = str(target_dict.get("value") or "").upper()
+    scoped = records
+    filters = dict(comparison.get("filters") or {})
+    filter_classes = [str(item).upper() for item in list(filters.get("classes", []) or [])]
+    filter_colours = [str(item).upper() for item in list(filters.get("colours", []) or [])]
+    if filter_classes:
+        scoped = _filter_records(scoped, include_classes=filter_classes)
+    if filter_colours:
+        scoped = _filter_records(scoped, include_colours=filter_colours)
+    if kind == "camera":
+        return _filter_records(scoped, include_camera_ids=[value] if value else [])
+    if kind == "colour":
+        return _filter_records(scoped, include_colours=[value] if value else [])
+    return _filter_records(scoped, include_classes=[value] if value else [])
+
+
+def _comparison_target_label(target: Any) -> str:
+    target_dict = dict(target or {}) if isinstance(target, dict) else {"kind": "class", "value": target}
+    value = str(target_dict.get("value") or "")
+    kind = str(target_dict.get("kind") or "class")
+    if kind == "camera":
+        return value
+    if kind == "colour":
+        return value.title()
+    return value.upper()
+
+
+def _unique_records(records: list[VehicleRecord]) -> list[VehicleRecord]:
+    seen: set[str] = set()
+    deduped: list[VehicleRecord] = []
+    for record in records:
+        key = getattr(record, "vehicle_id", "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
 
 
 def _summary_payload(records: list[VehicleRecord]) -> dict[str, Any]:
@@ -2043,10 +3301,11 @@ def _build_ranking_result(parsed: ChatVehicleQuery, counts: dict[str, int]) -> d
     ]
     winner_count = entries[0]["count"]
     winners = [entry for entry in entries if entry["count"] == winner_count]
+    display_limit = max(parsed.limit or 3, len(winners), 3)
     return {
         "group_by": parsed.group_by,
         "sort_by": parsed.sort_by,
-        "entries": entries[: max(parsed.limit or 3, 3)],
+        "entries": entries[:display_limit],
         "winners": winners,
         "is_tie": len(winners) > 1,
     }
@@ -2122,6 +3381,7 @@ def _matches_plate_filters(
     plate_detected: bool | None,
     plate_readable: bool | None,
     plate_text: str | None,
+    plate_match_mode: str | None,
 ) -> bool:
     normalized_plate_text = _clean_plate_text(getattr(record, "plate_text", None))
     detected = bool(getattr(record, "plate_detected", None)) or normalized_plate_text is not None
@@ -2141,7 +3401,11 @@ def _matches_plate_filters(
         return False
     if expected_readable is False and readable:
         return False
-    if plate_text is not None and normalized_plate_text != _clean_plate_text(plate_text):
+    if plate_text is not None and not _plate_text_matches(
+        normalized_plate_text,
+        _clean_plate_text(plate_text),
+        plate_match_mode=plate_match_mode,
+    ):
         return False
     return True
 
@@ -2158,9 +3422,28 @@ def _matches_plate_filters_dict(item: dict[str, Any], parsed: ChatVehicleQuery) 
         return False
     if parsed.plate_readable is False and readable:
         return False
-    if parsed.plate_text is not None and normalized_plate_text != _clean_plate_text(parsed.plate_text):
+    if parsed.plate_text is not None and not _plate_text_matches(
+        normalized_plate_text,
+        _clean_plate_text(parsed.plate_text),
+        plate_match_mode=parsed.plate_match_mode,
+    ):
         return False
     return True
+
+
+def _plate_text_matches(record_plate_text: str | None, query_plate_text: str | None, *, plate_match_mode: str | None) -> bool:
+    if query_plate_text is None:
+        return True
+    if record_plate_text is None:
+        return False
+    match_mode = plate_match_mode or "exact"
+    if match_mode == "prefix":
+        return record_plate_text.startswith(query_plate_text)
+    if match_mode == "suffix":
+        return record_plate_text.endswith(query_plate_text)
+    if match_mode == "contains":
+        return query_plate_text in record_plate_text
+    return record_plate_text == query_plate_text
 
 
 def _build_run_scope(selected_run_ids: list[str], repository: RunRepository) -> list[dict[str, Any]]:
@@ -2233,6 +3516,7 @@ def _query_filters(parsed: ChatVehicleQuery) -> dict[str, Any]:
         "plate_detected": parsed.plate_detected,
         "plate_readable": parsed.plate_readable,
         "plate_text": parsed.plate_text,
+        "plate_match_mode": parsed.plate_match_mode,
         "start_time": parsed.start_time,
         "end_time": parsed.end_time,
         "camera_id": parsed.camera_id,
@@ -2255,6 +3539,7 @@ def _payload_filters(payload: dict[str, Any]) -> dict[str, Any]:
         "plate_detected": payload.get("plate_detected"),
         "plate_readable": payload.get("plate_readable"),
         "plate_text": payload.get("plate_text"),
+        "plate_match_mode": payload.get("plate_match_mode"),
         "start_time": payload.get("start_time"),
         "end_time": payload.get("end_time"),
         "camera_id": None,
@@ -2290,6 +3575,7 @@ def _reject_suspicious_llm_payload(payload: dict[str, Any], text: str, context: 
     if expected_run_query is not None and payload.get("subject") != "runs":
         raise VehicleQueryParseError("missing_subject:runs")
     expected_plate_presence, expected_plate_detected, expected_plate_readable, expected_plate_text = _parse_plate_filters(text)
+    expected_plate_match_mode, expected_plate_search_value = _parse_plate_search_filter(text)
     if expected_plate_presence is not None and payload.get("plate_presence") != expected_plate_presence:
         raise VehicleQueryParseError("missing_plate_presence")
     if expected_plate_detected is not None and payload.get("plate_detected") != expected_plate_detected:
@@ -2298,6 +3584,10 @@ def _reject_suspicious_llm_payload(payload: dict[str, Any], text: str, context: 
         raise VehicleQueryParseError("missing_plate_readable")
     if expected_plate_text is not None and payload.get("plate_text") != expected_plate_text:
         raise VehicleQueryParseError("missing_plate_text")
+    if expected_plate_search_value is not None and payload.get("plate_text") != expected_plate_search_value:
+        raise VehicleQueryParseError("missing_plate_text")
+    if expected_plate_match_mode is not None and _normalize_plate_match_mode(payload.get("plate_match_mode")) != expected_plate_match_mode:
+        raise VehicleQueryParseError("missing_plate_match_mode")
     if payload.get("context_reference") is not None and not _context_reference(text):
         raise VehicleQueryParseError("invented_context_reference")
     if (payload.get("start_time") == 0 or payload.get("end_time") == 0) and not re.search(r"\b(0|zero|first|between|after|before|from|to|\d)\b", text):
@@ -2458,9 +3748,17 @@ def _comparison_from_llm(payload: dict[str, Any]) -> dict[str, Any] | None:
     intent = str(payload.get("intent") or "").upper()
     if intent not in {"COMPARE", "FIND_INTERVALS"}:
         return None
+    payload_comparison = payload.get("comparison")
+    if isinstance(payload_comparison, dict):
+        return dict(payload_comparison)
     classes = list(payload.get("classes", []) or [])
     if len(classes) >= 2:
-        comparison = {"left": classes[0], "right": classes[1]}
+        comparison = {
+            "left": {"kind": "class", "value": classes[0]},
+            "right": {"kind": "class", "value": classes[1]},
+            "mode": "winner",
+            "metric": "vehicle_count",
+        }
         if intent == "FIND_INTERVALS":
             comparison["operator"] = payload.get("operator") or ">"
             comparison["window_seconds"] = 5.0
@@ -2489,7 +3787,7 @@ def _llm_context(context: dict[str, Any]) -> dict[str, Any]:
 
 def _deterministic_rule_candidate(text: str, context: dict[str, Any]) -> ChatVehicleQuery | None:
     try:
-        return _parse_rule_chat_query(text, context)
+        return _PARSE_RULE_CHAT_QUERY_INTERNAL(text, context)
     except VehicleQueryParseError:
         return None
 
@@ -2501,8 +3799,12 @@ def _classify_qwen_failure(exc: Exception) -> str:
         return "qwen_timeout"
     if "connection refused" in lowered or "provider=ollama" in lowered or "urlerror" in lowered or "unavailable" in lowered:
         return "qwen_unavailable"
-    if "not valid json" in lowered or "json" in lowered and "invalid" in lowered:
-        return "qwen_invalid_json"
+    if "reason=qwen_output_truncated" in lowered:
+        return "qwen_output_truncated"
+    if "reason=qwen_empty_content" in lowered:
+        return "qwen_empty_content"
+    if "reason=qwen_invalid_json" in lowered or "not valid json" in lowered or "json" in lowered and "invalid" in lowered:
+        return "qwen_malformed_output"
     if isinstance(exc, VehicleQueryParseError):
         if lowered.startswith("unsupported_") or lowered.startswith("invalid_") or lowered.startswith("missing_required"):
             return "qwen_schema_validation_failed"
@@ -2559,6 +3861,8 @@ def _validate_qwen_plan(
             return "qwen_semantic_validation_failed", "plate_readable_mismatch"
         if rule_candidate.plate_text and repaired_payload.get("plate_text") != rule_candidate.plate_text:
             return "qwen_semantic_validation_failed", "plate_text_mismatch"
+        if rule_candidate.plate_match_mode and _normalize_plate_match_mode(repaired_payload.get("plate_match_mode")) != rule_candidate.plate_match_mode:
+            return "qwen_semantic_validation_failed", "plate_match_mode_mismatch"
     if raw_intent == "GENERAL_CHAT" and _classify_message_type(text, {}) == "NEW_ANALYTICS_QUERY":
         return "qwen_semantic_validation_failed", "incorrect_intent:general_chat_for_analytics"
     return None, None
@@ -2666,9 +3970,16 @@ def _query_description(parsed: ChatVehicleQuery, total: int) -> str:
         nouns = [_class_noun(label, total=total) for label in parsed.include_classes]
         parts.append(" or ".join(nouns))
     else:
-        parts.append("vehicles")
+        parts.append("vehicle" if total == 1 else "vehicles")
     if parsed.plate_text:
-        parts.append(f"with plate {parsed.plate_text}")
+        if parsed.plate_match_mode == "prefix":
+            parts.append(f"with plates starting with {parsed.plate_text}")
+        elif parsed.plate_match_mode == "suffix":
+            parts.append(f"with plates ending with {parsed.plate_text}")
+        elif parsed.plate_match_mode == "contains":
+            parts.append(f"with plates containing {parsed.plate_text}")
+        else:
+            parts.append(f"with plate {parsed.plate_text}")
     elif parsed.plate_detected is True and parsed.plate_readable is False:
         parts.append("with detected but unreadable number plates")
     elif parsed.plate_readable is False:
@@ -2874,6 +4185,7 @@ def _apply_run_and_camera_scope(
         plate_detected=parsed.plate_detected,
         plate_readable=parsed.plate_readable,
         plate_text=parsed.plate_text,
+        plate_match_mode=parsed.plate_match_mode,
         start_time=parsed.start_time,
         end_time=parsed.end_time,
         camera_id=include_camera_ids[0] if len(include_camera_ids) == 1 else parsed.camera_id,
@@ -2934,6 +4246,15 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _normalize_plate_match_mode(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in {"exact", "prefix", "suffix", "contains"}:
+        raise VehicleQueryParseError(f"unsupported_plate_match_mode:{value}")
+    return normalized
 
 
 def _normalize_group_by(value: Any) -> str | None:

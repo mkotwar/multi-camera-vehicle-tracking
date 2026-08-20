@@ -32,6 +32,7 @@ export type ChatVehicleQuery = {
   plate_presence?: string | null;
   plate_detected?: boolean | null;
   plate_text?: string | null;
+  plate_match_mode?: string | null;
   plate_readable?: boolean | null;
   start_time?: number | null;
   end_time?: number | null;

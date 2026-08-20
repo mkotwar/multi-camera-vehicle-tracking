@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .indian_plate_validator import validate_indian_plate
+from .plate_text import normalize_plate_text
 from .vehicle_enrichment.taxonomy import SUPPORTED_VEHICLE_CLASSES, SUPPORTED_VEHICLE_COLOUR_LABELS
 from .vehicle_enrichment.schemas import VEHICLE_COLOUR_UNKNOWN
 
@@ -112,7 +114,7 @@ def vehicle_records_from_repository_tracks(tracks: list[dict[str, Any]]) -> list
                 last_seen_seconds=_coerce_float(track.get("last_seen_seconds") or track.get("last_seen")),
                 observation_count=_coerce_int(track.get("observation_count")),
                 status="COMPLETED",
-                plate_text=str(track.get("plate_text") or "").strip().upper() or None,
+                plate_text=_canonical_track_plate_text(track),
                 plate_detected=_coerce_bool(track.get("plate_detected")),
                 plate_detection_confidence=_coerce_float(track.get("plate_detection_confidence")),
                 plate_text_confidence=_coerce_float(track.get("plate_text_confidence")),
@@ -149,11 +151,11 @@ def vehicle_records_from_physical_vehicles(vehicles: list[dict[str, Any]]) -> li
                 observation_count=_coerce_int(vehicle.get("member_track_count") or len(member_track_ids) or 1),
                 status=str(vehicle.get("identity_status") or "PHYSICAL_VEHICLE"),
                 member_track_ids=member_track_ids,
-                plate_text=str(vehicle.get("consensus_plate_text") or "") or None,
+                plate_text=_canonical_physical_vehicle_plate_text(vehicle),
                 plate_detected=_coerce_bool(
                     vehicle.get("plate_detected")
                     or (vehicle.get("plate") or {}).get("detected")
-                    or bool(vehicle.get("consensus_plate_text"))
+                    or bool(_canonical_physical_vehicle_plate_text(vehicle))
                 ),
                 plate_detection_confidence=_coerce_float(
                     vehicle.get("plate_detection_confidence")
@@ -373,6 +375,62 @@ def _extract_track_plate_text(track: dict[str, Any]) -> str | None:
     value = enrichment.get("plate_text") if isinstance(enrichment, dict) else track.get("plate_text")
     text = str(value or "").strip().upper()
     return text or None
+
+
+def _canonical_track_plate_text(track: dict[str, Any]) -> str | None:
+    candidates = [
+        _extract_track_plate_text(track),
+        _extract_track_enrichment_value(track, "plate_normalized_text"),
+        _extract_track_enrichment_value(track, "plate_raw_text"),
+        _extract_track_enrichment_value(track, "plate_ocr_raw_response"),
+    ]
+    return _first_valid_canonical_plate(candidates)
+
+
+def _canonical_physical_vehicle_plate_text(vehicle: dict[str, Any]) -> str | None:
+    candidates: list[Any] = [
+        vehicle.get("consensus_plate_text"),
+        vehicle.get("plate_text"),
+        vehicle.get("plate_normalized_text"),
+        vehicle.get("normalized_plate_text"),
+        (vehicle.get("plate") or {}).get("consensus_text") if isinstance(vehicle.get("plate"), dict) else None,
+    ]
+    for item in list(vehicle.get("representative_evidence") or []):
+        if isinstance(item, dict):
+            candidates.extend([
+                item.get("plate_text"),
+                item.get("raw_plate_text"),
+                item.get("normalized_plate_text"),
+                item.get("plate_ocr_raw_response"),
+            ])
+    for item in list(vehicle.get("plate_evidence") or []):
+        if isinstance(item, dict):
+            candidates.extend([
+                item.get("plate_text"),
+                item.get("raw_plate_text"),
+                item.get("normalized_plate_text"),
+                item.get("plate_ocr_raw_response"),
+            ])
+    for item in list(vehicle.get("member_tracks") or []):
+        if isinstance(item, dict):
+            candidates.extend([
+                item.get("plate_text"),
+                item.get("raw_plate_text"),
+                item.get("normalized_plate_text"),
+                item.get("plate_ocr_raw_response"),
+            ])
+    return _first_valid_canonical_plate(candidates)
+
+
+def _first_valid_canonical_plate(candidates: list[Any]) -> str | None:
+    for candidate in candidates:
+        normalized = normalize_plate_text(candidate)
+        if not normalized:
+            continue
+        validation = validate_indian_plate(normalized)
+        if validation.valid and validation.canonical_text:
+            return validation.canonical_text
+    return None
 
 
 def _extract_track_enrichment_value(track: dict[str, Any], key: str) -> Any:
